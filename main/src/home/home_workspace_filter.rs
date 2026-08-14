@@ -59,6 +59,7 @@ pub(crate) fn show_workspace_dialog(
         state
     });
 
+    let show_sort_order_input = workspace_id.is_some();
     name_input.update(cx, |state, cx| {
         state.focus(window, cx);
     });
@@ -85,7 +86,9 @@ pub(crate) fn show_workspace_dialog(
                     .gap_3()
                     .w(px(360.0))
                     .child(Input::new(&input_for_render).w_full())
-                    .child(Input::new(&sort_input_for_render).w_full()),
+                    .when(show_sort_order_input, |this| {
+                        this.child(Input::new(&sort_input_for_render).w_full())
+                    }),
             )
             .confirm()
             .on_ok(move |_, _, cx| {
@@ -93,17 +96,12 @@ pub(crate) fn show_workspace_dialog(
                 if name.is_empty() {
                     return false;
                 }
-                let sort_text = sort_input_for_ok
-                    .read(cx)
-                    .text()
-                    .to_string()
-                    .trim()
-                    .to_string();
-                let sort_order = if sort_text.is_empty() {
-                    None
-                } else if let Ok(sort_order) = sort_text.parse::<i32>() {
-                    Some(sort_order)
-                } else {
+                let sort_text = sort_input_for_ok.read(cx).text().to_string();
+                let Some(sort_order) = workspace_dialog_sort_order(
+                    show_sort_order_input,
+                    &sort_text,
+                    initial_sort_order,
+                ) else {
                     return false;
                 };
 
@@ -113,6 +111,23 @@ pub(crate) fn show_workspace_dialog(
                 true
             })
     });
+}
+
+fn workspace_dialog_sort_order(
+    show_sort_order_input: bool,
+    sort_text: &str,
+    initial_sort_order: Option<i32>,
+) -> Option<Option<i32>> {
+    if !show_sort_order_input {
+        return Some(initial_sort_order);
+    }
+
+    let sort_text = sort_text.trim();
+    if sort_text.is_empty() {
+        Some(None)
+    } else {
+        sort_text.parse::<i32>().ok().map(Some)
+    }
 }
 
 #[derive(Clone)]
@@ -422,5 +437,28 @@ impl ListDelegate for WorkspaceFilterDelegate {
             this.workspace_filter_open = false;
             cx.notify();
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::workspace_dialog_sort_order;
+
+    #[test]
+    fn new_workspace_keeps_initial_sort_order_without_visible_input() {
+        assert_eq!(
+            Some(Some(7)),
+            workspace_dialog_sort_order(false, "not-user-editable", Some(7))
+        );
+    }
+
+    #[test]
+    fn edit_workspace_parses_visible_sort_order_input() {
+        assert_eq!(
+            Some(Some(12)),
+            workspace_dialog_sort_order(true, " 12 ", Some(7))
+        );
+        assert_eq!(Some(None), workspace_dialog_sort_order(true, " ", Some(7)));
+        assert_eq!(None, workspace_dialog_sort_order(true, "abc", Some(7)));
     }
 }
