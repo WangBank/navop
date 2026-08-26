@@ -12,6 +12,7 @@ use crate::import_export::{
     ExportConfig, ExportProgressSender, ExportResult, ImportConfig, ImportProgressSender,
     ImportResult,
 };
+use crate::manifest_helpers::ssh_auth_options;
 use crate::mysql::connection::MysqlDbConnection;
 use crate::plugin::{DatabasePlugin, DatabaseUserOperationRequest, SqlCompletionInfo};
 use crate::plugin_manifest::{
@@ -83,6 +84,40 @@ fn executable_mysql_option(value: Option<&str>) -> Option<&str> {
         .then_some(value)
 }
 
+fn is_mysql_character_type(data_type: &str) -> bool {
+    let base_type = data_type
+        .split_once('(')
+        .map(|(base_type, _)| base_type)
+        .unwrap_or(data_type)
+        .trim()
+        .to_ascii_lowercase();
+
+    matches!(
+        base_type.as_str(),
+        "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" | "enum" | "set"
+    )
+}
+
+fn append_mysql_character_metadata(
+    definition: &mut String,
+    data_type: &str,
+    charset: Option<&str>,
+    collation: Option<&str>,
+) {
+    if !is_mysql_character_type(data_type) {
+        return;
+    }
+
+    if let Some(charset) = executable_mysql_option(charset) {
+        definition.push_str(" CHARACTER SET ");
+        definition.push_str(charset);
+    }
+    if let Some(collation) = executable_mysql_option(collation) {
+        definition.push_str(" COLLATE ");
+        definition.push_str(collation);
+    }
+}
+
 impl MySqlPlugin {
     pub fn new() -> Self {
         Self
@@ -107,11 +142,38 @@ impl MySqlPlugin {
     fn foreign_key_changed(left: &ForeignKeyDefinition, right: &ForeignKeyDefinition) -> bool {
         left.columns != right.columns
             || left.ref_table != right.ref_table
+            || left.ref_schema != right.ref_schema
             || left.ref_columns != right.ref_columns
             || Self::foreign_key_action_sql(&left.on_delete)
                 != Self::foreign_key_action_sql(&right.on_delete)
             || Self::foreign_key_action_sql(&left.on_update)
                 != Self::foreign_key_action_sql(&right.on_update)
+    }
+
+    fn index_changed(left: &IndexDefinition, right: &IndexDefinition) -> bool {
+        left.is_primary != right.is_primary
+            || left.is_unique != right.is_unique
+            || left.columns.len() != right.columns.len()
+            || left
+                .columns
+                .iter()
+                .zip(&right.columns)
+                .any(|(left, right)| !left.eq_ignore_ascii_case(right))
+    }
+
+    fn primary_key_columns(design: &TableDesign) -> Vec<String> {
+        if let Some(primary_index) = design.indexes.iter().find(|index| index.is_primary) {
+            if !primary_index.columns.is_empty() {
+                return primary_index.columns.clone();
+            }
+        }
+
+        design
+            .columns
+            .iter()
+            .filter(|column| column.is_primary_key)
+            .map(|column| column.name.clone())
+            .collect()
     }
 
     fn column_change_reasons(
@@ -207,8 +269,8 @@ fn mysql_engine_names() -> Vec<String> {
 
 fn mysql_foreign_keys_sql(database: &str, table: &str) -> String {
     format!(
-        "SELECT k.CONSTRAINT_NAME, k.COLUMN_NAME, k.REFERENCED_TABLE_NAME, \
-         k.REFERENCED_COLUMN_NAME, rc.DELETE_RULE, rc.UPDATE_RULE \
+        "SELECT k.CONSTRAINT_NAME, k.COLUMN_NAME, k.REFERENCED_TABLE_SCHEMA, \
+         k.REFERENCED_TABLE_NAME, k.REFERENCED_COLUMN_NAME, rc.DELETE_RULE, rc.UPDATE_RULE \
          FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE k \
          LEFT JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc \
            ON rc.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA \
@@ -250,16 +312,17 @@ fn parse_mysql_foreign_keys(rows: Vec<Vec<Option<String>>>) -> Vec<ForeignKeyDef
             foreign_keys.push(ForeignKeyDefinition {
                 name: name.clone(),
                 columns: Vec::new(),
-                ref_table: row_value(&row, 2),
+                ref_table: row_value(&row, 3),
+                ref_schema: Some(row_value(&row, 2)).filter(|value| value.is_empty() == false),
                 ref_columns: Vec::new(),
-                on_delete: row_value(&row, 4),
-                on_update: row_value(&row, 5),
+                on_delete: row_value(&row, 5),
+                on_update: row_value(&row, 6),
             });
             foreign_keys.len() - 1
         });
 
         foreign_keys[index].columns.push(row_value(&row, 1));
-        foreign_keys[index].ref_columns.push(row_value(&row, 3));
+        foreign_keys[index].ref_columns.push(row_value(&row, 4));
     }
 
     foreign_keys
@@ -583,11 +646,7 @@ fn mysql_connection_form() -> DatabaseFormManifest {
                     )
                     .optional()
                     .with_default("password")
-                    .with_options(vec![
-                        option("password", "ConnectionForm.ssh_auth_password"),
-                        option("private_key", "ConnectionForm.ssh_auth_private_key"),
-                        option("agent", "ConnectionForm.ssh_auth_agent"),
-                    ])
+                    .with_options(ssh_auth_options())
                     .with_visibility(ssh_enabled_rules()),
                     ssh_password_field(
                         "ssh_password",
@@ -1355,18 +1414,17 @@ impl DatabasePlugin for MySqlPlugin {
         database: &str,
         _schema: Option<String>,
     ) -> Result<Vec<TableInfo>> {
-        // Query to get all tables with their description/metadata
         let sql = format!(
             "SELECT \
-                TABLE_NAME, \
-                TABLE_COMMENT, \
-                ENGINE, \
-                TABLE_ROWS, \
-                CREATE_TIME, \
-                TABLE_COLLATION \
-             FROM INFORMATION_SCHEMA.TABLES \
-             WHERE TABLE_SCHEMA = '{}' AND TABLE_TYPE IN ('BASE TABLE','SYSTEM VIEW') \
-             ORDER BY TABLE_NAME",
+            TABLE_NAME, \
+            TABLE_COMMENT, \
+            ENGINE, \
+            CREATE_TIME, \
+            TABLE_COLLATION, \
+            TABLE_TYPE \
+         FROM INFORMATION_SCHEMA.TABLES \
+         WHERE TABLE_SCHEMA = '{}' \
+         ORDER BY TABLE_NAME",
             database
         );
 
@@ -1380,25 +1438,23 @@ impl DatabasePlugin for MySqlPlugin {
                 .rows
                 .iter()
                 .map(|row| {
-                    let collation = row.get(5).and_then(|v| v.clone());
-                    // Extract charset from collation (e.g., "utf8mb4_general_ci" -> "utf8mb4")
+                    // 索引顺序：0名, 1注释, 2引擎, 3时间, 4排序, 5类型
+                    let collation = row.get(4).and_then(|v| v.clone());
                     let charset = collation
                         .as_ref()
                         .and_then(|c| c.split('_').next().map(|s| s.to_string()));
 
-                    // Parse row count
-                    let row_count = row
-                        .get(3)
-                        .and_then(|v| v.clone())
-                        .and_then(|s| s.parse::<i64>().ok());
-
                     TableInfo {
                         name: row.first().and_then(|v| v.clone()).unwrap_or_default(),
+                        object_type: match row.get(5).and_then(|v| v.as_deref()) {
+                            Some("VIEW" | "SYSTEM VIEW") => TableObjectType::View,
+                            _ => TableObjectType::Table,
+                        },
                         schema: None,
                         comment: row.get(1).and_then(|v| v.clone()).filter(|s| !s.is_empty()),
                         engine: row.get(2).and_then(|v| v.clone()),
-                        row_count,
-                        create_time: row.get(4).and_then(|v| v.clone()),
+                        // row_count 字段已根据要求移除
+                        create_time: row.get(3).and_then(|v| v.clone()),
                         charset,
                         collation,
                     }
@@ -1417,40 +1473,79 @@ impl DatabasePlugin for MySqlPlugin {
         database: &str,
         _schema: Option<String>,
     ) -> Result<ObjectView> {
-        let tables = self.list_tables(connection, database, None).await?;
-
+        // UI需要展示的列
         let columns = vec![
             Column::localized("name", "ObjectView.columns.name").width(200.0),
             Column::localized("engine", "ObjectView.columns.engine").width(150.0),
             Column::localized("rows", "ObjectView.columns.rows")
                 .width(100.0)
                 .text_right(),
+            Column::localized("size", "ObjectView.columns.size")
+                .width(100.0)
+                .text_right(),
             Column::localized("created", "ObjectView.columns.created").width(180.0),
             Column::localized("comment", "ObjectView.columns.comment").width(300.0),
         ];
 
-        let rows: Vec<Vec<String>> = tables
-            .iter()
-            .map(|table| {
-                vec![
-                    table.name.clone(),
-                    table.engine.as_deref().unwrap_or("-").to_string(),
-                    table
-                        .row_count
-                        .map(|n| n.to_string())
-                        .unwrap_or_else(|| "-".to_string()),
-                    table.create_time.as_deref().unwrap_or("-").to_string(),
-                    table.comment.as_deref().unwrap_or("").to_string(),
-                ]
-            })
-            .collect();
+        // 独立写 SQL 获取 UI 需要的所有信息
+        let sql = format!(
+            "SELECT \
+            TABLE_NAME, \
+            ENGINE, \
+            TABLE_ROWS, \
+            ROUND((DATA_LENGTH + INDEX_LENGTH) / 1024 / 1024, 2) AS SIZE_MB, \
+            CREATE_TIME, \
+            TABLE_COMMENT \
+         FROM INFORMATION_SCHEMA.TABLES \
+         WHERE TABLE_SCHEMA = '{}' \
+         ORDER BY TABLE_NAME",
+            database
+        );
 
-        Ok(ObjectView {
-            db_node_type: DbNodeType::Table,
-            title: t!("ObjectView.counts.tables", count = tables.len()).to_string(),
-            columns,
-            rows,
-        })
+        let result = connection
+            .query(&sql)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to list tables view: {}", e))?;
+
+        if let SqlResult::Query(query_result) = result {
+            let rows: Vec<Vec<String>> = query_result
+                .rows
+                .iter()
+                .map(|row| {
+                    // 索引顺序：0名, 1引擎, 2行数, 3大小(MB), 4创建时间, 5注释
+                    let row_count = row
+                        .get(2)
+                        .and_then(|v| v.clone())
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+
+                    vec![
+                        row.first().and_then(|v| v.clone()).unwrap_or_default(),
+                        row.get(1)
+                            .and_then(|v| v.clone())
+                            .unwrap_or_else(|| "-".to_string()),
+                        row_count,
+                        row.get(3)
+                            .and_then(|v| v.clone())
+                            .unwrap_or_else(|| "-".to_string()),
+                        row.get(4)
+                            .and_then(|v| v.clone())
+                            .unwrap_or_else(|| "-".to_string()),
+                        row.get(5).and_then(|v| v.clone()).unwrap_or_default(),
+                    ]
+                })
+                .collect();
+
+            Ok(ObjectView {
+                db_node_type: DbNodeType::Table,
+                title: t!("ObjectView.counts.tables", count = rows.len()).to_string(),
+                columns,
+                rows,
+            })
+        } else {
+            Err(anyhow::anyhow!("Unexpected result type"))
+        }
     }
 
     // === Table Operations ===
@@ -2210,6 +2305,12 @@ impl DatabasePlugin for MySqlPlugin {
         }
 
         def.push_str(&column.data_type);
+        append_mysql_character_metadata(
+            &mut def,
+            &column.data_type,
+            column.charset.as_deref(),
+            column.collation.as_deref(),
+        );
 
         if !column.is_nullable {
             def.push_str(" NOT NULL");
@@ -2228,6 +2329,54 @@ impl DatabasePlugin for MySqlPlugin {
         }
 
         def
+    }
+
+    fn build_create_database_sql(
+        &self,
+        request: &crate::plugin::DatabaseOperationRequest,
+    ) -> String {
+        let db_name = self.quote_identifier(&request.database_name);
+        let charset = request
+            .field_values
+            .get("charset")
+            .map(|s| s.as_str())
+            .unwrap_or("utf8mb4");
+        let collation = request
+            .field_values
+            .get("collation")
+            .map(|s| s.as_str())
+            .unwrap_or("utf8mb4_general_ci");
+
+        format!(
+            "CREATE DATABASE {} CHARACTER SET {} COLLATE {};",
+            db_name, charset, collation
+        )
+    }
+
+    fn build_modify_database_sql(
+        &self,
+        request: &crate::plugin::DatabaseOperationRequest,
+    ) -> String {
+        let db_name = self.quote_identifier(&request.database_name);
+        let charset = request
+            .field_values
+            .get("charset")
+            .map(|s| s.as_str())
+            .unwrap_or("utf8mb4");
+        let collation = request
+            .field_values
+            .get("collation")
+            .map(|s| s.as_str())
+            .unwrap_or("utf8mb4_general_ci");
+
+        format!(
+            "ALTER DATABASE {} CHARACTER SET {} COLLATE {};",
+            db_name, charset, collation
+        )
+    }
+
+    fn build_drop_database_sql(&self, database_name: &str) -> String {
+        format!("DROP DATABASE {};", self.quote_identifier(database_name))
     }
 
     // === Database Management Operations ===
@@ -2349,54 +2498,6 @@ ORDER BY User, Host;"#
             scope,
             mysql_user_account(request)
         ))
-    }
-
-    fn build_create_database_sql(
-        &self,
-        request: &crate::plugin::DatabaseOperationRequest,
-    ) -> String {
-        let db_name = self.quote_identifier(&request.database_name);
-        let charset = request
-            .field_values
-            .get("charset")
-            .map(|s| s.as_str())
-            .unwrap_or("utf8mb4");
-        let collation = request
-            .field_values
-            .get("collation")
-            .map(|s| s.as_str())
-            .unwrap_or("utf8mb4_general_ci");
-
-        format!(
-            "CREATE DATABASE {} CHARACTER SET {} COLLATE {};",
-            db_name, charset, collation
-        )
-    }
-
-    fn build_modify_database_sql(
-        &self,
-        request: &crate::plugin::DatabaseOperationRequest,
-    ) -> String {
-        let db_name = self.quote_identifier(&request.database_name);
-        let charset = request
-            .field_values
-            .get("charset")
-            .map(|s| s.as_str())
-            .unwrap_or("utf8mb4");
-        let collation = request
-            .field_values
-            .get("collation")
-            .map(|s| s.as_str())
-            .unwrap_or("utf8mb4_general_ci");
-
-        format!(
-            "ALTER DATABASE {} CHARACTER SET {} COLLATE {};",
-            db_name, charset, collation
-        )
-    }
-
-    fn build_drop_database_sql(&self, database_name: &str) -> String {
-        format!("DROP DATABASE {};", self.quote_identifier(database_name))
     }
 
     fn build_limit_clause(&self) -> String {
@@ -2907,6 +3008,12 @@ ORDER BY User, Host;"#
 
         let type_str = self.build_type_string(col);
         def.push_str(&type_str);
+        append_mysql_character_metadata(
+            &mut def,
+            &col.data_type,
+            col.charset.as_deref(),
+            col.collation.as_deref(),
+        );
 
         if col.is_unsigned {
             def.push_str(" UNSIGNED");
@@ -2931,6 +3038,14 @@ ORDER BY User, Host;"#
         }
 
         def
+    }
+
+    fn build_drop_foreign_key_sql(&self, table_name: &str, foreign_key_name: &str) -> String {
+        format!(
+            "ALTER TABLE {} DROP FOREIGN KEY {};",
+            self.quote_identifier(table_name),
+            self.quote_identifier(foreign_key_name)
+        )
     }
 
     fn build_create_table_sql(&self, design: &TableDesign) -> String {
@@ -3074,6 +3189,43 @@ ORDER BY User, Host;"#
             }
         }
 
+        let original_indexes: HashMap<&str, &IndexDefinition> = original
+            .indexes
+            .iter()
+            .map(|i| (i.name.as_str(), i))
+            .collect();
+        let new_indexes: HashMap<&str, &IndexDefinition> =
+            new.indexes.iter().map(|i| (i.name.as_str(), i)).collect();
+
+        let original_pk = Self::primary_key_columns(original);
+        let new_pk = Self::primary_key_columns(new);
+        let primary_key_changed = original_pk.len() != new_pk.len()
+            || original_pk
+                .iter()
+                .zip(&new_pk)
+                .any(|(left, right)| !left.eq_ignore_ascii_case(right));
+        if primary_key_changed && !original_pk.is_empty() {
+            statements.push(format!("ALTER TABLE {} DROP PRIMARY KEY;", table_name));
+        }
+
+        for (name, original_index) in &original_indexes {
+            if original_index.is_primary {
+                continue;
+            }
+            match new_indexes.get(name) {
+                Some(new_index)
+                    if !new_index.is_primary && !Self::index_changed(original_index, new_index) => {
+                }
+                _ => {
+                    statements.push(format!(
+                        "ALTER TABLE {} DROP INDEX {};",
+                        table_name,
+                        self.quote_identifier(name)
+                    ));
+                }
+            }
+        }
+
         for name in original_cols.keys() {
             if !new_cols.contains_key(name) {
                 statements.push(format!(
@@ -3160,43 +3312,20 @@ ORDER BY User, Host;"#
             }
         }
 
-        let original_indexes: HashMap<&str, &IndexDefinition> = original
-            .indexes
-            .iter()
-            .map(|i| (i.name.as_str(), i))
-            .collect();
-        let new_indexes: HashMap<&str, &IndexDefinition> =
-            new.indexes.iter().map(|i| (i.name.as_str(), i)).collect();
-
-        for (name, idx) in &original_indexes {
-            if !new_indexes.contains_key(name) {
-                if idx.is_primary {
-                    statements.push(format!("ALTER TABLE {} DROP PRIMARY KEY;", table_name));
-                } else {
-                    statements.push(format!(
-                        "ALTER TABLE {} DROP INDEX {};",
-                        table_name,
-                        self.quote_identifier(name)
-                    ));
-                }
-            }
-        }
-
         for (name, idx) in &new_indexes {
-            if !original_indexes.contains_key(name) {
-                let idx_cols: Vec<String> = idx
-                    .columns
-                    .iter()
-                    .map(|c| self.quote_identifier(c))
-                    .collect();
+            if idx.is_primary {
+                continue;
+            }
+            match original_indexes.get(name) {
+                Some(original_index)
+                    if !original_index.is_primary && !Self::index_changed(original_index, idx) => {}
+                _ => {
+                    let idx_cols: Vec<String> = idx
+                        .columns
+                        .iter()
+                        .map(|c| self.quote_identifier(c))
+                        .collect();
 
-                if idx.is_primary {
-                    statements.push(format!(
-                        "ALTER TABLE {} ADD PRIMARY KEY ({});",
-                        table_name,
-                        idx_cols.join(", ")
-                    ));
-                } else {
                     let idx_type = if idx.is_unique {
                         "UNIQUE INDEX"
                     } else {
@@ -3211,6 +3340,18 @@ ORDER BY User, Host;"#
                     ));
                 }
             }
+        }
+
+        if primary_key_changed && !new_pk.is_empty() {
+            let idx_cols: Vec<String> = new_pk
+                .iter()
+                .map(|column| self.quote_identifier(column))
+                .collect();
+            statements.push(format!(
+                "ALTER TABLE {} ADD PRIMARY KEY ({});",
+                table_name,
+                idx_cols.join(", ")
+            ));
         }
 
         for (name, new_foreign_key) in &new_foreign_keys {
@@ -3278,14 +3419,6 @@ ORDER BY User, Host;"#
         } else {
             statements.join("\n")
         }
-    }
-
-    fn build_drop_foreign_key_sql(&self, table_name: &str, foreign_key_name: &str) -> String {
-        format!(
-            "ALTER TABLE {} DROP FOREIGN KEY {};",
-            self.quote_identifier(table_name),
-            self.quote_identifier(foreign_key_name)
-        )
     }
 
     /// MySQL 使用 CHANGE COLUMN 语法进行列重命名，需要完整列定义。
@@ -3360,6 +3493,130 @@ mod tests {
         MySqlPlugin::new()
     }
 
+    fn column(name: &str, data_type: &str, is_primary_key: bool) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            is_nullable: !is_primary_key,
+            is_primary_key,
+            default_value: None,
+            comment: None,
+            charset: None,
+            collation: None,
+        }
+    }
+
+    #[test]
+    fn test_generate_table_changes_sql_formats_mysql_bit_values_as_literals() {
+        let plugin = create_plugin();
+        let request = TableSaveRequest {
+            database: "comi_app_test".to_string(),
+            schema: None,
+            table: "test_bit".to_string(),
+            columns: vec![
+                column("bit_name", "MYSQL_TYPE_BIT", true),
+                column("text_value", "varchar(20)", false),
+            ],
+            index_infos: vec![],
+            changes: vec![TableRowChange::Updated {
+                original_data: vec!["1".into(), "old".into()],
+                changes: vec![
+                    TableCellChange {
+                        column_index: 0,
+                        column_name: "bit_name".to_string(),
+                        old_value: "1".into(),
+                        new_value: "0".into(),
+                    },
+                    TableCellChange {
+                        column_index: 1,
+                        column_name: "text_value".to_string(),
+                        old_value: "old".into(),
+                        new_value: "1".into(),
+                    },
+                ],
+                rowid: None,
+            }],
+        };
+
+        assert_eq!(
+            "UPDATE `comi_app_test`.`test_bit` SET `bit_name` = 0, `text_value` = '1' WHERE `bit_name` = 1 LIMIT 1;",
+            plugin.generate_table_changes_sql(&request)
+        );
+    }
+
+    #[test]
+    fn test_generate_table_changes_sql_formats_mysql_bit_insert_and_preserves_null() {
+        let plugin = create_plugin();
+        let request = TableSaveRequest {
+            database: "comi_app_test".to_string(),
+            schema: None,
+            table: "test_bit".to_string(),
+            columns: vec![
+                column("id", "tinyint", true),
+                column("bit_name", "bit(1)", false),
+                column("text_value", "varchar(20)", false),
+            ],
+            index_infos: vec![],
+            changes: vec![TableRowChange::Added {
+                data: vec!["1".into(), "b'1'".into(), "1".into()],
+            }],
+        };
+
+        assert_eq!(
+            "INSERT INTO `comi_app_test`.`test_bit` (`id`, `bit_name`, `text_value`) VALUES (1, b'1', '1');",
+            plugin.generate_table_changes_sql(&request)
+        );
+
+        let null_request = TableSaveRequest {
+            changes: vec![TableRowChange::Updated {
+                original_data: vec!["1".into(), "1".into(), "1".into()],
+                changes: vec![TableCellChange {
+                    column_index: 1,
+                    column_name: "bit_name".to_string(),
+                    old_value: "1".into(),
+                    new_value: TableCellValue::Null,
+                }],
+                rowid: None,
+            }],
+            ..request
+        };
+
+        assert_eq!(
+            "UPDATE `comi_app_test`.`test_bit` SET `bit_name` = NULL WHERE `id` = 1 LIMIT 1;",
+            plugin.generate_table_changes_sql(&null_request)
+        );
+    }
+
+    #[test]
+    fn test_generate_table_changes_sql_decodes_mysql_binary_base64() {
+        let plugin = create_plugin();
+        let request = TableSaveRequest {
+            database: "app".to_string(),
+            schema: None,
+            table: "files".to_string(),
+            columns: vec![
+                column("id", "int", true),
+                column("payload", "varbinary(16)", false),
+            ],
+            index_infos: vec![],
+            changes: vec![TableRowChange::Updated {
+                original_data: vec!["1".into(), "AQI=".into()],
+                changes: vec![TableCellChange {
+                    column_index: 1,
+                    column_name: "payload".to_string(),
+                    old_value: "AQI=".into(),
+                    new_value: TableCellValue::Binary(vec![0xde, 0xad, 0xbe, 0xef]),
+                }],
+                rowid: None,
+            }],
+        };
+
+        assert_eq!(
+            "UPDATE `app`.`files` SET `payload` = X'deadbeef' WHERE `id` = 1 LIMIT 1;",
+            plugin.generate_table_changes_sql(&request)
+        );
+    }
+
     fn cell(value: &str) -> Option<String> {
         Some(value.to_string())
     }
@@ -3373,8 +3630,8 @@ mod tests {
         host: Option<&str>,
         database: Option<&str>,
         values: &[(&str, &str)],
-    ) -> crate::plugin::DatabaseUserOperationRequest {
-        crate::plugin::DatabaseUserOperationRequest {
+    ) -> DatabaseUserOperationRequest {
+        DatabaseUserOperationRequest {
             user_name: user_name.to_string(),
             host: host.map(str::to_string),
             database: database.map(str::to_string),
@@ -3429,6 +3686,7 @@ mod tests {
             row(&[
                 "fk_order_items_order",
                 "tenant_id",
+                "audit",
                 "orders",
                 "tenant_id",
                 "CASCADE",
@@ -3437,6 +3695,7 @@ mod tests {
             row(&[
                 "fk_order_items_order",
                 "order_id",
+                "audit",
                 "orders",
                 "id",
                 "CASCADE",
@@ -3451,6 +3710,7 @@ mod tests {
             foreign_keys[0].columns
         );
         assert_eq!("orders", foreign_keys[0].ref_table);
+        assert_eq!(Some("audit".to_string()), foreign_keys[0].ref_schema);
         assert_eq!(
             vec!["tenant_id".to_string(), "id".to_string()],
             foreign_keys[0].ref_columns
@@ -3713,6 +3973,62 @@ mod tests {
     }
 
     #[test]
+    fn test_build_column_def_preserves_character_set_and_collation() {
+        let plugin = create_plugin();
+        let col = ColumnDefinition {
+            name: "display_name".to_string(),
+            data_type: "VARCHAR".to_string(),
+            length: Some(100),
+            charset: Some("utf8mb4".to_string()),
+            collation: Some("utf8mb4_bin".to_string()),
+            ..ColumnDefinition::new("display_name")
+        };
+
+        let def = plugin.build_column_def(&col);
+
+        assert!(def.contains("VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"));
+    }
+
+    #[test]
+    fn test_build_column_def_ignores_character_metadata_for_numeric_types() {
+        let plugin = create_plugin();
+        let col = ColumnDefinition {
+            name: "score".to_string(),
+            data_type: "INT".to_string(),
+            charset: Some("utf8mb4".to_string()),
+            collation: Some("utf8mb4_bin".to_string()),
+            ..ColumnDefinition::new("score")
+        };
+
+        let def = plugin.build_column_def(&col);
+
+        assert!(!def.contains("CHARACTER SET"));
+        assert!(!def.contains("COLLATE"));
+    }
+
+    #[test]
+    fn test_build_column_definition_preserves_character_set_and_collation() {
+        let plugin = create_plugin();
+        let column = ColumnInfo {
+            name: "display_name".to_string(),
+            data_type: "varchar(100)".to_string(),
+            is_nullable: true,
+            is_primary_key: false,
+            default_value: None,
+            comment: None,
+            charset: Some("utf8mb4".to_string()),
+            collation: Some("utf8mb4_bin".to_string()),
+        };
+
+        let def = plugin.build_column_definition(&column, true);
+
+        assert_eq!(
+            def,
+            "`display_name` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"
+        );
+    }
+
+    #[test]
     fn test_build_column_def_unsigned() {
         let plugin = create_plugin();
         let mut col = ColumnDefinition::new("age").data_type("INT");
@@ -3873,6 +4189,7 @@ mod tests {
                 name: "fk_order_items_order".to_string(),
                 columns: vec!["order_id".to_string()],
                 ref_table: "orders".to_string(),
+                ref_schema: None,
                 ref_columns: vec!["id".to_string()],
                 on_delete: "CASCADE".to_string(),
                 on_update: "RESTRICT".to_string(),
@@ -4091,6 +4408,177 @@ mod tests {
     }
 
     #[test]
+    fn test_build_alter_table_sql_preserves_changed_character_metadata() {
+        let plugin = create_plugin();
+        let original_column = ColumnDefinition {
+            name: "name".to_string(),
+            data_type: "VARCHAR".to_string(),
+            length: Some(100),
+            charset: Some("utf8".to_string()),
+            collation: Some("utf8_general_ci".to_string()),
+            ..ColumnDefinition::new("name")
+        };
+        let new_column = ColumnDefinition {
+            charset: Some("utf8mb4".to_string()),
+            collation: Some("utf8mb4_bin".to_string()),
+            ..original_column.clone()
+        };
+        let original = TableDesign {
+            database_name: "test_db".to_string(),
+            table_name: "users".to_string(),
+            columns: vec![original_column],
+            indexes: vec![],
+            foreign_keys: vec![],
+            options: TableOptions::default(),
+        };
+        let new = TableDesign {
+            columns: vec![new_column],
+            ..original.clone()
+        };
+
+        let sql = plugin.build_alter_table_sql(&original, &new);
+
+        assert!(sql.contains(
+            "MODIFY COLUMN `name` VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"
+        ));
+    }
+
+    #[test]
+    fn test_build_alter_table_sql_rebuilds_same_named_index_when_columns_change() {
+        let plugin = create_plugin();
+
+        let original = TableDesign {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id").data_type("INT"),
+                ColumnDefinition::new("email")
+                    .data_type("VARCHAR")
+                    .length(100),
+                ColumnDefinition::new("name")
+                    .data_type("VARCHAR")
+                    .length(100),
+            ],
+            indexes: vec![
+                IndexDefinition::new("idx_users_email").columns(vec!["email".to_string()]),
+            ],
+            ..TableDesign::default()
+        };
+        let new = TableDesign {
+            columns: vec![
+                ColumnDefinition::new("id").data_type("INT"),
+                ColumnDefinition::new("email")
+                    .data_type("VARCHAR")
+                    .length(200),
+                ColumnDefinition::new("name")
+                    .data_type("VARCHAR")
+                    .length(100),
+            ],
+            indexes: vec![
+                IndexDefinition::new("idx_users_email").columns(vec!["name".to_string()]),
+            ],
+            ..original.clone()
+        };
+
+        let sql = plugin.build_alter_table_sql(&original, &new);
+        assert!(sql.contains("DROP INDEX `idx_users_email`;"));
+        assert!(sql.contains("ADD INDEX `idx_users_email` (`name`);"));
+    }
+
+    #[test]
+    fn test_build_alter_table_sql_rebuilds_same_named_index_when_unique_changes() {
+        let plugin = create_plugin();
+
+        let original = TableDesign {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition::new("email")
+                    .data_type("VARCHAR")
+                    .length(100),
+            ],
+            indexes: vec![
+                IndexDefinition::new("idx_users_email").columns(vec!["email".to_string()]),
+            ],
+            ..TableDesign::default()
+        };
+        let new = TableDesign {
+            indexes: vec![
+                IndexDefinition::new("idx_users_email")
+                    .columns(vec!["email".to_string()])
+                    .unique(true),
+            ],
+            ..original.clone()
+        };
+
+        let sql = plugin.build_alter_table_sql(&original, &new);
+        assert!(sql.contains("DROP INDEX `idx_users_email`;"));
+        assert!(sql.contains("ADD UNIQUE INDEX `idx_users_email` (`email`);"));
+    }
+
+    #[test]
+    fn test_build_alter_table_sql_rebuilds_primary_key_when_columns_change() {
+        let plugin = create_plugin();
+
+        let original = TableDesign {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id")
+                    .data_type("INT")
+                    .primary_key(true),
+                ColumnDefinition::new("email")
+                    .data_type("VARCHAR")
+                    .length(100),
+            ],
+            ..TableDesign::default()
+        };
+        let new = TableDesign {
+            columns: vec![
+                ColumnDefinition::new("id")
+                    .data_type("INT")
+                    .primary_key(true),
+                ColumnDefinition::new("email")
+                    .data_type("VARCHAR")
+                    .length(100)
+                    .primary_key(true),
+            ],
+            ..original.clone()
+        };
+
+        let sql = plugin.build_alter_table_sql(&original, &new);
+        assert!(sql.contains("DROP PRIMARY KEY;"));
+        assert!(sql.contains("ADD PRIMARY KEY (`id`, `email`);"));
+    }
+
+    #[test]
+    fn test_build_alter_table_sql_drops_index_before_indexed_column() {
+        let plugin = create_plugin();
+
+        let original = TableDesign {
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id").data_type("INT"),
+                ColumnDefinition::new("legacy_email")
+                    .data_type("VARCHAR")
+                    .length(100),
+            ],
+            indexes: vec![
+                IndexDefinition::new("idx_users_legacy_email")
+                    .columns(vec!["legacy_email".to_string()]),
+            ],
+            ..TableDesign::default()
+        };
+        let new = TableDesign {
+            columns: vec![ColumnDefinition::new("id").data_type("INT")],
+            indexes: vec![],
+            ..original.clone()
+        };
+
+        let sql = plugin.build_alter_table_sql(&original, &new);
+        let drop_index = sql.find("DROP INDEX").expect("drop index statement");
+        let drop_column = sql.find("DROP COLUMN").expect("drop column statement");
+        assert!(drop_index < drop_column, "{sql}");
+    }
+
+    #[test]
     fn test_build_alter_table_sql_add_and_drop_foreign_keys() {
         let plugin = create_plugin();
 
@@ -4107,6 +4595,7 @@ mod tests {
                 name: "fk_order_items_legacy".to_string(),
                 columns: vec!["legacy_order_id".to_string()],
                 ref_table: "orders".to_string(),
+                ref_schema: None,
                 ref_columns: vec!["id".to_string()],
                 on_delete: String::new(),
                 on_update: String::new(),
@@ -4125,6 +4614,7 @@ mod tests {
                 name: "fk_order_items_order".to_string(),
                 columns: vec!["order_id".to_string()],
                 ref_table: "orders".to_string(),
+                ref_schema: None,
                 ref_columns: vec!["id".to_string()],
                 on_delete: "CASCADE".to_string(),
                 on_update: "RESTRICT".to_string(),

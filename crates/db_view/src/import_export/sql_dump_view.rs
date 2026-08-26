@@ -1,6 +1,7 @@
 use gpui::{
-    App, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, ParentElement, Render, Styled, Window, div, prelude::FluentBuilder, px,
+    App, AppContext, ClickEvent, ColorExt, Context, Entity, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, ParentElement, Render, Styled, Window, div,
+    prelude::FluentBuilder, px,
 };
 use gpui_component::{
     ActiveTheme, VirtualListScrollHandle,
@@ -283,7 +284,8 @@ impl SqlDumpView {
                 let progress_clone = progress.clone();
 
                 let write_error = match &event {
-                    ExportProgressEvent::StructureExported { data, .. }
+                    ExportProgressEvent::HeaderExported { data }
+                    | ExportProgressEvent::StructureExported { data, .. }
                     | ExportProgressEvent::DataExported { data, .. } => {
                         Self::append_dump_chunk(&file_path_for_write, data, &mut file_created)
                             .err()
@@ -321,6 +323,7 @@ impl SqlDumpView {
                     });
 
                     match event {
+                        ExportProgressEvent::HeaderExported { .. } => {}
                         ExportProgressEvent::TableStart {
                             table,
                             table_index,

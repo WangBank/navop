@@ -12,6 +12,7 @@ pub(super) enum ConnectionCopyAction {
     RedisAddress,
     MongoDbAddress,
     RemoteDesktopAddress,
+    TelnetAddress,
     Username,
     SerialPort,
     ForwardingRule,
@@ -130,6 +131,11 @@ pub(super) fn connection_copy_actions(
                 ]);
             }
         }
+        ConnectionType::Telnet => {
+            if connection_address(connection).is_some() {
+                actions.push(ConnectionCopyAction::TelnetAddress);
+            }
+        }
         ConnectionType::PortForwarding => {
             if forwarding_rule(connection).is_some() {
                 actions.push(ConnectionCopyAction::ForwardingRule);
@@ -172,6 +178,7 @@ pub(super) fn connection_copy_text(
         ConnectionCopyAction::RedisAddress => connection_address(connection),
         ConnectionCopyAction::MongoDbAddress => connection_address(connection),
         ConnectionCopyAction::RemoteDesktopAddress => connection_address(connection),
+        ConnectionCopyAction::TelnetAddress => connection_address(connection),
         ConnectionCopyAction::Username => connection_username(connection),
         ConnectionCopyAction::SerialPort => serial_port(connection),
         ConnectionCopyAction::ForwardingRule => forwarding_rule(connection),
@@ -279,6 +286,10 @@ fn connection_address(connection: &StoredConnection) -> Option<String> {
                     })
             }),
         ConnectionType::Serial | ConnectionType::PortForwarding => None,
+        ConnectionType::Telnet => connection
+            .to_telnet_params()
+            .ok()
+            .and_then(|params| optional_host_port(&params.host, Some(params.port))),
         ConnectionType::Rdp | ConnectionType::Vnc => connection
             .to_remote_desktop_params()
             .ok()
@@ -390,6 +401,7 @@ mod tests {
         StoredConnection::new_ssh(
             "SSH".to_string(),
             SshParams {
+                sftp_account: None,
                 host: "2001:db8::1".to_string(),
                 port: 2222,
                 username: "alice".to_string(),
@@ -414,6 +426,7 @@ mod tests {
                 proxy: None,
                 os_id: None,
                 icon: None,
+                account_expect: Default::default(),
             },
             None,
         )
@@ -718,6 +731,8 @@ mod tests {
                 read_only: false,
                 audio_playback: false,
                 proxy: None,
+                backend_preference: Default::default(),
+                rdp: None,
             },
             None,
         );
@@ -786,6 +801,8 @@ mod tests {
                 read_only: false,
                 audio_playback: false,
                 proxy: None,
+                backend_preference: Default::default(),
+                rdp: None,
             },
             None,
         );

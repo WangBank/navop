@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use russh::ChannelMsg;
 use russh::client::{self, Handle};
-use russh::keys::PublicKey;
+use russh::keys::PublicKeyOrCertificate;
 use russh_sftp::client::RawSftpSession;
 use russh_sftp::client::SftpSession;
 use russh_sftp::client::error::Error as SftpError;
@@ -879,8 +879,17 @@ impl client::Handler for SftpHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &PublicKey,
+        server_identity: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
+        let server_public_key = match server_identity {
+            PublicKeyOrCertificate::PublicKey { key, .. } => key,
+            PublicKeyOrCertificate::Certificate(_) => {
+                return Err(anyhow!(
+                    "SSH host certificates are not supported for {}",
+                    self.identity
+                ));
+            }
+        };
         let acceptance = self
             .host_key_verifier
             .verify(&self.identity, server_public_key)
@@ -3142,6 +3151,47 @@ mod tests {
                 .iter()
                 .any(|name| name == legacy)
         }));
+    }
+
+    #[test]
+    fn sftp_config_enables_ssh_dss_host_keys_only_when_requested() {
+        let identity = HostKeyIdentity::new("host.example", 22, ssh::HostKeyRoute::Direct);
+        let mut ssh_config = SshConnectConfig {
+            host: "host.example".to_owned(),
+            port: 22,
+            username: "tester".to_owned(),
+            auth: ssh::SshAuth::Agent,
+            timeout: None,
+            keepalive_interval: None,
+            keepalive_max: None,
+            jump_server: None,
+            proxy: None,
+            keyboard_interactive_responder: None,
+            host_key_verifier: HostKeyVerifier::default(),
+            x11_forwarding: false,
+            allow_legacy_algorithms: false,
+        };
+
+        let modern =
+            build_sftp_russh_config(&ssh_config, &identity).expect("SFTP config should build");
+        assert!(
+            !modern
+                .preferred
+                .key
+                .iter()
+                .any(|algorithm| algorithm.as_str() == "ssh-dss")
+        );
+
+        ssh_config.allow_legacy_algorithms = true;
+        let legacy =
+            build_sftp_russh_config(&ssh_config, &identity).expect("SFTP config should build");
+        assert!(
+            legacy
+                .preferred
+                .key
+                .iter()
+                .any(|algorithm| algorithm.as_str() == "ssh-dss")
+        );
     }
 
     #[test]

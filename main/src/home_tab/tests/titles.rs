@@ -103,6 +103,8 @@ fn remote_desktop_connection_info_uses_remote_desktop_params() {
         read_only: false,
         audio_playback: false,
         proxy: None,
+        backend_preference: Default::default(),
+        rdp: None,
     };
 
     assert_eq!(
@@ -124,6 +126,8 @@ fn remote_desktop_connection_info_omits_missing_username() {
         read_only: false,
         audio_playback: false,
         proxy: None,
+        backend_preference: Default::default(),
+        rdp: None,
     };
 
     assert_eq!("10.0.0.9:5900", remote_desktop_connection_info(&params));

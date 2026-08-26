@@ -17,11 +17,14 @@ use crate::import_export::{
 };
 use crate::manifest_helpers::{
     DatabaseActionDescriptorExt, action, action_with_scope, field, option,
-    schema_preference_fields, ssh_auth_rules, ssh_enabled_rules, ssh_field, ssh_number_field,
-    ssh_password_field, tab, yes_no_options,
+    schema_preference_fields, ssh_auth_options, ssh_auth_rules, ssh_enabled_rules, ssh_field,
+    ssh_number_field, ssh_password_field, tab, yes_no_options,
 };
 use crate::oracle::connection::OracleDbConnection;
-use crate::plugin::{DatabasePlugin, DatabaseUserOperationRequest, SqlCompletionInfo};
+use crate::plugin::{
+    DatabasePlugin, DatabaseUserOperationRequest, PaginatedQuery, SqlCompletionInfo,
+    parse_table_data_total_count,
+};
 use crate::plugin_manifest::{
     DatabaseActionId, DatabaseActionManifest, DatabaseActionPlacement, DatabaseActionToolbarScope,
     DatabaseCapabilities, DatabaseFormFieldType, DatabaseFormKind, DatabaseFormManifest,
@@ -70,10 +73,37 @@ const ORACLE_DATETIME_FORMAT: &str = "YYYY-MM-DD HH24:MI:SS";
 const ORACLE_DATETIME_FRACTION_FORMAT: &str = "YYYY-MM-DD HH24:MI:SS.FF6";
 const ORACLE_DATETIME_TZ_FORMAT: &str = "YYYY-MM-DD HH24:MI:SS TZH:TZM";
 const ORACLE_DATETIME_TZ_FRACTION_FORMAT: &str = "YYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM";
+const ORACLE_PAGINATION_ROWNUM_COLUMN: &str = "__navop_pagination_rownum__";
 
 impl OraclePlugin {
     pub fn new() -> Self {
         Self
+    }
+
+    fn sql_literal(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+
+    fn normalize_export_ddl(sql: &str) -> Option<String> {
+        let sql = sql.trim().trim_end_matches(';').trim_end();
+        (!sql.is_empty()).then(|| sql.to_string())
+    }
+
+    async fn export_query_rows(
+        connection: &dyn DbConnection,
+        query: &str,
+        context: &str,
+    ) -> Result<Vec<Vec<Option<String>>>> {
+        match connection.query(query).await {
+            Ok(SqlResult::Query(result)) => Ok(result.rows),
+            Ok(SqlResult::Exec(_)) => {
+                Err(anyhow::anyhow!("{context} returned an execution result"))
+            }
+            Ok(SqlResult::Error(error)) => {
+                Err(anyhow::anyhow!("{context} failed: {}", error.message))
+            }
+            Err(error) => Err(anyhow::anyhow!("{context} failed: {error}")),
+        }
     }
 
     fn comment_literal(comment: &str) -> String {
@@ -132,11 +162,21 @@ impl OraclePlugin {
         value: &TableCellValue,
         column: Option<&ColumnInfo>,
     ) -> String {
-        let TableCellValue::Text(value) = value else {
-            return "NULL".to_string();
+        let value = match value {
+            TableCellValue::Null => return "NULL".to_string(),
+            TableCellValue::Binary(bytes) => return self.format_binary_literal(bytes),
+            TableCellValue::Text(value) => value,
         };
         if value.is_empty() {
             return "NULL".to_string();
+        }
+
+        if let Some(expr) = crate::sql_literal::format_special_table_value_for_database(
+            &DatabaseType::Oracle,
+            value,
+            column,
+        ) {
+            return expr;
         }
 
         if let Some(expr) = oracle_temporal_value_expr(value, column) {
@@ -713,11 +753,7 @@ fn oracle_connection_form() -> DatabaseFormManifest {
                     )
                     .optional()
                     .with_default("password")
-                    .with_options(vec![
-                        option("password", "ConnectionForm.ssh_auth_password"),
-                        option("private_key", "ConnectionForm.ssh_auth_private_key"),
-                        option("agent", "ConnectionForm.ssh_auth_agent"),
-                    ])
+                    .with_options(ssh_auth_options())
                     .with_visibility(ssh_enabled_rules()),
                     ssh_password_field(
                         "ssh_password",
@@ -1065,6 +1101,30 @@ impl DatabasePlugin for OraclePlugin {
         "ROWID"
     }
 
+    fn build_paginated_query(
+        &self,
+        base_sql: &str,
+        limit: usize,
+        offset: usize,
+        _order_clause: &str,
+    ) -> PaginatedQuery {
+        if offset == 0 {
+            return PaginatedQuery::new(format!(
+                "SELECT * FROM ({base_sql}) WHERE ROWNUM <= {limit}"
+            ));
+        }
+
+        let end_row = offset.saturating_add(limit);
+        PaginatedQuery::new(format!(
+            "SELECT * FROM (\
+             SELECT navop_page_.*, ROWNUM AS \"{ORACLE_PAGINATION_ROWNUM_COLUMN}\" \
+             FROM ({base_sql}) navop_page_ \
+             WHERE ROWNUM <= {end_row}\
+             ) WHERE \"{ORACLE_PAGINATION_ROWNUM_COLUMN}\" > {offset}"
+        ))
+        .with_hidden_result_column(ORACLE_PAGINATION_ROWNUM_COLUMN)
+    }
+
     fn format_table_reference(&self, _database: &str, schema: Option<&str>, table: &str) -> String {
         match schema {
             Some(s) => format!(
@@ -1074,6 +1134,122 @@ impl DatabasePlugin for OraclePlugin {
             ),
             None => self.quote_identifier(table),
         }
+    }
+
+    async fn export_table_create_sql(
+        &self,
+        connection: &dyn DbConnection,
+        database: &str,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<String> {
+        let owner = if let Some(owner) = schema.filter(|owner| !owner.trim().is_empty()) {
+            owner.to_string()
+        } else if !database.trim().is_empty() {
+            database.to_string()
+        } else {
+            connection
+                .current_database()
+                .await
+                .map_err(|error| anyhow::anyhow!("Failed to resolve Oracle owner: {error}"))?
+                .filter(|owner| !owner.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Oracle table owner is required for DDL export"))?
+        };
+        let owner_literal = Self::sql_literal(&owner);
+        let table_literal = Self::sql_literal(table);
+        let table_ref = format!(
+            "{}.{}",
+            self.quote_identifier(&owner),
+            self.quote_identifier(table)
+        );
+        let mut statements = Vec::new();
+
+        let table_ddl_query = format!(
+            "SELECT DBMS_METADATA.GET_DDL('TABLE', {table_literal}, {owner_literal}) FROM DUAL"
+        );
+        let table_rows =
+            Self::export_query_rows(connection, &table_ddl_query, "Oracle table DDL query").await?;
+        let table_ddl = table_rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(|value| value.as_deref())
+            .and_then(Self::normalize_export_ddl)
+            .ok_or_else(|| anyhow::anyhow!("Oracle table DDL query returned empty DDL"))?;
+        statements.push(table_ddl);
+
+        let table_comment_query = format!(
+            "SELECT comments FROM ALL_TAB_COMMENTS \
+             WHERE owner = {owner_literal} AND table_name = {table_literal} \
+             AND table_type = 'TABLE'"
+        );
+        let table_comment_rows = Self::export_query_rows(
+            connection,
+            &table_comment_query,
+            "Oracle table comment query",
+        )
+        .await?;
+        if let Some(comment) = table_comment_rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(|value| value.as_deref())
+            .filter(|comment| !comment.is_empty())
+        {
+            statements.push(format!(
+                "COMMENT ON TABLE {table_ref} IS {}",
+                Self::comment_literal(comment)
+            ));
+        }
+
+        let column_comment_query = format!(
+            "SELECT column_name, comments FROM ALL_COL_COMMENTS \
+             WHERE owner = {owner_literal} AND table_name = {table_literal} \
+             AND comments IS NOT NULL ORDER BY column_name"
+        );
+        let column_comment_rows = Self::export_query_rows(
+            connection,
+            &column_comment_query,
+            "Oracle column comment query",
+        )
+        .await?;
+        for row in column_comment_rows {
+            let Some(column_name) = row.first().and_then(|value| value.as_deref()) else {
+                continue;
+            };
+            let Some(comment) = row
+                .get(1)
+                .and_then(|value| value.as_deref())
+                .filter(|comment| !comment.is_empty())
+            else {
+                continue;
+            };
+            statements.push(format!(
+                "COMMENT ON COLUMN {table_ref}.{} IS {}",
+                self.quote_identifier(column_name),
+                Self::comment_literal(comment)
+            ));
+        }
+
+        let index_ddl_query = format!(
+            "SELECT DBMS_METADATA.GET_DDL('INDEX', i.index_name, i.owner) \
+             FROM ALL_INDEXES i \
+             WHERE i.table_owner = {owner_literal} AND i.table_name = {table_literal} \
+             AND NOT EXISTS ( \
+                 SELECT 1 FROM ALL_CONSTRAINTS c \
+                 WHERE c.owner = i.owner AND c.index_name = i.index_name \
+                   AND c.constraint_type IN ('P', 'U') \
+             ) \
+             ORDER BY i.index_name"
+        );
+        let index_rows =
+            Self::export_query_rows(connection, &index_ddl_query, "Oracle index DDL query").await?;
+        statements.extend(
+            index_rows
+                .into_iter()
+                .filter_map(|row| row.first().cloned().flatten())
+                .filter_map(|ddl| Self::normalize_export_ddl(&ddl)),
+        );
+
+        Ok(statements.join(";\n"))
     }
 
     fn generate_table_changes_sql(&self, request: &TableSaveRequest) -> String {
@@ -1107,7 +1283,7 @@ impl DatabasePlugin for OraclePlugin {
             Some(ref c) if !c.trim().is_empty() => format!(" ORDER BY {}", c.trim()),
             _ => String::new(),
         };
-        let offset = (request.page.saturating_sub(1)) * request.page_size;
+        let offset = request.effective_offset();
 
         let table_ref = self.format_table_reference(
             &request.database,
@@ -1115,17 +1291,12 @@ impl DatabasePlugin for OraclePlugin {
             &request.table,
         );
 
-        let count_sql = format!("SELECT COUNT(*) FROM {}{}", table_ref, where_clause);
-
-        let total_count = match connection.query(&count_sql).await? {
-            SqlResult::Query(result) => result
-                .rows
-                .first()
-                .and_then(|r| r.first())
-                .and_then(|v| v.as_ref())
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(0),
-            _ => 0,
+        let total_count = match request.known_total_count {
+            Some(total_count) => total_count,
+            None => {
+                let count_sql = format!("SELECT COUNT(*) FROM {}{}", table_ref, where_clause);
+                parse_table_data_total_count(connection.query(&count_sql).await?)?
+            }
         };
 
         let order_by = if order_clause.is_empty() {
@@ -1134,19 +1305,30 @@ impl DatabasePlugin for OraclePlugin {
             order_clause.clone()
         };
 
-        let data_sql = format!(
-            "SELECT ROWID AS \"__rowid__\", t.* FROM {} t{}{} OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
-            table_ref, where_clause, order_by, offset, request.page_size
+        let base_sql = format!(
+            "SELECT ROWID AS \"__rowid__\", t.* FROM {table_ref} t{where_clause}{order_by}"
         );
+        let paginated_query =
+            self.build_paginated_query(&base_sql, request.page_size, offset, &order_by);
 
-        let sql_result = connection.query(&data_sql).await?;
+        let sql_result = connection.query(&paginated_query.sql).await?;
         let duration = start_time.elapsed().as_millis();
 
-        let query_result = match sql_result {
+        let mut query_result = match sql_result {
             SqlResult::Query(query_result) => Ok::<QueryResult, anyhow::Error>(query_result),
             SqlResult::Exec(_) => anyhow::bail!(t!("Error.query_type_error")),
             SqlResult::Error(sql_error_info) => anyhow::bail!(sql_error_info.message),
         }?;
+        paginated_query.strip_hidden_result_columns(&mut query_result)?;
+        crate::query_result_normalization::normalize_table_query_result(
+            self,
+            connection,
+            &request.database,
+            request.schema.as_deref(),
+            &request.table,
+            &mut query_result,
+        )
+        .await?;
 
         Ok(TableDataResponse {
             query_result,
@@ -1485,10 +1667,11 @@ impl DatabasePlugin for OraclePlugin {
                 .iter()
                 .map(|row| TableInfo {
                     name: row.get(0).and_then(|v| v.clone()).unwrap_or_default(),
+                    object_type: crate::TableObjectType::Table,
                     schema: Some(schema.to_string()),
                     comment: row.get(1).and_then(|v| v.clone()),
                     engine: None,
-                    row_count: None,
+
                     create_time: None,
                     charset: None,
                     collation: None,
@@ -1931,6 +2114,16 @@ impl DatabasePlugin for OraclePlugin {
         }
     }
 
+    async fn list_functions_in_schema(
+        &self,
+        connection: &dyn DbConnection,
+        database: &str,
+        schema: Option<String>,
+    ) -> Result<Vec<FunctionInfo>> {
+        let schema = schema.unwrap_or_else(|| database.to_string());
+        self.list_functions(connection, &schema).await
+    }
+
     async fn list_functions_view(
         &self,
         connection: &dyn DbConnection,
@@ -2034,6 +2227,16 @@ impl DatabasePlugin for OraclePlugin {
         }
     }
 
+    async fn list_procedures_in_schema(
+        &self,
+        connection: &dyn DbConnection,
+        database: &str,
+        schema: Option<String>,
+    ) -> Result<Vec<FunctionInfo>> {
+        let schema = schema.unwrap_or_else(|| database.to_string());
+        self.list_procedures(connection, &schema).await
+    }
+
     async fn list_procedures_view(
         &self,
         connection: &dyn DbConnection,
@@ -2135,6 +2338,16 @@ impl DatabasePlugin for OraclePlugin {
         } else {
             Ok(vec![])
         }
+    }
+
+    async fn list_triggers_in_schema(
+        &self,
+        connection: &dyn DbConnection,
+        database: &str,
+        schema: Option<String>,
+    ) -> Result<Vec<TriggerInfo>> {
+        let schema = schema.unwrap_or_else(|| database.to_string());
+        self.list_triggers(connection, &schema).await
     }
 
     async fn list_triggers_view(
@@ -2553,11 +2766,19 @@ ORDER BY username;"#
             .map(|column| self.quote_identifier(column))
             .collect::<Vec<_>>()
             .join(", ");
+        let referenced_table = match foreign_key.ref_schema.as_deref() {
+            Some(schema) if !schema.trim().is_empty() => format!(
+                "{}.{}",
+                self.quote_identifier(schema),
+                self.quote_identifier(&foreign_key.ref_table)
+            ),
+            _ => self.quote_identifier(&foreign_key.ref_table),
+        };
         let mut definition = format!(
             "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({})",
             self.quote_identifier(&foreign_key.name),
             columns,
-            self.quote_identifier(&foreign_key.ref_table),
+            referenced_table,
             ref_columns
         );
         if let Some(action) = Self::foreign_key_delete_action_sql(&foreign_key.on_delete) {
@@ -2573,6 +2794,7 @@ ORDER BY username;"#
     ) -> bool {
         left.columns != right.columns
             || left.ref_table != right.ref_table
+            || left.ref_schema != right.ref_schema
             || left.ref_columns != right.ref_columns
             || Self::foreign_key_delete_action_sql(&left.on_delete)
                 != Self::foreign_key_delete_action_sql(&right.on_delete)
@@ -2835,6 +3057,7 @@ ORDER BY username;"#
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executor::{ExecOptions, SqlSource};
     use crate::plugin::DatabasePlugin;
     use crate::plugin_manifest::{DatabaseActionId, DatabaseFormKind};
     use crate::types::{
@@ -2842,9 +3065,257 @@ mod tests {
         TableDesign, TableOptions, TableRowChange, TableSaveRequest,
     };
     use std::collections::HashMap;
+    use std::sync::Mutex;
+    use tokio::sync::mpsc;
+
+    struct ExportDdlConnection {
+        config: DbConnectionConfig,
+        queries: Mutex<Vec<String>>,
+    }
+
+    impl ExportDdlConnection {
+        fn new() -> Self {
+            Self {
+                config: DbConnectionConfig {
+                    id: "oracle-export-ddl".to_string(),
+                    name: "Oracle export DDL".to_string(),
+                    database_type: DatabaseType::Oracle,
+                    host: "localhost".to_string(),
+                    port: 1521,
+                    username: "APP".to_string(),
+                    password: String::new(),
+                    credential_reference: None,
+                    database: Some("APP".to_string()),
+                    service_name: Some("FREEPDB1".to_string()),
+                    sid: None,
+                    workspace_id: None,
+                    proxy: None,
+                    extra_params: Default::default(),
+                },
+                queries: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn queries(&self) -> Vec<String> {
+            self.queries.lock().expect("queries mutex poisoned").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DbConnection for ExportDdlConnection {
+        fn config(&self) -> &DbConnectionConfig {
+            &self.config
+        }
+
+        fn set_config_database(&mut self, database: Option<String>) {
+            self.config.database = database;
+        }
+
+        async fn connect(&mut self) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        async fn disconnect(&mut self) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        async fn execute(
+            &self,
+            _plugin: &dyn DatabasePlugin,
+            _script: &str,
+            _options: ExecOptions,
+        ) -> Result<Vec<SqlResult>, DbError> {
+            Err(DbError::query("execute should not be used by export tests"))
+        }
+
+        async fn query(&self, query: &str) -> Result<SqlResult, DbError> {
+            self.queries
+                .lock()
+                .expect("queries mutex poisoned")
+                .push(query.to_string());
+
+            let rows = if query.contains("GET_DDL('TABLE'") {
+                vec![vec![Some(
+                    "CREATE TABLE \"APP\".\"ORDERS\" (
+  \"TENANT_ID\" NUMBER GENERATED BY DEFAULT AS IDENTITY,
+  \"ORDER_ID\" NUMBER NOT NULL,
+  \"CUSTOMER_ID\" NUMBER,
+  CONSTRAINT \"ORDERS_PK\" PRIMARY KEY (\"TENANT_ID\", \"ORDER_ID\"),
+  CONSTRAINT \"ORDERS_CUSTOMER_FK\" FOREIGN KEY (\"CUSTOMER_ID\") REFERENCES \"APP\".\"CUSTOMERS\" (\"ID\") ON DELETE CASCADE,
+  CONSTRAINT \"ORDERS_AMOUNT_CK\" CHECK (\"ORDER_ID\" > 0)
+) TABLESPACE \"USERS\";"
+                        .to_string(),
+                )]]
+            } else if query.contains("ALL_TAB_COMMENTS") {
+                vec![vec![Some("Customer's orders".to_string())]]
+            } else if query.contains("ALL_COL_COMMENTS") {
+                vec![
+                    vec![
+                        Some("TENANT_ID".to_string()),
+                        Some("Tenant identifier".to_string()),
+                    ],
+                    vec![
+                        Some("ORDER_ID".to_string()),
+                        Some("Order identifier".to_string()),
+                    ],
+                ]
+            } else if query.contains("GET_DDL('INDEX'") {
+                vec![vec![Some(
+                    "CREATE INDEX \"APP\".\"IDX_ORDERS_CUSTOMER\" ON \"APP\".\"ORDERS\" (\"CUSTOMER_ID\") TABLESPACE \"USERS\";"
+                        .to_string(),
+                )]]
+            } else {
+                return Err(DbError::query(format!(
+                    "unexpected Oracle export query: {query}"
+                )));
+            };
+
+            Ok(SqlResult::Query(QueryResult {
+                sql: query.to_string(),
+                columns: vec![],
+                column_meta: vec![],
+                rows,
+                binary_cells: vec![],
+                elapsed_ms: 0,
+            }))
+        }
+
+        async fn current_database(&self) -> Result<Option<String>, DbError> {
+            Ok(Some("APP".to_string()))
+        }
+
+        async fn switch_database(&self, _database: &str) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        async fn execute_streaming(
+            &self,
+            _plugin: &dyn DatabasePlugin,
+            _source: SqlSource,
+            _options: ExecOptions,
+            _sender: mpsc::Sender<crate::connection::StreamingProgress>,
+        ) -> Result<(), DbError> {
+            Ok(())
+        }
+    }
 
     fn create_plugin() -> OraclePlugin {
         OraclePlugin::new()
+    }
+
+    #[test]
+    fn table_data_pagination_uses_oracle_11g_compatible_rownum() {
+        let paginated_query = create_plugin().build_paginated_query(
+            "SELECT ROWID AS \"__rowid__\", t.* FROM \"APP\".\"USERS\" t WHERE active = 1 ORDER BY created_at DESC",
+            10,
+            20,
+            " ORDER BY created_at DESC",
+        );
+        let sql = paginated_query.sql;
+
+        assert!(!sql.contains("OFFSET"));
+        assert!(!sql.contains("FETCH NEXT"));
+        assert!(sql.contains(
+            "SELECT ROWID AS \"__rowid__\", t.* FROM \"APP\".\"USERS\" t WHERE active = 1 ORDER BY created_at DESC"
+        ));
+        assert!(sql.contains("WHERE ROWNUM <= 30"));
+        assert!(sql.contains("\"__navop_pagination_rownum__\" > 20"));
+    }
+
+    #[test]
+    fn first_page_pagination_does_not_expose_an_internal_column() {
+        let paginated_query =
+            create_plugin().build_paginated_query("SELECT * FROM \"USERS\"", 10, 0, "");
+
+        assert_eq!(
+            paginated_query.sql,
+            "SELECT * FROM (SELECT * FROM \"USERS\") WHERE ROWNUM <= 10"
+        );
+
+        let mut query_result = QueryResult {
+            sql: paginated_query.sql.clone(),
+            columns: vec!["id".to_string()],
+            column_meta: vec![],
+            rows: vec![vec![Some("42".to_string())]],
+            binary_cells: vec![],
+            elapsed_ms: 0,
+        };
+        paginated_query
+            .strip_hidden_result_columns(&mut query_result)
+            .unwrap();
+        assert_eq!(query_result.columns, vec!["id"]);
+    }
+
+    #[tokio::test]
+    async fn export_table_create_sql_preserves_oracle_metadata() {
+        let connection = ExportDdlConnection::new();
+        let ddl = create_plugin()
+            .export_table_create_sql(&connection, "APP", Some("APP"), "ORDERS")
+            .await
+            .expect("Oracle DDL export should succeed");
+
+        assert!(ddl.contains("GENERATED BY DEFAULT AS IDENTITY"));
+        assert!(ddl.contains("PRIMARY KEY (\"TENANT_ID\", \"ORDER_ID\")"));
+        assert!(ddl.contains("FOREIGN KEY (\"CUSTOMER_ID\")"));
+        assert!(ddl.contains("CHECK (\"ORDER_ID\" > 0)"));
+        assert!(ddl.contains("TABLESPACE \"USERS\""));
+        assert!(ddl.contains("COMMENT ON TABLE \"APP\".\"ORDERS\" IS 'Customer''s orders'"));
+        assert!(
+            ddl.contains(
+                "COMMENT ON COLUMN \"APP\".\"ORDERS\".\"TENANT_ID\" IS 'Tenant identifier'"
+            )
+        );
+        assert!(ddl.contains("CREATE INDEX \"APP\".\"IDX_ORDERS_CUSTOMER\""));
+
+        let queries = connection.queries();
+        assert_eq!(queries.len(), 4);
+        assert!(queries[0].contains("GET_DDL('TABLE', 'ORDERS', 'APP')"));
+        assert!(
+            queries[3].contains("NOT EXISTS"),
+            "constraint-backed indexes must be excluded"
+        );
+    }
+
+    #[test]
+    fn table_data_pagination_removes_internal_rownum_column() {
+        let paginated_query =
+            create_plugin().build_paginated_query("SELECT * FROM \"USERS\"", 10, 20, "");
+        let mut query_result = QueryResult {
+            sql: "test".to_string(),
+            columns: vec![
+                "__rowid__".to_string(),
+                "id".to_string(),
+                ORACLE_PAGINATION_ROWNUM_COLUMN.to_string(),
+            ],
+            column_meta: vec![
+                crate::executor::QueryColumnMeta::new("__rowid__", "ROWID"),
+                crate::executor::QueryColumnMeta::new("id", "NUMBER"),
+                crate::executor::QueryColumnMeta::new(ORACLE_PAGINATION_ROWNUM_COLUMN, "NUMBER"),
+            ],
+            rows: vec![vec![
+                Some("AAABBB".to_string()),
+                Some("42".to_string()),
+                Some("21".to_string()),
+            ]],
+            binary_cells: vec![crate::executor::BinaryCell {
+                row_index: 0,
+                column_index: 1,
+                bytes: vec![42],
+            }],
+            elapsed_ms: 0,
+        };
+
+        paginated_query
+            .strip_hidden_result_columns(&mut query_result)
+            .unwrap();
+
+        assert_eq!(query_result.columns, vec!["__rowid__", "id"]);
+        assert_eq!(
+            query_result.rows,
+            vec![vec![Some("AAABBB".to_string()), Some("42".to_string())]]
+        );
+        assert_eq!(query_result.column_meta.len(), 2);
+        assert_eq!(query_result.binary_cells[0].column_index, 1);
     }
 
     fn user_request(
@@ -3099,7 +3570,7 @@ mod tests {
         let sql = plugin.generate_table_changes_sql(&request);
 
         assert_eq!(
-            "INSERT INTO \"APP\".\"EVENTS\" (\"ID\", \"STARTED_AT\") VALUES ('1', TO_DATE('2026-06-21 14:05:06', 'YYYY-MM-DD HH24:MI:SS'));",
+            "INSERT INTO \"APP\".\"EVENTS\" (\"ID\", \"STARTED_AT\") VALUES (1, TO_DATE('2026-06-21 14:05:06', 'YYYY-MM-DD HH24:MI:SS'));",
             sql
         );
     }
@@ -3156,8 +3627,38 @@ mod tests {
         let sql = plugin.generate_table_changes_sql(&request);
 
         assert_eq!(
-            "INSERT INTO \"APP\".\"EVENTS\" (\"ID\", \"UPDATED_AT\") VALUES ('1', TO_TIMESTAMP_TZ('2026-06-21 14:05:06 +08:00', 'YYYY-MM-DD HH24:MI:SS TZH:TZM'));",
+            "INSERT INTO \"APP\".\"EVENTS\" (\"ID\", \"UPDATED_AT\") VALUES (1, TO_TIMESTAMP_TZ('2026-06-21 14:05:06 +08:00', 'YYYY-MM-DD HH24:MI:SS TZH:TZM'));",
             sql
+        );
+    }
+
+    #[test]
+    fn table_change_sql_formats_oracle_scalar_and_binary_literals() {
+        let plugin = create_plugin();
+        let request = TableSaveRequest {
+            database: String::new(),
+            schema: Some("APP".to_string()),
+            table: "TYPED_VALUES".to_string(),
+            columns: vec![
+                column_info("ID", "NUMBER", true),
+                column_info("ENABLED", "BOOLEAN", false),
+                column_info("PAYLOAD", "RAW(16)", false),
+                column_info("LABEL", "VARCHAR2(20)", false),
+            ],
+            index_infos: vec![],
+            changes: vec![TableRowChange::Added {
+                data: vec![
+                    "12.50".into(),
+                    "true".into(),
+                    TableCellValue::Binary(vec![0xde, 0xad, 0xbe, 0xef]),
+                    "1".into(),
+                ],
+            }],
+        };
+
+        assert_eq!(
+            "INSERT INTO \"APP\".\"TYPED_VALUES\" (\"ID\", \"ENABLED\", \"PAYLOAD\", \"LABEL\") VALUES (12.50, TRUE, HEXTORAW('deadbeef'), '1');",
+            plugin.generate_table_changes_sql(&request)
         );
     }
 
@@ -3465,6 +3966,7 @@ mod tests {
                 name: "fk_order_items_order".to_string(),
                 columns: vec!["order_id".to_string()],
                 ref_table: "orders".to_string(),
+                ref_schema: None,
                 ref_columns: vec!["id".to_string()],
                 on_delete: "CASCADE".to_string(),
                 on_update: String::new(),
@@ -3494,6 +3996,7 @@ mod tests {
                 name: "fk_order_items_order".to_string(),
                 columns: vec!["order_id".to_string()],
                 ref_table: "orders".to_string(),
+                ref_schema: None,
                 ref_columns: vec!["id".to_string()],
                 on_delete: "SET NULL".to_string(),
                 on_update: "CASCADE".to_string(),
@@ -3735,6 +4238,7 @@ mod tests {
                 name: "fk_order_items_legacy".to_string(),
                 columns: vec!["legacy_order_id".to_string()],
                 ref_table: "orders".to_string(),
+                ref_schema: None,
                 ref_columns: vec!["id".to_string()],
                 on_delete: String::new(),
                 on_update: String::new(),
@@ -3753,6 +4257,7 @@ mod tests {
                 name: "fk_order_items_order".to_string(),
                 columns: vec!["order_id".to_string()],
                 ref_table: "orders".to_string(),
+                ref_schema: None,
                 ref_columns: vec!["id".to_string()],
                 on_delete: "CASCADE".to_string(),
                 on_update: String::new(),

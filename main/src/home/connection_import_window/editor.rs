@@ -70,6 +70,7 @@ impl ConnectionImportWindow {
         open_popup_window(
             PopupWindowOptions::new(t!("Home.import").to_string()).size(700.0, 650.0),
             move |window, cx| cx.new(|cx| ConnectionFormWindow::new(form_config, window, cx)),
+            None,
             cx,
         );
     }
@@ -92,6 +93,7 @@ impl ConnectionImportWindow {
         open_popup_window(
             PopupWindowOptions::new(t!("Home.import").to_string()).size(700.0, 650.0),
             move |window, cx| cx.new(|cx| RedisFormWindow::new(form_config, window, cx)),
+            None,
             cx,
         );
     }
@@ -114,6 +116,7 @@ impl ConnectionImportWindow {
         open_popup_window(
             PopupWindowOptions::new(t!("Home.import").to_string()).size(700.0, 650.0),
             move |window, cx| cx.new(|cx| MongoFormWindow::new(form_config, window, cx)),
+            None,
             cx,
         );
     }
@@ -133,8 +136,9 @@ impl ConnectionImportWindow {
             teams: get_cached_team_options(cx),
         };
         open_popup_window(
-            PopupWindowOptions::new(t!("Home.import").to_string()).size(700.0, 650.0),
+            PopupWindowOptions::new(t!("Home.import").to_string()).size(750.0, 650.0),
             move |window, cx| cx.new(|cx| SshFormWindow::new(form_config, window, cx)),
+            None,
             cx,
         );
     }

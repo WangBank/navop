@@ -15,6 +15,7 @@ impl TerminalView {
             tab_index,
             duplicate_source,
             recording_playback_name,
+            session_log_name,
         } = init;
         let blink_manager = cx.new(|_| BlinkCursor::new());
         let recording_playback_slider = cx.new(|_| {
@@ -175,6 +176,15 @@ impl TerminalView {
             );
             subscriptions.push(settings_subscription);
         }
+        if let Some(quick_command_sync) = crate::quick_command_sync::quick_command_sync_notifier(cx)
+        {
+            let quick_command_subscription = cx.subscribe_in(
+                &quick_command_sync,
+                window,
+                Self::handle_quick_command_sync_event,
+            );
+            subscriptions.push(quick_command_subscription);
+        }
         subscriptions
             .push(cx.observe_global_in::<AppSettings>(window, Self::handle_app_settings_changed));
         subscriptions.push(
@@ -191,6 +201,7 @@ impl TerminalView {
             terminal,
             duplicate_source,
             recording_playback_name,
+            session_log_name,
             local_working_dir: if is_local_terminal {
                 local_working_dir
             } else {
@@ -230,6 +241,9 @@ impl TerminalView {
             render_cache: RenderCache::new(DEFAULT_ROWS, DEFAULT_COLS, colors),
             terminal_frame_snapshot: TerminalFrameSnapshot::default(),
             terminal_render_retry: None,
+            selection_autoscroll_position: None,
+            selection_autoscroll_display_offset: None,
+            selection_autoscroll_task: None,
             focus_handle,
             performance_metrics,
             terminal_bounds: Bounds::default(),
@@ -237,6 +251,7 @@ impl TerminalView {
             history_prompt: HistoryPromptState::default(),
             shell_prompt_input_active: false,
             local_command_running: false,
+            last_connection_status: None,
             suggestion_debounce: None,
             recording_path_prompt_pending: false,
             recording_control_error: None,
@@ -249,7 +264,7 @@ impl TerminalView {
             cd_completion_session_manager: None,
             cd_completion_cache: CdCompletionCache::default(),
             cd_completion_loading_parent: None,
-            ssh_credential_inputs: None,
+            credential_inputs: None,
             ssh_mfa_inputs: Vec::new(),
             zmodem_picker_request_id: None,
             focus_terminal_after_connect: false,
@@ -261,6 +276,7 @@ impl TerminalView {
             confirm_high_risk_command: true,
             auto_copy_on_select: true,
             autocomplete_enabled: true,
+            suggestion_popup_enabled: true,
             middle_click_paste: true,
             right_click_paste: false,
             paste_image_upload: true,
@@ -275,7 +291,7 @@ impl TerminalView {
             render_mode: TerminalRenderMode::Embedded,
         };
         this.apply_settings_snapshot(&initial_settings, window, cx);
-        this.sync_ssh_credential_inputs(window, cx);
+        this.sync_credential_inputs(window, cx);
         this.sync_ssh_mfa_inputs(window, cx);
         this.register_broadcast_input(cx);
         this.start_performance_diagnostics(connection_id, connection_kind, cx);

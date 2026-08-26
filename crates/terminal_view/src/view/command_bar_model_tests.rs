@@ -204,6 +204,14 @@ fn command_submission_trims_outer_whitespace_and_appends_enter() {
 }
 
 #[test]
+fn quick_command_click_executes_only_for_explicit_trailing_enter() {
+    assert!(quick_command_executes_on_click("echo hello\n"));
+    assert!(quick_command_executes_on_click("echo hello\r"));
+    assert!(!quick_command_executes_on_click("echo hello"));
+    assert!(!quick_command_executes_on_click("echo \\\nhello"));
+}
+
+#[test]
 fn command_batch_lines_split_trim_and_drop_empty_lines() {
     assert_eq!(
         vec![
@@ -215,6 +223,51 @@ fn command_batch_lines_split_trim_and_drop_empty_lines() {
     );
     assert_eq!(vec!["ls".to_string()], command_batch_lines("ls"));
     assert!(command_batch_lines(" \n\t \n").is_empty());
+}
+
+#[test]
+fn quick_command_shortcut_prefers_the_current_connection_over_global() {
+    let mut global = command("echo global", Some("Global"), None, false, 0);
+    global.shortcut = Some("ctrl-alt-g".to_string());
+    let mut connection = command("echo connection", Some("Connection"), None, false, 1);
+    connection.connection_id = Some(42);
+    connection.shortcut = Some("ctrl-alt-g".to_string());
+
+    assert_eq!(
+        Some("echo connection".to_string()),
+        quick_command_for_shortcut(
+            &[global, connection],
+            Some(42),
+            &gpui::Keystroke::parse("ctrl-alt-g").expect("parse shortcut"),
+        )
+    );
+}
+
+#[test]
+fn quick_command_shortcut_falls_back_to_global_and_matches_modifiers_exactly() {
+    let mut global = command("echo global", Some("Global"), None, false, 0);
+    global.shortcut = Some("ctrl-alt-g".to_string());
+    let mut other_connection = command("echo other", Some("Other"), None, false, 1);
+    other_connection.connection_id = Some(7);
+    other_connection.shortcut = Some("ctrl-alt-g".to_string());
+    let commands = [other_connection, global];
+
+    assert_eq!(
+        Some("echo global".to_string()),
+        quick_command_for_shortcut(
+            &commands,
+            None,
+            &gpui::Keystroke::parse("ctrl-alt-g").expect("parse shortcut"),
+        )
+    );
+    assert_eq!(
+        None,
+        quick_command_for_shortcut(
+            &commands,
+            None,
+            &gpui::Keystroke::parse("ctrl-g").expect("parse shortcut"),
+        )
+    );
 }
 
 fn command(

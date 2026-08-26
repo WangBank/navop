@@ -1,8 +1,9 @@
 use super::*;
 use crate::view::command_bar_model::{
     SelectionDirection, build_command_suggestions, command_inline_suffix,
+    quick_command_for_shortcut,
 };
-use gpui::{AppContext, Context, KeyDownEvent, Window};
+use gpui::{AppContext, Context, KeyDownEvent, Keystroke, Window};
 use gpui_component::input::{InputEvent, MoveDown, MoveUp};
 use one_core::storage::{GlobalStorageState, QuickCommandRepository};
 
@@ -42,6 +43,7 @@ impl TerminalCommandBar {
             collapsed: true,
             input_height: COMMAND_BAR_INPUT_DEFAULT_HEIGHT,
             autocomplete_enabled: true,
+            suggestion_popup_enabled: true,
             colors: config.colors,
             recording_path_prompt_pending: false,
             recording_control_error: None,
@@ -101,6 +103,19 @@ impl TerminalCommandBar {
         cx.notify();
     }
 
+    pub(in crate::view) fn set_suggestion_popup_enabled(
+        &mut self,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.suggestion_popup_enabled = enabled;
+        if !enabled {
+            self.suggestions.clear();
+            self.selected_suggestion = None;
+        }
+        cx.notify();
+    }
+
     pub(in crate::view) fn set_session_controls_state(
         &mut self,
         recording_path_prompt_pending: bool,
@@ -116,7 +131,7 @@ impl TerminalCommandBar {
         cx.notify();
     }
 
-    pub(super) fn load_quick_commands(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::view) fn load_quick_commands(&mut self, cx: &mut Context<Self>) {
         self.quick_commands = cx
             .try_global::<GlobalStorageState>()
             .and_then(|state| state.storage.get::<QuickCommandRepository>())
@@ -124,7 +139,7 @@ impl TerminalCommandBar {
             .unwrap_or_default();
     }
 
-    pub(super) fn refresh_suggestions(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::view) fn refresh_suggestions(&mut self, cx: &mut Context<Self>) {
         if !self.autocomplete_enabled {
             return;
         }
@@ -141,6 +156,10 @@ impl TerminalCommandBar {
             state.set_inline_completion_text(inline_suffix, cx);
         });
         cx.notify();
+    }
+
+    pub(in crate::view) fn command_for_shortcut(&self, keystroke: &Keystroke) -> Option<String> {
+        quick_command_for_shortcut(&self.quick_commands, self.connection_id, keystroke)
     }
 
     fn handle_input_change(&mut self, cx: &mut Context<Self>) {

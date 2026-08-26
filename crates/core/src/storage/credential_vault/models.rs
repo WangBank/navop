@@ -1,6 +1,8 @@
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 
+use crate::storage::SshAccountExpect;
+
 /// A locally stored credential entry.
 ///
 /// Secret values are kept decrypted in memory only. The repository encrypts
@@ -9,7 +11,6 @@ use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 pub struct CredentialEntry {
     pub id: Option<i64>,
     pub name: String,
-    pub kind: String,
     pub username: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
@@ -19,6 +20,8 @@ pub struct CredentialEntry {
     pub private_key_content: Option<String>,
     #[serde(default)]
     pub passphrase: Option<String>,
+    #[serde(default)]
+    pub ssh_expect: SshAccountExpect,
     #[serde(default)]
     pub sync_enabled: bool,
     pub cloud_id: Option<String>,
@@ -39,10 +42,9 @@ impl Serialize for CredentialEntry {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("CredentialEntry", 11)?;
+        let mut state = serializer.serialize_struct("CredentialEntry", 10)?;
         state.serialize_field("id", &self.id)?;
         state.serialize_field("name", &self.name)?;
-        state.serialize_field("kind", &self.kind)?;
         state.serialize_field("username", &self.username)?;
         state.serialize_field("sync_enabled", &self.sync_enabled)?;
         state.serialize_field("cloud_id", &self.cloud_id)?;
@@ -61,10 +63,12 @@ impl std::fmt::Debug for CredentialEntry {
             .debug_struct("CredentialEntry")
             .field("id", &self.id)
             .field("name", &self.name)
-            .field("kind", &self.kind)
             .field("username", &self.username)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
-            .field("private_key_path", &self.private_key_path)
+            .field(
+                "private_key_path",
+                &self.private_key_path.as_ref().map(|_| "<local-path>"),
+            )
             .field(
                 "private_key_content",
                 &self.private_key_content.as_ref().map(|_| "<redacted>"),
@@ -72,6 +76,10 @@ impl std::fmt::Debug for CredentialEntry {
             .field(
                 "passphrase",
                 &self.passphrase.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "ssh_expect",
+                &(!self.ssh_expect.is_empty()).then_some("<redacted>"),
             )
             .field("sync_enabled", &self.sync_enabled)
             .field("cloud_id", &self.cloud_id)
@@ -85,16 +93,16 @@ impl std::fmt::Debug for CredentialEntry {
 }
 
 impl CredentialEntry {
-    pub fn new(name: impl Into<String>, kind: impl Into<String>) -> Self {
+    pub fn new(name: impl Into<String>) -> Self {
         Self {
             id: None,
             name: name.into(),
-            kind: kind.into(),
             username: None,
             password: None,
             private_key_path: None,
             private_key_content: None,
             passphrase: None,
+            ssh_expect: SshAccountExpect::default(),
             sync_enabled: false,
             cloud_id: None,
             last_synced_at: None,
@@ -121,6 +129,7 @@ impl CredentialEntry {
             .into_iter()
             .flatten()
             .any(|value| !value.is_empty())
+            || !self.ssh_expect.is_empty()
     }
 }
 
@@ -146,12 +155,12 @@ impl crate::storage::traits::Entity for CredentialEntry {
 pub struct CredentialSummary {
     pub id: i64,
     pub name: String,
-    pub kind: String,
     pub username: Option<String>,
     pub has_password: bool,
     pub has_private_key_path: bool,
     pub has_private_key_content: bool,
     pub has_passphrase: bool,
+    pub has_ssh_expect: bool,
     pub sync_enabled: bool,
     pub cloud_id: Option<String>,
     pub last_synced_at: Option<i64>,
@@ -162,9 +171,12 @@ pub struct CredentialSummary {
 }
 
 /// Selects which fields should be copied from a credential entry.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialReference {
     pub credential_id: i64,
+    /// 跨设备稳定引用。新记录优先使用此字段，本地整数 ID 仅用于兼容旧记录。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_cloud_id: Option<String>,
     #[serde(default)]
     pub username: bool,
     #[serde(default)]
@@ -186,6 +198,7 @@ impl CredentialReference {
     pub fn all(credential_id: i64) -> Self {
         Self {
             credential_id,
+            credential_cloud_id: None,
             username: true,
             password: true,
             private_key: true,

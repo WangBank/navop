@@ -2,14 +2,18 @@ use anyhow::Error;
 use std::collections::HashMap;
 use std::time::Instant;
 
-use connection_form::credential::{
-    CredentialCapabilities, CredentialField, CredentialPickerConfig, CredentialPickerEvent,
-    CredentialReferencePicker, create_credential_picker, resolve_connection_for_runtime,
-};
 use connection_form::team::{
     TeamSelectItem, connection_sync_controls_visible_in, create_team_select, refresh_team_options,
     refresh_teams_tooltip, replace_team_options, resolve_team_assignment, selected_team_id,
     team_label, team_management_enabled,
+};
+use connection_form::{
+    SshAuthOption, SshConnectionSelectItem,
+    credential::{
+        CredentialCapabilities, CredentialPickerConfig, CredentialPickerEvent,
+        CredentialReferencePicker, create_credential_picker, resolve_connection_for_runtime,
+    },
+    normalize_ssh_auth_type as normalized_ssh_auth_type,
 };
 use db::plugin_manifest::FormVisibilityRule;
 use db::{
@@ -48,6 +52,45 @@ use rust_i18n::t;
 use tracing::info;
 
 use super::connection_proxy::{self, ProxyValidationError};
+
+const ORACLE_GO_DRIVER_ID: &str = "oracle-go";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum OracleDriverMode {
+    #[default]
+    Native,
+    Go,
+}
+
+fn database_type_for_oracle_driver_mode(
+    current: &DatabaseType,
+    mode: OracleDriverMode,
+) -> DatabaseType {
+    match (current, mode) {
+        (DatabaseType::Oracle, OracleDriverMode::Go) => DatabaseType::external(ORACLE_GO_DRIVER_ID),
+        (DatabaseType::Oracle, OracleDriverMode::Native) => DatabaseType::Oracle,
+        (DatabaseType::External { driver_id }, OracleDriverMode::Native)
+            if driver_id == ORACLE_GO_DRIVER_ID =>
+        {
+            DatabaseType::Oracle
+        }
+        (DatabaseType::External { driver_id }, OracleDriverMode::Go)
+            if driver_id == ORACLE_GO_DRIVER_ID =>
+        {
+            current.clone()
+        }
+        _ => current.clone(),
+    }
+}
+
+fn oracle_driver_mode_for_database_type(database_type: &DatabaseType) -> OracleDriverMode {
+    match database_type {
+        DatabaseType::External { driver_id } if driver_id == ORACLE_GO_DRIVER_ID => {
+            OracleDriverMode::Go
+        }
+        _ => OracleDriverMode::Native,
+    }
+}
 
 /// Form select item for dropdown fields
 #[derive(Clone, Debug)]
@@ -101,45 +144,6 @@ impl WorkspaceSelectItem {
 }
 
 impl SelectItem for WorkspaceSelectItem {
-    type Value = Option<i64>;
-
-    fn title(&self) -> SharedString {
-        self.name.clone().into()
-    }
-
-    fn value(&self) -> &Self::Value {
-        &self.id
-    }
-}
-
-/// SSH connection select item for tunnel reuse.
-#[derive(Clone, Debug)]
-pub struct SshConnectionSelectItem {
-    pub id: Option<i64>,
-    pub name: String,
-}
-
-impl SshConnectionSelectItem {
-    pub fn none() -> Self {
-        Self {
-            id: None,
-            name: t!("ConnectionForm.ssh_connection_manual").to_string(),
-        }
-    }
-
-    pub fn from_connection(connection: &StoredConnection) -> Self {
-        let id = connection.id;
-        let host = connection.to_ssh_params().ok().map(|params| params.host);
-        let name = match host.as_deref().filter(|host| !host.trim().is_empty()) {
-            Some(host) => format!("{} ({})", connection.name, host),
-            None => connection.name.clone(),
-        };
-
-        Self { id, name }
-    }
-}
-
-impl SelectItem for SshConnectionSelectItem {
     type Value = Option<i64>;
 
     fn title(&self) -> SharedString {
@@ -362,24 +366,12 @@ impl DbFormConfig {
             )
             .optional()
             .default("password")
-            .options(vec![
-                (
-                    "password".to_string(),
-                    t!("ConnectionForm.ssh_auth_password").to_string(),
-                ),
-                (
-                    "private_key".to_string(),
-                    t!("ConnectionForm.ssh_auth_private_key").to_string(),
-                ),
-                (
-                    "private_key_content".to_string(),
-                    t!("ConnectionForm.ssh_auth_private_key_content").to_string(),
-                ),
-                (
-                    "agent".to_string(),
-                    t!("ConnectionForm.ssh_auth_agent").to_string(),
-                ),
-            ]),
+            .options(
+                SshAuthOption::ALL
+                    .iter()
+                    .map(|option| (option.value().to_string(), option.label()))
+                    .collect(),
+            ),
             FormField::new(
                 "ssh_password",
                 t!("ConnectionForm.ssh_password"),
@@ -1107,25 +1099,16 @@ impl DbFormConfig {
     }
 }
 
-fn normalized_ssh_auth_type(auth_type: &str) -> &str {
-    match auth_type.trim().to_ascii_lowercase().as_str() {
-        "private_key" => "private_key",
-        "private_key_content" | "private_key_material" => "private_key_content",
-        "agent" => "agent",
-        _ => "password",
-    }
-}
-
 fn ssh_auth_requires_password(auth_type: &str) -> bool {
-    normalized_ssh_auth_type(auth_type) == "password"
+    normalized_ssh_auth_type(auth_type) == SshAuthOption::Password.value()
 }
 
 fn ssh_auth_requires_private_key(auth_type: &str) -> bool {
-    normalized_ssh_auth_type(auth_type) == "private_key"
+    normalized_ssh_auth_type(auth_type) == SshAuthOption::PrivateKey.value()
 }
 
 fn ssh_auth_requires_private_key_content(auth_type: &str) -> bool {
-    normalized_ssh_auth_type(auth_type) == "private_key_content"
+    normalized_ssh_auth_type(auth_type) == SshAuthOption::PrivateKeyContent.value()
 }
 
 const REQUIRED_HOST_SSH_FIELD_NAMES: &[&str] = &[
@@ -1292,6 +1275,7 @@ pub struct DbConnectionForm {
     /// Oracle client detection status: Ok(version) / Err(error).
     oracle_client_status: Entity<Option<Result<String, String>>>,
     oracle_client_checking: Entity<bool>,
+    oracle_driver_mode: OracleDriverMode,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1300,6 +1284,7 @@ impl DbConnectionForm {
         let config = connection_proxy::with_proxy_tab(config);
         let focus_handle = cx.focus_handle();
         let current_db_type = cx.new(|_| config.db_type.clone());
+        let oracle_driver_mode = oracle_driver_mode_for_database_type(&config.db_type);
 
         // Initialize field values, inputs, and selects
         let mut field_values = Vec::new();
@@ -1455,7 +1440,6 @@ impl DbConnectionForm {
                 |_, _, _: &CredentialPickerEvent, cx| cx.notify(),
             ),
         ];
-
         let form = Self {
             config,
             current_db_type,
@@ -1478,6 +1462,7 @@ impl DbConnectionForm {
             sync_enabled,
             oracle_client_status,
             oracle_client_checking,
+            oracle_driver_mode,
             _subscriptions: subscriptions,
         };
 
@@ -1485,8 +1470,12 @@ impl DbConnectionForm {
         form
     }
 
+    fn effective_database_type(&self, cx: &App) -> DatabaseType {
+        database_type_for_oracle_driver_mode(self.current_db_type.read(cx), self.oracle_driver_mode)
+    }
+
     fn refresh_oracle_client_status(&self, cx: &mut Context<Self>) {
-        if *self.current_db_type.read(cx) != DatabaseType::Oracle {
+        if self.effective_database_type(cx) != DatabaseType::Oracle {
             self.oracle_client_checking.update(cx, |checking, cx| {
                 *checking = false;
                 cx.notify();
@@ -1523,7 +1512,7 @@ impl DbConnectionForm {
     }
 
     fn oracle_client_guide_text(&self, cx: &App) -> Option<String> {
-        if *self.current_db_type.read(cx) != DatabaseType::Oracle {
+        if self.effective_database_type(cx) != DatabaseType::Oracle {
             return None;
         }
 
@@ -1543,7 +1532,7 @@ impl DbConnectionForm {
     }
 
     fn oracle_client_download_url(&self, cx: &App) -> Option<&'static str> {
-        if *self.current_db_type.read(cx) != DatabaseType::Oracle {
+        if self.effective_database_type(cx) != DatabaseType::Oracle {
             return None;
         }
 
@@ -1627,15 +1616,18 @@ impl DbConnectionForm {
         });
 
         if let Ok(params) = connection.to_db_connection() {
+            self.oracle_driver_mode = oracle_driver_mode_for_database_type(&params.database_type);
+            self.refresh_oracle_client_status(cx);
+
             self.credential_picker.update(cx, |picker, cx| {
-                picker.set_reference(params.credential_reference, window, cx)
+                picker.set_reference(params.credential_reference.clone(), window, cx)
             });
             self.proxy_credential_picker.update(cx, |picker, cx| {
                 picker.set_reference(
                     params
                         .proxy
                         .as_ref()
-                        .and_then(|proxy| proxy.credential_reference),
+                        .and_then(|proxy| proxy.credential_reference.clone()),
                     window,
                     cx,
                 )
@@ -1708,6 +1700,17 @@ impl DbConnectionForm {
         }
 
         self.sync_ssh_connection_selection(window, cx);
+    }
+
+    /// Prefills a new connection without switching the form into update mode.
+    pub fn load_initial_connection(
+        &mut self,
+        connection: &StoredConnection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.load_connection(connection, window, cx);
+        self.editing_connection = None;
     }
 
     fn current_ssh_connection_id(&self, cx: &App) -> Option<i64> {
@@ -1799,7 +1802,7 @@ impl DbConnectionForm {
             }
         }
 
-        let db_type = self.current_db_type.read(cx).clone();
+        let db_type = self.effective_database_type(cx);
 
         let port_str = self.get_field_value("port", cx);
 
@@ -1934,7 +1937,7 @@ impl DbConnectionForm {
     }
 
     fn validate_oracle_client(&self, cx: &App) -> Result<(), String> {
-        if *self.current_db_type.read(cx) != DatabaseType::Oracle {
+        if self.effective_database_type(cx) != DatabaseType::Oracle {
             return Ok(());
         }
 
@@ -2015,7 +2018,7 @@ impl DbConnectionForm {
                 return;
             }
         };
-        let db_type = self.current_db_type.read(cx).clone();
+        let db_type = self.effective_database_type(cx);
 
         self.is_testing.update(cx, |testing, cx| {
             *testing = true;
@@ -2279,28 +2282,6 @@ impl DbConnectionForm {
             .unwrap_or(false)
     }
 
-    fn credential_field_referenced(&self, field_name: &str, cx: &App) -> bool {
-        match field_name {
-            "username" => self
-                .credential_picker
-                .read(cx)
-                .field_referenced(CredentialField::Username),
-            "password" => self
-                .credential_picker
-                .read(cx)
-                .field_referenced(CredentialField::Password),
-            "proxy_username" => self
-                .proxy_credential_picker
-                .read(cx)
-                .field_referenced(CredentialField::Username),
-            "proxy_password" => self
-                .proxy_credential_picker
-                .read(cx)
-                .field_referenced(CredentialField::Password),
-            _ => false,
-        }
-    }
-
     fn render_credential_picker_field(&self, proxy: bool) -> gpui_component::form::Field {
         let picker = if proxy {
             self.proxy_credential_picker.clone()
@@ -2427,9 +2408,7 @@ impl DbConnectionForm {
                     })
                     .when(!is_select && !is_checkbox, |el| {
                         if let Some(input_state) = self.get_input_by_name(&field_name) {
-                            let input = Input::new(&input_state)
-                                .w_full()
-                                .disabled(self.credential_field_referenced(&field_name, cx));
+                            let input = Input::new(&input_state).w_full();
                             let input = if is_password {
                                 input.mask_toggle()
                             } else {
@@ -2464,7 +2443,22 @@ impl DbConnectionForm {
         let visible_fields = current_tab_fields
             .iter()
             .enumerate()
-            .filter(|(_, field)| self.is_field_visible(field, cx))
+            .filter(|(_, field)| {
+                self.is_field_visible(field, cx)
+                    && match field.name.as_str() {
+                        "username" | "password" => self
+                            .credential_picker
+                            .read(cx)
+                            .selected_reference()
+                            .is_none(),
+                        "proxy_username" | "proxy_password" => self
+                            .proxy_credential_picker
+                            .read(cx)
+                            .selected_reference()
+                            .is_none(),
+                        _ => true,
+                    }
+            })
             .collect::<Vec<_>>();
 
         if visible_fields.is_empty() {
@@ -2480,6 +2474,8 @@ impl DbConnectionForm {
 
         let is_general_tab = self.active_tab == 0;
         let db_type = self.config.db_type.clone();
+        let is_builtin_oracle = db_type == DatabaseType::Oracle;
+        let is_native_oracle = self.effective_database_type(cx) == DatabaseType::Oracle;
         let has_main_credentials = current_tab_fields
             .iter()
             .any(|field| matches!(field.name.as_str(), "username" | "password"));
@@ -2547,11 +2543,7 @@ impl DbConnectionForm {
                             })
                             .when(!is_select && !is_checkbox, |el| {
                                 if let Some(Some(input_state)) = self.field_inputs.get(input_idx) {
-                                    let input = Input::new(input_state)
-                                        .w_full()
-                                        .disabled(
-                                            self.credential_field_referenced(&field_name, cx),
-                                        );
+                                    let input = Input::new(input_state).w_full();
                                     let input = if is_password {
                                         input.mask_toggle()
                                     } else {
@@ -2647,10 +2639,126 @@ impl DbConnectionForm {
                                             .text_color(cx.theme().muted_foreground)
                                             .child(t!("ConnectionForm.cloud_sync_desc").to_string()),
                                     ),
+                        ),
+                    )
+                })
+                .when(is_builtin_oracle, |form| {
+                    let is_native = self.oracle_driver_mode == OracleDriverMode::Native;
+                    let is_go = self.oracle_driver_mode == OracleDriverMode::Go;
+
+                    form.child(
+                        field()
+                            .label(t!("ConnectionForm.oracle_driver_mode").to_string())
+                            .items_center()
+                            .label_justify_end()
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .items_center()
+                                    .flex_wrap()
+                                    .gap_3()
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .flex_shrink_0()
+                                            .child(
+                                                Radio::new("oracle-driver-mode-native")
+                                                    .label(
+                                                        t!(
+                                                            "ConnectionForm.oracle_driver_native"
+                                                        )
+                                                        .to_string(),
+                                                    )
+                                                    .checked(is_native)
+                                                    .on_click(cx.listener(
+                                                        |this, _, _window, cx| {
+                                                            this.oracle_driver_mode =
+                                                                OracleDriverMode::Native;
+                                                            this.refresh_oracle_client_status(cx);
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                Popover::new("oracle-driver-native-help")
+                                                    .trigger(
+                                                        Button::new("oracle-driver-native-help-btn")
+                                                            .icon(IconName::Info)
+                                                            .ghost()
+                                                            .xsmall()
+                                                            .tooltip(
+                                                                t!(
+                                                                    "ConnectionForm.oracle_driver_native_desc"
+                                                                )
+                                                                .to_string(),
+                                                            ),
+                                                    )
+                                                    .content(|_, _, _| {
+                                                        div()
+                                                            .text_sm()
+                                                            .max_w(px(320.))
+                                                            .child(
+                                                                t!(
+                                                                    "ConnectionForm.oracle_driver_native_desc"
+                                                                )
+                                                                .to_string(),
+                                                            )
+                                                    }),
+                                            ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .flex_shrink_0()
+                                            .child(
+                                                Radio::new("oracle-driver-mode-go")
+                                                    .label(
+                                                        t!("ConnectionForm.oracle_driver_go")
+                                                            .to_string(),
+                                                    )
+                                                    .checked(is_go)
+                                                    .on_click(cx.listener(
+                                                        |this, _, _window, cx| {
+                                                            this.oracle_driver_mode =
+                                                                OracleDriverMode::Go;
+                                                            this.refresh_oracle_client_status(cx);
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                Popover::new("oracle-driver-go-help")
+                                                    .trigger(
+                                                        Button::new("oracle-driver-go-help-btn")
+                                                            .icon(IconName::Info)
+                                                            .ghost()
+                                                            .xsmall()
+                                                            .tooltip(
+                                                                t!(
+                                                                    "ConnectionForm.oracle_driver_go_desc"
+                                                                )
+                                                                .to_string(),
+                                                            ),
+                                                    )
+                                                    .content(|_, _, _| {
+                                                        div()
+                                                            .text_sm()
+                                                            .max_w(px(320.))
+                                                            .child(
+                                                                t!(
+                                                                    "ConnectionForm.oracle_driver_go_desc"
+                                                                )
+                                                                .to_string(),
+                                                            )
+                                                    }),
+                                            ),
+                                    ),
                             ),
                     )
                 })
-                .when(db_type == DatabaseType::Oracle, |form| {
+                .when(is_builtin_oracle && is_native_oracle, |form| {
                     let has_error = matches!(&oracle_client_status, Some(Err(_)));
                     let oracle_client_guide = oracle_client_guide.clone();
 
@@ -2670,7 +2778,7 @@ impl DbConnectionForm {
                                             .overflow_hidden()
                                             .text_ellipsis()
                                             .whitespace_nowrap()
-                                            .flex_shrink()
+                                            .flex_shrink_1()
                                             .min_w_0()
                                             .when(is_checking, |div| {
                                                 div.text_color(cx.theme().muted_foreground).child(
@@ -2680,7 +2788,7 @@ impl DbConnectionForm {
                                             })
                                             .when(!is_checking, |div| match &oracle_client_status {
                                                 Some(Ok(version)) => div
-                                                    .text_color(cx.theme().success_foreground)
+                                                    .text_color(cx.theme().success)
                                                     .child(
                                                         t!(
                                                             "ConnectionForm.oracle_client_available",
@@ -2689,7 +2797,7 @@ impl DbConnectionForm {
                                                         .to_string(),
                                                     ),
                                                 Some(Err(error)) => div
-                                                    .text_color(cx.theme().danger_foreground)
+                                                    .text_color(cx.theme().danger)
                                                     .child(
                                                         t!(
                                                             "ConnectionForm.oracle_client_unavailable",
@@ -2879,84 +2987,36 @@ impl DbConnectionForm {
                             .label(self.field_label("ssh_auth_type"))
                             .items_center()
                             .label_justify_end()
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .flex_wrap()
-                                    .gap_4()
-                                    .child(
-                                        Radio::new("db-ssh-auth-password")
-                                            .label(
-                                                t!("ConnectionForm.ssh_auth_password").to_string(),
-                                            )
-                                            .checked(ssh_auth_type == "password")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.set_field_value(
-                                                    "ssh_auth_type",
-                                                    "password",
-                                                    window,
-                                                    cx,
-                                                );
-                                            })),
-                                    )
-                                    .child(
-                                        Radio::new("db-ssh-auth-private-key")
-                                            .label(
-                                                t!("ConnectionForm.ssh_auth_private_key")
-                                                    .to_string(),
-                                            )
-                                            .checked(ssh_auth_type == "private_key")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.set_field_value(
-                                                    "ssh_auth_type",
-                                                    "private_key",
-                                                    window,
-                                                    cx,
-                                                );
-                                            })),
-                                    )
-                                    .child(
-                                        Radio::new("db-ssh-auth-private-key-content")
-                                            .label(
-                                                t!("ConnectionForm.ssh_auth_private_key_content")
-                                                    .to_string(),
-                                            )
-                                            .checked(ssh_auth_type == "private_key_content")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.set_field_value(
-                                                    "ssh_auth_type",
-                                                    "private_key_content",
-                                                    window,
-                                                    cx,
-                                                );
-                                            })),
-                                    )
-                                    .child(
-                                        Radio::new("db-ssh-auth-agent")
-                                            .label(t!("ConnectionForm.ssh_auth_agent").to_string())
-                                            .checked(ssh_auth_type == "agent")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.set_field_value(
-                                                    "ssh_auth_type",
-                                                    "agent",
-                                                    window,
-                                                    cx,
-                                                );
-                                            })),
-                                    ),
-                            ),
+                            .child(h_flex().w_full().flex_wrap().gap_4().children(
+                                SshAuthOption::ALL.iter().copied().map(|option| {
+                                    Radio::new(format!("db-ssh-auth-{}", option.value()))
+                                        .label(option.label())
+                                        .checked(ssh_auth_type == option.value())
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.set_field_value(
+                                                "ssh_auth_type",
+                                                option.value(),
+                                                window,
+                                                cx,
+                                            );
+                                        }))
+                                }),
+                            )),
                     )
-                    .when(ssh_auth_type == "password", |form| {
+                    .when(ssh_auth_type == SshAuthOption::Password.value(), |form| {
                         form.child(self.render_field_by_name("ssh_password", cx))
                     })
-                    .when(ssh_auth_type == "private_key", |form| {
+                    .when(ssh_auth_type == SshAuthOption::PrivateKey.value(), |form| {
                         form.child(self.render_field_by_name("ssh_private_key_path", cx))
                             .child(self.render_field_by_name("ssh_private_key_passphrase", cx))
                     })
-                    .when(ssh_auth_type == "private_key_content", |form| {
-                        form.child(self.render_field_by_name("ssh_private_key_content", cx))
-                            .child(self.render_field_by_name("ssh_private_key_passphrase", cx))
-                    })
+                    .when(
+                        ssh_auth_type == SshAuthOption::PrivateKeyContent.value(),
+                        |form| {
+                            form.child(self.render_field_by_name("ssh_private_key_content", cx))
+                                .child(self.render_field_by_name("ssh_private_key_passphrase", cx))
+                        },
+                    )
                 })
                 .child(self.render_field_by_name("ssh_target_host", cx))
                 .child(self.render_field_by_name("ssh_target_port", cx))
@@ -3137,6 +3197,7 @@ mod tests {
         let mut connection = StoredConnection::new_ssh(
             name.to_string(),
             SshParams {
+                sftp_account: None,
                 host: host.to_string(),
                 port: 22,
                 username: "root".to_string(),
@@ -3159,6 +3220,7 @@ mod tests {
                 proxy: None,
                 os_id: None,
                 icon: None,
+                account_expect: Default::default(),
             },
             None,
         );
@@ -3175,6 +3237,57 @@ mod tests {
         assert_eq!(&Some(42), item.value());
         assert!(item.matches("10.0.0.5"));
         assert!(!item.matches("42"));
+    }
+
+    #[gpui::test]
+    fn initial_connection_prefills_without_entering_edit_mode(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(AppSettings::default());
+            gpui_component::init(cx);
+        });
+        let params = DbConnectionConfig {
+            database_type: DatabaseType::MySQL,
+            name: "Imported DB".to_string(),
+            host: "db.example.test".to_string(),
+            port: 3306,
+            username: "imported".to_string(),
+            password: String::new(),
+            credential_reference: None,
+            database: None,
+            service_name: None,
+            sid: None,
+            workspace_id: None,
+            proxy: None,
+            extra_params: HashMap::new(),
+            id: String::new(),
+        };
+        let connection = StoredConnection::from_db_connection(params);
+        assert_eq!(None, connection.id);
+
+        let window = cx.update(|cx| {
+            cx.open_window(WindowOptions::default(), |window, cx| {
+                cx.new(|cx| {
+                    let mut form = DbConnectionForm::new(DbFormConfig::mysql(), window, cx);
+                    form.load_initial_connection(&connection, window, cx);
+                    form
+                })
+            })
+            .expect("form window should open")
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        let form = window.root(&mut cx).expect("form should be mounted");
+
+        assert!(form.read_with(&cx, |form, _| form.editing_connection.is_none()));
+        assert_eq!(
+            Some("db.example.test".to_string()),
+            form.read_with(&cx, |form, cx| form.get_field_value("host", cx))
+        );
+        let (stored, is_update) = form
+            .read_with(&cx, |form, cx| form.build_stored_connection(cx))
+            .expect("prefilled connection should be valid");
+        assert!(!is_update);
+        assert_eq!(None, stored.id);
     }
 
     #[gpui::test]
@@ -3318,6 +3431,45 @@ mod tests {
     }
 
     #[test]
+    fn oracle_driver_mode_maps_to_expected_database_type() {
+        assert_eq!(
+            DatabaseType::Oracle,
+            database_type_for_oracle_driver_mode(&DatabaseType::Oracle, OracleDriverMode::Native)
+        );
+        assert_eq!(
+            DatabaseType::external(ORACLE_GO_DRIVER_ID),
+            database_type_for_oracle_driver_mode(&DatabaseType::Oracle, OracleDriverMode::Go)
+        );
+        assert_eq!(
+            DatabaseType::MySQL,
+            database_type_for_oracle_driver_mode(&DatabaseType::MySQL, OracleDriverMode::Go)
+        );
+        assert_eq!(
+            DatabaseType::Oracle,
+            database_type_for_oracle_driver_mode(
+                &DatabaseType::external(ORACLE_GO_DRIVER_ID),
+                OracleDriverMode::Native
+            )
+        );
+    }
+
+    #[test]
+    fn oracle_driver_mode_restores_from_database_type() {
+        assert_eq!(
+            OracleDriverMode::Native,
+            oracle_driver_mode_for_database_type(&DatabaseType::Oracle)
+        );
+        assert_eq!(
+            OracleDriverMode::Go,
+            oracle_driver_mode_for_database_type(&DatabaseType::external(ORACLE_GO_DRIVER_ID))
+        );
+        assert_eq!(
+            OracleDriverMode::Native,
+            oracle_driver_mode_for_database_type(&DatabaseType::MySQL)
+        );
+    }
+
+    #[test]
     fn external_driver_host_ssh_fields_use_custom_ssh_tab() {
         let ssh_tab = DbFormConfig::mysql()
             .tab_groups
@@ -3426,6 +3578,11 @@ mod tests {
     }
 
     #[test]
+    fn pageant_auth_type_is_preserved() {
+        assert_eq!("pageant", normalized_ssh_auth_type(" Pageant "));
+    }
+
+    #[test]
     fn custom_ssl_enabled_matches_database_semantics() {
         assert!(is_custom_ssl_enabled(
             HostSslTabKind::MySql,
@@ -3503,6 +3660,22 @@ mod tests {
                 "jump.example.com",
                 "root",
                 "agent",
+                "",
+                "",
+                ""
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ssh_pageant_auth_does_not_require_password() {
+        assert_eq!(
+            missing_ssh_tunnel_required_field(
+                true,
+                "jump.example.com",
+                "root",
+                "pageant",
                 "",
                 "",
                 ""

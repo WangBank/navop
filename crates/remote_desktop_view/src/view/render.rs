@@ -1,4 +1,7 @@
 use gpui::prelude::FluentBuilder;
+use gpui_component::{
+    ElementExt as _, Sizable as _, button::Button, scroll::ScrollableElement as _,
+};
 
 use super::*;
 use crate::pointer::scale_filled_remote_cursor_bounds;
@@ -6,6 +9,15 @@ use crate::pointer::scale_filled_remote_cursor_bounds;
 struct RemoteDesktopCanvasPaint {
     frame: Option<Arc<surface::RemoteDesktopSurface>>,
     cursor: Option<cursor::RemoteCursorPaint>,
+}
+
+pub(super) fn should_show_empty_status(
+    show_empty_status: bool,
+    uses_windows_native: bool,
+    show_failure_detail: bool,
+    connected: bool,
+) -> bool {
+    show_empty_status && (!uses_windows_native || show_failure_detail || !connected)
 }
 
 fn remote_desktop_frame_canvas(frame: RemoteDesktopCanvasPaint) -> impl IntoElement {
@@ -119,7 +131,9 @@ fn paint_remote_cursor(
     let Some(bounds) = remote_cursor_bounds(bounds, cursor.geometry) else {
         return;
     };
-    if let Err(error) = window.paint_image(bounds, Corners::default(), cursor.image, 0, false) {
+    if let Err(error) =
+        window.paint_image(bounds, bounds, Corners::default(), cursor.image, 0, false)
+    {
         tracing::warn!(?error, "failed to paint remote desktop cursor");
     }
 }
@@ -141,6 +155,78 @@ fn remote_cursor_bounds(
         point(px(local.left), px(local.top)),
         size(px(local.width), px(local.height)),
     ))
+}
+
+fn localized_fallback_reason(reason: presentation::WindowsNativeRdpUnavailableReason) -> String {
+    match reason {
+        presentation::WindowsNativeRdpUnavailableReason::FeatureDisabled => {
+            t!("RemoteDesktop.fallback_feature_disabled").to_string()
+        }
+        presentation::WindowsNativeRdpUnavailableReason::UnsupportedPlatform => {
+            t!("RemoteDesktop.fallback_unsupported_platform").to_string()
+        }
+        presentation::WindowsNativeRdpUnavailableReason::ProbeReportedUnavailable => {
+            t!("RemoteDesktop.fallback_probe_reported_unavailable").to_string()
+        }
+        presentation::WindowsNativeRdpUnavailableReason::ClassNotRegistered => {
+            t!("RemoteDesktop.fallback_class_not_registered").to_string()
+        }
+        presentation::WindowsNativeRdpUnavailableReason::RequiredInterfaceMissing => {
+            t!("RemoteDesktop.fallback_required_interface_missing").to_string()
+        }
+        presentation::WindowsNativeRdpUnavailableReason::SharedFoldersUnsupported => {
+            t!("RemoteDesktop.fallback_shared_folders_unsupported").to_string()
+        }
+    }
+}
+
+impl RemoteDesktopView {
+    /// Queues the Windows native RDP close intent and spawns the borrow-free
+    /// close task. The entity borrow held by `try_close` only performs pure
+    /// Rust state resets; every native call runs inside the spawned task after
+    /// the update closure returns.
+    #[cfg(all(feature = "windows-native-rdp", target_os = "windows"))]
+    fn spawn_windows_native_close(
+        registration: windows_rdp_host::WindowsRdpRegistration,
+        initial_mode: WindowsNativeCloseRetryMode,
+        cx: &mut Context<Self>,
+    ) -> Task<bool> {
+        let hard_deadline = Instant::now()
+            + match initial_mode {
+                WindowsNativeCloseRetryMode::WaitForConfirmation => {
+                    WINDOWS_NATIVE_CLOSE_TIMEOUT + WINDOWS_NATIVE_FORCE_CLOSE_TIMEOUT
+                }
+                WindowsNativeCloseRetryMode::ForceClose => WINDOWS_NATIVE_FORCE_CLOSE_TIMEOUT,
+            };
+        cx.spawn(async move |this, cx| {
+            loop {
+                let taken = this.update(cx, |this, _| {
+                    this.take_windows_native_close_operation(registration)
+                });
+                match taken {
+                    // The view is gone; its release hook (or the shutdown
+                    // drain) owns the adapter and its terminal outcome.
+                    Err(_) => return true,
+                    Ok(WindowsNativeCloseTake::Closed) => return true,
+                    Ok(WindowsNativeCloseTake::Failed) => return false,
+                    Ok(WindowsNativeCloseTake::Pending) => {}
+                    Ok(WindowsNativeCloseTake::Ready(operation)) => {
+                        return close_windows_native_operation(
+                            &this,
+                            operation,
+                            initial_mode,
+                            hard_deadline,
+                            cx,
+                        )
+                        .await;
+                    }
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+            }
+        })
+    }
 }
 
 impl Focusable for RemoteDesktopView {
@@ -171,11 +257,49 @@ impl TabContent for RemoteDesktopView {
         true
     }
 
+    fn on_activate(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        // Pure Rust intent only: native activate/focus runs in the maintenance
+        // operation outside any entity borrow (COM calls pump messages).
+        self.tab_active = true;
+        #[cfg(all(feature = "windows-native-rdp", target_os = "windows"))]
+        {
+            self.windows_native_lifecycle_dirty = true;
+            self.windows_native_focus_requested = true;
+        }
+    }
+
+    fn on_deactivate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Pure Rust intent only; native deactivate runs in the maintenance
+        // operation outside any entity borrow.
+        self.tab_active = false;
+        #[cfg(all(feature = "windows-native-rdp", target_os = "windows"))]
+        {
+            self.windows_native_lifecycle_dirty = true;
+            self.windows_native_focus_requested = false;
+        }
+        // Returning GPUI focus to the parent handle is a pure GPUI operation
+        // and safe inside the borrow, unlike the native deactivate path.
+        window.focus(&self.focus_handle, cx);
+    }
+
+    fn set_presentation_obscured(&mut self, obscured: bool, _cx: &mut Context<Self>) {
+        if self.presentation_obscured == obscured {
+            return;
+        }
+
+        self.presentation_obscured = obscured;
+        #[cfg(all(feature = "windows-native-rdp", target_os = "windows"))]
+        {
+            self.windows_native_lifecycle_dirty = true;
+            self.windows_native_focus_requested = false;
+        }
+    }
+
     fn try_close(
         &mut self,
         _tab_id: &str,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> Task<bool> {
         self.cursor.reset_session();
         close_runtime_once(&mut self.input_tx);
@@ -187,7 +311,32 @@ impl TabContent for RemoteDesktopView {
         self._initial_layout_task.take();
         self._output_ready_task.take();
         self._presentation_task.take();
-        Task::ready(true)
+
+        #[cfg(all(feature = "windows-native-rdp", target_os = "windows"))]
+        {
+            self.windows_native_display.reset();
+            let Some(registration) = self.windows_native_registration else {
+                if self.windows_native.is_some() || self.native_event_state.is_some() {
+                    tracing::error!("Windows native RDP adapter has no shutdown registration");
+                    return Task::ready(false);
+                }
+                return Task::ready(true);
+            };
+            // Only queue the close intent here: every native close call runs in
+            // the spawned borrow-free task after this update closure returns.
+            window.focus(&self.focus_handle, cx);
+            return Self::spawn_windows_native_close(
+                registration,
+                WindowsNativeCloseRetryMode::WaitForConfirmation,
+                cx,
+            );
+        }
+
+        #[cfg(not(all(feature = "windows-native-rdp", target_os = "windows")))]
+        {
+            let _ = (window, cx);
+            Task::ready(true)
+        }
     }
 }
 
@@ -208,6 +357,7 @@ impl Render for RemoteDesktopView {
         }
         self.drain_output(window, cx);
         self.sync_local_clipboard(window, cx);
+        self.ensure_presentation(window, cx);
         self.flush_pending_start(cx);
         self.flush_pending_resize();
         if let Some(latest_frame) = self.latest_frame.take() {
@@ -238,11 +388,24 @@ impl Render for RemoteDesktopView {
             frame: rendered_frame,
             cursor: self.cursor.paint_state(self.remote_size),
         };
+        let uses_windows_native = self.uses_windows_native_presentation();
+        let failure_detail = self.failure_detail.clone();
+        let show_failure_detail = failure_detail.is_some();
+        let presentation_initialization = self.presentation_initialization;
+        let fallback_reason = presentation_initialization
+            .fallback_reason()
+            .map(localized_fallback_reason);
+        let canvas_retry_available = presentation_initialization.allows_explicit_canvas_retry();
+        // Reserve the status row only when it has content; an empty RDP status
+        // row renders as a blank white strip above the remote desktop.
+        let show_presentation_status = self.options.protocol == RemoteDesktopProtocol::Rdp
+            && (fallback_reason.is_some() || canvas_retry_available);
         let view = cx.entity();
 
         let content = div()
             .id("remote-desktop-content")
-            .size_full()
+            .w_full()
+            .flex_grow(1.0)
             .min_w_0()
             .min_h_0()
             .relative()
@@ -251,91 +414,144 @@ impl Render for RemoteDesktopView {
             .justify_center()
             .overflow_hidden()
             .track_focus(&self.focus_handle)
-            .key_context(REMOTE_DESKTOP_CONTEXT)
-            .on_action(cx.listener(Self::send_tab))
-            .on_action(cx.listener(Self::send_shift_tab))
-            .on_action(cx.listener(Self::remote_copy))
-            .on_action(cx.listener(Self::remote_paste))
-            .capture_key_down(cx.listener(Self::handle_key_down))
-            .capture_key_up(cx.listener(Self::handle_key_up))
-            .on_modifiers_changed(cx.listener(Self::handle_modifiers_changed))
-            .on_hover(cx.listener(|this, hovered, _, _| {
-                this.cursor.set_pointer_hovered(*hovered);
-            }))
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                this.send_pointer_move(event.position, window, cx);
-                cx.stop_propagation();
-            }))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    window.focus(&this.focus_handle, cx);
-                    this.send_pointer_move(event.position, window, cx);
-                    this.send_mouse_button(event.button, true);
-                    cx.stop_propagation();
-                }),
+            .when(!uses_windows_native, |this| {
+                this.key_context(REMOTE_DESKTOP_CONTEXT)
+                    .on_action(cx.listener(Self::send_tab))
+                    .on_action(cx.listener(Self::send_shift_tab))
+                    .on_action(cx.listener(Self::remote_copy))
+                    .on_action(cx.listener(Self::remote_paste))
+                    .capture_key_down(cx.listener(Self::handle_key_down))
+                    .capture_key_up(cx.listener(Self::handle_key_up))
+                    .on_modifiers_changed(cx.listener(Self::handle_modifiers_changed))
+                    .on_hover(cx.listener(|this, hovered, _, _| {
+                        this.cursor.set_pointer_hovered(*hovered);
+                    }))
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                        this.send_pointer_move(event.position, window, cx);
+                        cx.stop_propagation();
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            window.focus(&this.focus_handle, cx);
+                            this.send_pointer_move(event.position, window, cx);
+                            this.send_mouse_button(event.button, true);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            window.focus(&this.focus_handle, cx);
+                            this.send_pointer_move(event.position, window, cx);
+                            this.send_mouse_button(event.button, true);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            window.focus(&this.focus_handle, cx);
+                            this.send_pointer_move(event.position, window, cx);
+                            this.send_mouse_button(event.button, true);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                            this.send_pointer_move(event.position, window, cx);
+                            this.send_mouse_button(event.button, false);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                            this.send_pointer_move(event.position, window, cx);
+                            this.send_mouse_button(event.button, false);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Middle,
+                        cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                            this.send_pointer_move(event.position, window, cx);
+                            this.send_mouse_button(event.button, false);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                        this.send_scroll(event);
+                        cx.stop_propagation();
+                    }))
+                    .child(remote_desktop_frame_canvas(canvas_paint))
+            })
+            .when(
+                should_show_empty_status(
+                    show_empty_status,
+                    uses_windows_native,
+                    show_failure_detail,
+                    self.connected,
+                ),
+                |this| {
+                    this.child(
+                        div()
+                            .min_w_0()
+                            .max_w_full()
+                            .flex_shrink_0()
+                            .overflow_hidden()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_3()
+                            .text_center()
+                            .px_4()
+                            .py_2()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(
+                                div()
+                                    .w_full()
+                                    .whitespace_normal()
+                                    .child(self.status.clone()),
+                            )
+                            .when_some(failure_detail, |this, detail| {
+                                let clipboard_detail = detail.clone();
+                                this.child(
+                                    div()
+                                        .w_full()
+                                        .max_h(px(320.0))
+                                        .overflow_scrollbar()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(cx.theme().border)
+                                        .bg(cx.theme().muted)
+                                        .p_3()
+                                        .text_left()
+                                        .text_xs()
+                                        .whitespace_normal()
+                                        .child(detail),
+                                )
+                                .child(
+                                    Button::new("remote-desktop-copy-diagnostic")
+                                        .small()
+                                        .outline()
+                                        .compact()
+                                        .label(t!("RemoteDesktop.copy_diagnostic").to_string())
+                                        .on_click(move |_, _, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                clipboard_detail.to_string(),
+                                            ));
+                                        }),
+                                )
+                            }),
+                    )
+                },
             )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    window.focus(&this.focus_handle, cx);
-                    this.send_pointer_move(event.position, window, cx);
-                    this.send_mouse_button(event.button, true);
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Middle,
-                cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    window.focus(&this.focus_handle, cx);
-                    this.send_pointer_move(event.position, window, cx);
-                    this.send_mouse_button(event.button, true);
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                    this.send_pointer_move(event.position, window, cx);
-                    this.send_mouse_button(event.button, false);
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Right,
-                cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                    this.send_pointer_move(event.position, window, cx);
-                    this.send_mouse_button(event.button, false);
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Middle,
-                cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                    this.send_pointer_move(event.position, window, cx);
-                    this.send_mouse_button(event.button, false);
-                    cx.stop_propagation();
-                }),
-            )
-            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                this.send_scroll(event);
-                cx.stop_propagation();
-            }))
-            .child(remote_desktop_frame_canvas(canvas_paint))
-            .when(show_empty_status, |this| {
-                this.child(
-                    div()
-                        .min_w_0()
-                        .max_w_full()
-                        .flex_shrink_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_center()
-                        .px_4()
-                        .py_2()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(self.status.clone()),
-                )
+            .on_prepaint(move |bounds, window, cx| {
+                view.update(cx, |view, view_cx| {
+                    view.update_content_bounds(bounds, window.scale_factor(), view_cx);
+                });
             });
 
         div()
@@ -343,13 +559,44 @@ impl Render for RemoteDesktopView {
             .min_w_0()
             .min_h_0()
             .relative()
+            .flex()
+            .flex_col()
             .overflow_hidden()
-            .on_children_prepainted(move |bounds, window, cx| {
-                if let Some(bounds) = bounds.first().copied() {
-                    view.update(cx, |view, cx| {
-                        view.update_content_bounds(bounds, window.scale_factor(), cx);
-                    });
-                }
+            .on_action(cx.listener(Self::use_canvas))
+            .when(show_presentation_status, |this| {
+                this.child(
+                    div()
+                        .id("remote-desktop-presentation-status")
+                        .w_full()
+                        .h(cx.theme().geometry.layout.status_bar)
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .px_3()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().background)
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .when_some(fallback_reason, |this, reason| {
+                            this.child(div().min_w_0().flex_1().truncate().child(
+                                t!("RemoteDesktop.fallback_reason", reason = reason).to_string(),
+                            ))
+                        })
+                        .when(canvas_retry_available, |this| {
+                            this.child(
+                                Button::new("remote-desktop-use-canvas")
+                                    .small()
+                                    .outline()
+                                    .compact()
+                                    .label(t!("RemoteDesktop.use_canvas").to_string())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.use_canvas(&UseCanvas, window, cx);
+                                    })),
+                            )
+                        }),
+                )
             })
             .child(content)
     }

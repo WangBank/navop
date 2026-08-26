@@ -1,7 +1,6 @@
-use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AppContext, Context, Entity, EventEmitter, Hsla, IntoElement, ParentElement, Pixels, Render,
-    Styled, UniformListScrollHandle, Window,
+    AnyElement, AppContext, Context, Entity, EventEmitter, Hsla, InteractiveElement, IntoElement,
+    ParentElement, Pixels, Render, Styled, UniformListScrollHandle, Window, div,
 };
 use gpui_component::{
     ActiveTheme as _, h_flex,
@@ -21,6 +20,7 @@ mod connection_share;
 mod context_menu;
 mod drag;
 mod header_actions;
+mod navigation_sections;
 mod rail;
 mod resize;
 #[cfg(test)]
@@ -77,10 +77,12 @@ impl From<&TerminalColors> for SidebarPalette {
             foreground: colors.foreground,
             muted: colors.muted,
             hover: colors.muted,
-            selected: Hsla {
-                a: 0.18,
-                ..colors.accent
-            },
+            selected: Hsla::new(
+                colors.accent.hue.into_degrees(),
+                colors.accent.saturation,
+                colors.accent.lightness,
+                0.18,
+            ),
             selected_border: colors.accent,
             muted_foreground: colors.muted_foreground,
             border: colors.border,
@@ -94,10 +96,12 @@ impl From<&TerminalColors> for SidebarPalette {
 /// terminal themes.
 fn shade(color: Hsla, dark_mode: bool) -> Hsla {
     let amount = if dark_mode { -0.02 } else { -0.015 };
-    Hsla {
-        l: (color.l + amount).clamp(0.0, 1.0),
-        ..color
-    }
+    Hsla::new(
+        color.hue.into_degrees(),
+        color.saturation,
+        (color.lightness + amount).clamp(0.0, 1.0),
+        color.alpha,
+    )
 }
 
 pub(crate) struct PersistentConnectionSidebar {
@@ -105,6 +109,7 @@ pub(crate) struct PersistentConnectionSidebar {
     connection_selection: ConnectionSelection,
     pub(super) tree_expanded: bool,
     pub(super) hide_empty_workspaces: bool,
+    pub(super) auto_hide_tree: bool,
     pub(super) search_input: Entity<InputState>,
     tree_width: Pixels,
     terminal_colors: Option<TerminalColors>,
@@ -118,6 +123,31 @@ pub(crate) enum PersistentConnectionSidebarEvent {
 impl EventEmitter<PersistentConnectionSidebarEvent> for PersistentConnectionSidebar {}
 
 impl PersistentConnectionSidebar {
+    /// Render the connection tree as a floating panel that overlays the main
+    /// content instead of occupying flex space, so expanding it no longer
+    /// squeezes the terminal. The caller (OnetCliApp) positions it just after
+    /// the navigation rail and above the terminal, and collapses it when the
+    /// terminal regains focus.
+    pub(crate) fn render_floating_tree(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let palette = self.palette(cx);
+        let layout = cx.theme().geometry.layout;
+        let rail_width = layout.global_rail;
+        let top = layout.tab_bar;
+        div()
+            .absolute()
+            .top(top)
+            .bottom_0()
+            .left(rail_width)
+            .w(self.tree_width)
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(self.render_connection_tree(palette, window, cx))
+            .into_any_element()
+    }
+
     pub(crate) fn new(
         home_page: Entity<HomePage>,
         tree_expanded: bool,
@@ -155,6 +185,7 @@ impl PersistentConnectionSidebar {
             connection_selection: ConnectionSelection::default(),
             tree_expanded,
             hide_empty_workspaces: tree_state.hide_empty_workspaces,
+            auto_hide_tree: tree_state.auto_hide_tree,
             search_input,
             tree_width: cx.theme().geometry.layout.context_sidebar_default,
             terminal_colors: None,
@@ -171,6 +202,19 @@ impl PersistentConnectionSidebar {
 
     pub(crate) fn is_expanded(&self) -> bool {
         self.tree_expanded
+    }
+
+    pub(crate) fn is_auto_hide_tree(&self) -> bool {
+        self.auto_hide_tree
+    }
+
+    /// 非自动隐藏模式下，连接树作为与终端并排的分割面板渲染，而不是浮层。
+    pub(crate) fn render_docked_connection_tree(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_connection_tree(self.palette(cx), window, cx)
     }
 
     pub(crate) fn set_terminal_colors(
@@ -191,7 +235,7 @@ impl PersistentConnectionSidebar {
 }
 
 impl Render for PersistentConnectionSidebar {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.palette(cx);
         h_flex()
             .h_full()
@@ -202,9 +246,6 @@ impl Render for PersistentConnectionSidebar {
                 palette,
                 cx,
             ))
-            .when(self.tree_expanded, |this| {
-                this.child(self.render_connection_tree(palette, window, cx))
-            })
             .into_any_element()
     }
 }

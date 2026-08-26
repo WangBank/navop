@@ -14,6 +14,7 @@ use crate::search_shortcut::{
     DB_SEARCH_CONTEXT, FocusSearchInput, OpenSelectedTableQuery, focus_search_input,
 };
 use crate::table_copy_menu::append_table_copy_items;
+use db::DbNodeType::QueryFolder;
 use db::plugin_manifest::DatabaseActionId;
 use db::{
     DbNode, DbNodeType, GlobalDbState, ObjectView, ObjectViewColumn,
@@ -684,6 +685,13 @@ impl DatabaseObjects {
 
         let mut metadata: HashMap<String, String> = current_node.metadata.clone();
         let database = metadata.get("database").cloned().unwrap_or_default();
+        // 树中加载的数据库节点（如 MySQL）默认不携带 database 元数据，
+        // 此时回退到数据库节点名，避免打开表/视图数据时数据库名为空。
+        let database = if database.is_empty() && current_node.node_type == DbNodeType::Database {
+            current_node.name.clone()
+        } else {
+            database
+        };
 
         let (node_id, target_node_type) = match db_node_type {
             DbNodeType::Connection => {
@@ -724,13 +732,8 @@ impl DatabaseObjects {
                 }
             }
             DbNodeType::TablesFolder | DbNodeType::Table => {
-                let db = if database.is_empty() {
-                    current_node.name.clone()
-                } else {
-                    database.clone()
-                };
                 let schema = current_node.get_schema_name();
-                metadata.insert("database".to_string(), db.clone());
+                metadata.insert("database".to_string(), database.clone());
                 if let Some(schema) = schema.as_ref().filter(|schema| !schema.trim().is_empty()) {
                     metadata.insert("schema".to_string(), schema.clone());
                 }
@@ -745,12 +748,10 @@ impl DatabaseObjects {
                 } else {
                     metadata.remove("comment");
                 }
-                let node_id = if let Some(schema) =
-                    schema.as_ref().filter(|schema| !schema.trim().is_empty())
-                {
-                    format!("{}:{}:{}:table_folder:{}", connection_id, db, schema, name)
+                let node_id = if current_node.node_type == DbNodeType::TablesFolder {
+                    format!("{}:{}", current_node.id, name)
                 } else {
-                    format!("{}:{}:table_folder:{}", connection_id, db, name)
+                    format!("{}:table_folder:{}", current_node.id, name)
                 };
                 (node_id, DbNodeType::Table)
             }
@@ -786,34 +787,22 @@ impl DatabaseObjects {
                 }
             }
             DbNodeType::ViewsFolder | DbNodeType::View => {
-                let db = if database.is_empty() {
-                    current_node.name.clone()
-                } else {
-                    database.clone()
-                };
                 let schema = current_node.get_schema_name();
-                metadata.insert("database".to_string(), db.clone());
+                metadata.insert("database".to_string(), database.clone());
                 if let Some(schema) = schema.as_ref().filter(|schema| !schema.trim().is_empty()) {
                     metadata.insert("schema".to_string(), schema.clone());
                 }
                 metadata.insert("view".to_string(), name.clone());
-                let node_id = if let Some(schema) =
-                    schema.as_ref().filter(|schema| !schema.trim().is_empty())
-                {
-                    format!("{}:{}:{}:views_folder:{}", connection_id, db, schema, name)
+                let node_id = if current_node.node_type == DbNodeType::ViewsFolder {
+                    format!("{}:{}", current_node.id, name)
                 } else {
-                    format!("{}:{}:views_folder:{}", connection_id, db, name)
+                    format!("{}:views_folder:{}", current_node.id, name)
                 };
                 (node_id, DbNodeType::View)
             }
             DbNodeType::FunctionsFolder | DbNodeType::Function => {
-                let db = if database.is_empty() {
-                    current_node.name.clone()
-                } else {
-                    database.clone()
-                };
                 let schema = current_node.get_schema_name();
-                metadata.insert("database".to_string(), db.clone());
+                metadata.insert("database".to_string(), database.clone());
                 if let Some(schema) = schema.as_ref().filter(|schema| !schema.trim().is_empty()) {
                     metadata.insert("schema".to_string(), schema.clone());
                 }
@@ -838,26 +827,16 @@ impl DatabaseObjects {
                 let routine_key = object_id
                     .map(|object_id| format!("{}#oid:{}", name, object_id))
                     .unwrap_or_else(|| node_name.clone());
-                let node_id = if let Some(schema) =
-                    schema.as_ref().filter(|schema| !schema.trim().is_empty())
-                {
-                    format!(
-                        "{}:{}:{}:functions_folder:{}",
-                        connection_id, db, schema, routine_key
-                    )
+                let node_id = if current_node.node_type == DbNodeType::FunctionsFolder {
+                    format!("{}:{}", current_node.id, routine_key)
                 } else {
-                    format!("{}:{}:functions_folder:{}", connection_id, db, routine_key)
+                    format!("{}:functions_folder:{}", current_node.id, routine_key)
                 };
                 (node_id, DbNodeType::Function)
             }
             DbNodeType::ProceduresFolder | DbNodeType::Procedure => {
-                let db = if database.is_empty() {
-                    current_node.name.clone()
-                } else {
-                    database.clone()
-                };
                 let schema = current_node.get_schema_name();
-                metadata.insert("database".to_string(), db.clone());
+                metadata.insert("database".to_string(), database.clone());
                 if let Some(schema) = schema.as_ref().filter(|schema| !schema.trim().is_empty()) {
                     metadata.insert("schema".to_string(), schema.clone());
                 }
@@ -882,15 +861,10 @@ impl DatabaseObjects {
                 let routine_key = object_id
                     .map(|object_id| format!("{}#oid:{}", name, object_id))
                     .unwrap_or_else(|| node_name.clone());
-                let node_id = if let Some(schema) =
-                    schema.as_ref().filter(|schema| !schema.trim().is_empty())
-                {
-                    format!(
-                        "{}:{}:{}:procedures_folder:{}",
-                        connection_id, db, schema, routine_key
-                    )
+                let node_id = if current_node.node_type == DbNodeType::ProceduresFolder {
+                    format!("{}:{}", current_node.id, routine_key)
                 } else {
-                    format!("{}:{}:procedures_folder:{}", connection_id, db, routine_key)
+                    format!("{}:procedures_folder:{}", current_node.id, routine_key)
                 };
                 (node_id, DbNodeType::Procedure)
             }
@@ -1223,11 +1197,15 @@ impl DatabaseObjects {
             Some(QUERY_ROW_KIND_SQL) => DbNodeType::NamedQuery,
             _ => args.db_node_type,
         };
-        let query_depth = args
-            .row_values
-            .get(QUERY_ROW_DEPTH_INDEX)
-            .and_then(|depth| depth.parse::<f32>().ok())
-            .unwrap_or(0.0);
+        let mut query_depth = 0.0;
+        if row_node_type == QueryFolder {
+            query_depth = args
+                .row_values
+                .get(QUERY_ROW_DEPTH_INDEX)
+                .and_then(|depth| depth.parse::<f32>().ok())
+                .unwrap_or(0.0);
+        }
+
         let mut row = h_flex()
             .w_full()
             .h(one_ui::table_row_height(cx))
@@ -1532,7 +1510,7 @@ impl Render for DatabaseObjects {
                                 },
                             )
                         })
-                        .flex_grow()
+                        .flex_grow_1()
                         .size_full()
                         .with_sizing_behavior(ListSizingBehavior::Auto),
                     ),
@@ -1736,6 +1714,40 @@ mod tests {
             node.metadata.get("table").map(String::as_str)
         );
         assert_eq!("conn1:app_db:public:table_folder:users", node.id);
+    }
+
+    #[test]
+    fn database_without_database_metadata_falls_back_to_node_name_for_table_row() {
+        // MySQL 数据库节点（来自树）默认不携带 database 元数据，
+        // 从对象页签双击表行时必须以节点名作为数据库名。
+        let current_node = DbNode::new(
+            "conn1:shop_db",
+            "shop_db",
+            DbNodeType::Database,
+            "conn1".to_string(),
+            DatabaseType::MySQL,
+        );
+        let row = vec!["orders".to_string()];
+
+        let node = DatabaseObjects::build_node_from_object_row(
+            DbNodeType::Table,
+            Some(&current_node),
+            &[],
+            &row,
+        )
+        .expect("table row under a database node should produce a node");
+
+        assert_eq!(DbNodeType::Table, node.node_type);
+        assert_eq!("orders", node.name);
+        assert_eq!(
+            Some("shop_db"),
+            node.metadata.get("database").map(String::as_str)
+        );
+        assert_eq!(
+            Some("orders"),
+            node.metadata.get("table").map(String::as_str)
+        );
+        assert_eq!("conn1:shop_db:table_folder:orders", node.id);
     }
 
     #[test]
@@ -2202,6 +2214,170 @@ mod tests {
 
         std::fs::remove_dir_all(default_root).unwrap();
         std::fs::remove_dir_all(added_root).unwrap();
+    }
+
+    fn oracle_tables_folder_node() -> DbNode {
+        DbNode::new(
+            "127:COMI_SERVER2112:table_folder",
+            "DbTree.Tables",
+            DbNodeType::TablesFolder,
+            "127".to_string(),
+            DatabaseType::Oracle,
+        )
+        .with_metadata(HashMap::from([
+            ("database".to_string(), String::new()),
+            ("schema".to_string(), "COMI_SERVER2112".to_string()),
+        ]))
+    }
+
+    fn oracle_schema_node() -> DbNode {
+        DbNode::new(
+            "127:COMI_SERVER2112",
+            "COMI_SERVER2112",
+            DbNodeType::Schema,
+            "127".to_string(),
+            DatabaseType::Oracle,
+        )
+        .with_metadata(HashMap::from([("database".to_string(), String::new())]))
+    }
+
+    #[test]
+    fn oracle_tables_folder_row_builds_table_node_matching_tree_id() {
+        let row = vec!["BIZ_MESSAGE".to_string()];
+
+        let node = DatabaseObjects::build_node_from_object_row(
+            DbNodeType::Table,
+            Some(&oracle_tables_folder_node()),
+            &[],
+            &row,
+        )
+        .expect("table row under an oracle tables folder should produce a node");
+
+        assert_eq!(DbNodeType::Table, node.node_type);
+        assert_eq!("BIZ_MESSAGE", node.name);
+        // node id must match the id used in the real left-side tree so that
+        // tree-driven actions (design table, open table data) can find it.
+        assert_eq!("127:COMI_SERVER2112:table_folder:BIZ_MESSAGE", node.id);
+        assert_eq!(
+            Some(""),
+            node.metadata.get("database").map(String::as_str)
+        );
+        assert_eq!(
+            Some("COMI_SERVER2112"),
+            node.metadata.get("schema").map(String::as_str)
+        );
+        assert_eq!(
+            Some("BIZ_MESSAGE"),
+            node.metadata.get("table").map(String::as_str)
+        );
+    }
+
+    #[test]
+    fn oracle_schema_row_builds_table_node_matching_tree_id() {
+        let row = vec!["BIZ_MESSAGE".to_string()];
+
+        let node = DatabaseObjects::build_node_from_object_row(
+            DbNodeType::Table,
+            Some(&oracle_schema_node()),
+            &[],
+            &row,
+        )
+        .expect("table row under an oracle schema should produce a node");
+
+        assert_eq!(DbNodeType::Table, node.node_type);
+        assert_eq!("BIZ_MESSAGE", node.name);
+        // Schema-based databases (uses_schema_as_database) have no database
+        // segment in the tree node id.
+        assert_eq!("127:COMI_SERVER2112:table_folder:BIZ_MESSAGE", node.id);
+        assert_eq!(
+            Some("COMI_SERVER2112"),
+            node.metadata.get("schema").map(String::as_str)
+        );
+    }
+
+    #[test]
+    fn oracle_folder_row_builds_view_node_matching_tree_id() {
+        let current_node = DbNode::new(
+            "127:COMI_SERVER2112:views_folder",
+            "DbTree.Views",
+            DbNodeType::ViewsFolder,
+            "127".to_string(),
+            DatabaseType::Oracle,
+        )
+        .with_metadata(HashMap::from([
+            ("database".to_string(), String::new()),
+            ("schema".to_string(), "COMI_SERVER2112".to_string()),
+        ]));
+        let row = vec!["BIZ_VIEW".to_string()];
+
+        let node = DatabaseObjects::build_node_from_object_row(
+            DbNodeType::View,
+            Some(&current_node),
+            &[],
+            &row,
+        )
+        .expect("view row under an oracle views folder should produce a node");
+
+        assert_eq!(DbNodeType::View, node.node_type);
+        assert_eq!("127:COMI_SERVER2112:views_folder:BIZ_VIEW", node.id);
+        assert_eq!(
+            Some("COMI_SERVER2112"),
+            node.metadata.get("schema").map(String::as_str)
+        );
+    }
+
+    #[test]
+    fn oracle_folder_row_builds_function_node_matching_tree_id() {
+        let current_node = DbNode::new(
+            "127:COMI_SERVER2112:functions_folder",
+            "DbTree.Functions",
+            DbNodeType::FunctionsFolder,
+            "127".to_string(),
+            DatabaseType::Oracle,
+        )
+        .with_metadata(HashMap::from([
+            ("database".to_string(), String::new()),
+            ("schema".to_string(), "COMI_SERVER2112".to_string()),
+        ]));
+        let row = vec!["REVERSE".to_string()];
+
+        let node = DatabaseObjects::build_node_from_object_row(
+            DbNodeType::Function,
+            Some(&current_node),
+            &[],
+            &row,
+        )
+        .expect("function row under an oracle functions folder should produce a node");
+
+        assert_eq!(DbNodeType::Function, node.node_type);
+        assert_eq!("127:COMI_SERVER2112:functions_folder:REVERSE", node.id);
+    }
+
+    #[test]
+    fn oracle_folder_row_builds_procedure_node_matching_tree_id() {
+        let current_node = DbNode::new(
+            "127:COMI_SERVER2112:procedures_folder",
+            "DbTree.Procedures",
+            DbNodeType::ProceduresFolder,
+            "127".to_string(),
+            DatabaseType::Oracle,
+        )
+        .with_metadata(HashMap::from([
+            ("database".to_string(), String::new()),
+            ("schema".to_string(), "COMI_SERVER2112".to_string()),
+        ]));
+        let row = vec!["SYNC_DATA".to_string()];
+
+        let node = DatabaseObjects::build_node_from_object_row(
+            DbNodeType::Procedure,
+            Some(&current_node),
+            &[],
+            &row,
+        )
+        .expect("procedure row under an oracle procedures folder should produce a node");
+
+        assert_eq!(DbNodeType::Procedure, node.node_type);
+        assert_eq!("127:COMI_SERVER2112:procedures_folder:SYNC_DATA", node.id);
     }
 }
 

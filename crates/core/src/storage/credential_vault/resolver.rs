@@ -3,8 +3,9 @@ use anyhow::{Result, bail};
 use crate::storage::traits::Repository;
 use crate::storage::{
     ConnectionType, CredentialRepository, DbConnectionConfig, MongoDBParams, ProxyConfig,
-    RedisParams, ReferencedCredentialFields, RemoteDesktopParams, SshAuthMethod, SshParams,
-    StoredConnection, resolve_credential_reference_strict,
+    RedisParams, ReferencedCredentialFields, RemoteDesktopParams, SshAccountExpect, SshAuthMethod,
+    SshParams, StoredConnection, TelnetLoginStep, TelnetParams,
+    resolve_credential_reference_strict,
 };
 
 impl CredentialRepository {
@@ -27,6 +28,9 @@ impl CredentialRepository {
             ConnectionType::MongoDB => {
                 serde_json::to_string(&self.resolve_mongodb(connection.to_mongodb_params()?)?)?
             }
+            ConnectionType::Telnet => {
+                serde_json::to_string(&self.resolve_telnet(connection.to_telnet_params()?)?)?
+            }
             ConnectionType::Rdp | ConnectionType::Vnc => serde_json::to_string(
                 &self.resolve_remote_desktop(connection.to_remote_desktop_params()?)?,
             )?,
@@ -36,30 +40,56 @@ impl CredentialRepository {
     }
 
     pub fn resolve_ssh(&self, mut params: SshParams) -> Result<SshParams> {
-        let Some(reference) = params.credential_reference else {
+        params.account_expect = SshAccountExpect::default();
+        let Some(reference) = params.credential_reference.as_ref() else {
             self.resolve_optional_proxy(params.proxy.as_mut())?;
             self.resolve_optional_jump(params.jump_server.as_mut())?;
             return Ok(params);
         };
-        reject_conflicting_ssh_fields(&reference)?;
-        let credential = self.get(reference.credential_id)?;
+        reject_conflicting_ssh_fields(reference)?;
+        let credential = self.resolve_reference_entry(reference)?;
         let manual = ssh_fields(&params);
-        let fields = resolve_credential_reference_strict(manual, &reference, credential.as_ref())?;
+        let fields = resolve_credential_reference_strict(manual, reference, credential.as_ref())?;
         params.username = fields.username.clone().unwrap_or_default();
         apply_ssh_auth(
             &mut params.auth_method,
-            &reference,
+            reference,
             fields,
             credential.as_ref(),
         )?;
+        if let Some(credential) = credential.as_ref() {
+            params.account_expect = credential.ssh_expect.clone();
+        }
         self.resolve_optional_proxy(params.proxy.as_mut())?;
         self.resolve_optional_jump(params.jump_server.as_mut())?;
         Ok(params)
     }
 
+    pub fn resolve_telnet(&self, mut params: TelnetParams) -> Result<TelnetParams> {
+        let Some(reference) = params.credential_reference.as_ref() else {
+            return Ok(params);
+        };
+        let credential = self.resolve_reference_entry(reference)?;
+        let fields = resolve_credential_reference_strict(
+            ReferencedCredentialFields::new(None, None, None, None),
+            reference,
+            credential.as_ref(),
+        )?;
+        let username = fields.username.as_deref();
+        let password = fields.password.as_deref();
+
+        if params.login_script.is_empty()
+            && let Some(credential) = credential.as_ref()
+        {
+            params.login_script = telnet_login_script_from_credential(credential);
+        }
+        params.apply_login_credentials(username, password);
+        Ok(params)
+    }
+
     pub fn resolve_database(&self, mut params: DbConnectionConfig) -> Result<DbConnectionConfig> {
-        if let Some(reference) = params.credential_reference {
-            let credential = self.get(reference.credential_id)?;
+        if let Some(reference) = params.credential_reference.as_ref() {
+            let credential = self.resolve_reference_entry(reference)?;
             let fields = resolve_credential_reference_strict(
                 ReferencedCredentialFields::new(
                     Some(params.username.clone()),
@@ -67,7 +97,7 @@ impl CredentialRepository {
                     None,
                     None,
                 ),
-                &reference,
+                reference,
                 credential.as_ref(),
             )?;
             params.username = fields.username.unwrap_or_default();
@@ -78,8 +108,8 @@ impl CredentialRepository {
     }
 
     pub fn resolve_redis(&self, mut params: RedisParams) -> Result<RedisParams> {
-        if let Some(reference) = params.credential_reference {
-            let credential = self.get(reference.credential_id)?;
+        if let Some(reference) = params.credential_reference.as_ref() {
+            let credential = self.resolve_reference_entry(reference)?;
             let fields = resolve_credential_reference_strict(
                 ReferencedCredentialFields::new(
                     params.username.clone(),
@@ -87,16 +117,16 @@ impl CredentialRepository {
                     None,
                     None,
                 ),
-                &reference,
+                reference,
                 credential.as_ref(),
             )?;
             params.username = fields.username;
             params.password = fields.password;
         }
         if let Some(sentinel) = params.sentinel.as_mut()
-            && let Some(reference) = sentinel.credential_reference
+            && let Some(reference) = sentinel.credential_reference.as_ref()
         {
-            let credential = self.get(reference.credential_id)?;
+            let credential = self.resolve_reference_entry(reference)?;
             let fields = resolve_credential_reference_strict(
                 ReferencedCredentialFields::new(
                     None,
@@ -104,7 +134,7 @@ impl CredentialRepository {
                     None,
                     None,
                 ),
-                &reference,
+                reference,
                 credential.as_ref(),
             )?;
             sentinel.sentinel_password = fields.password;
@@ -113,8 +143,8 @@ impl CredentialRepository {
     }
 
     pub fn resolve_mongodb(&self, mut params: MongoDBParams) -> Result<MongoDBParams> {
-        if let Some(reference) = params.credential_reference {
-            let credential = self.get(reference.credential_id)?;
+        if let Some(reference) = params.credential_reference.as_ref() {
+            let credential = self.resolve_reference_entry(reference)?;
             let fields = resolve_credential_reference_strict(
                 ReferencedCredentialFields::new(
                     params.username.clone(),
@@ -122,7 +152,7 @@ impl CredentialRepository {
                     None,
                     None,
                 ),
-                &reference,
+                reference,
                 credential.as_ref(),
             )?;
             params.username = fields.username;
@@ -135,8 +165,8 @@ impl CredentialRepository {
         &self,
         mut params: RemoteDesktopParams,
     ) -> Result<RemoteDesktopParams> {
-        if let Some(reference) = params.credential_reference {
-            let credential = self.get(reference.credential_id)?;
+        if let Some(reference) = params.credential_reference.as_ref() {
+            let credential = self.resolve_reference_entry(reference)?;
             let fields = resolve_credential_reference_strict(
                 ReferencedCredentialFields::new(
                     params.username.clone(),
@@ -144,7 +174,7 @@ impl CredentialRepository {
                     None,
                     None,
                 ),
-                &reference,
+                reference,
                 credential.as_ref(),
             )?;
             params.username = fields.username;
@@ -158,10 +188,10 @@ impl CredentialRepository {
         let Some(proxy) = proxy else {
             return Ok(());
         };
-        let Some(reference) = proxy.credential_reference else {
+        let Some(reference) = proxy.credential_reference.as_ref() else {
             return Ok(());
         };
-        let credential = self.get(reference.credential_id)?;
+        let credential = self.resolve_reference_entry(reference)?;
         let fields = resolve_credential_reference_strict(
             ReferencedCredentialFields::new(
                 proxy.username.clone(),
@@ -169,7 +199,7 @@ impl CredentialRepository {
                 None,
                 None,
             ),
-            &reference,
+            reference,
             credential.as_ref(),
         )?;
         proxy.username = fields.username;
@@ -184,10 +214,10 @@ impl CredentialRepository {
         let Some(jump) = jump else {
             return Ok(());
         };
-        let Some(reference) = jump.credential_reference else {
+        let Some(reference) = jump.credential_reference.as_ref() else {
             return Ok(());
         };
-        let credential = self.get(reference.credential_id)?;
+        let credential = self.resolve_reference_entry(reference)?;
         let fields = resolve_credential_reference_strict(
             ReferencedCredentialFields::new(
                 Some(jump.username.clone()),
@@ -195,16 +225,27 @@ impl CredentialRepository {
                 private_key_from_auth(&jump.auth_method),
                 passphrase_from_auth(&jump.auth_method),
             ),
-            &reference,
+            reference,
             credential.as_ref(),
         )?;
         jump.username = fields.username.clone().unwrap_or_default();
         apply_ssh_auth(
             &mut jump.auth_method,
-            &reference,
+            reference,
             fields,
             credential.as_ref(),
         )
+    }
+
+    fn resolve_reference_entry(
+        &self,
+        reference: &crate::storage::CredentialReference,
+    ) -> Result<Option<crate::storage::CredentialEntry>> {
+        if let Some(cloud_id) = reference.credential_cloud_id.as_deref() {
+            self.get_by_cloud_id(cloud_id)
+        } else {
+            self.get(reference.credential_id)
+        }
     }
 }
 
@@ -286,4 +327,20 @@ fn reject_conflicting_ssh_fields(reference: &crate::storage::CredentialReference
         bail!("a credential reference cannot select password and private key together");
     }
     Ok(())
+}
+
+fn telnet_login_script_from_credential(
+    credential: &crate::storage::CredentialEntry,
+) -> Vec<TelnetLoginStep> {
+    [
+        &credential.ssh_expect.username,
+        &credential.ssh_expect.password,
+    ]
+    .into_iter()
+    .filter(|step| !step.expect.trim().is_empty())
+    .map(|step| TelnetLoginStep {
+        expect: step.expect.clone(),
+        send: step.send.clone(),
+    })
+    .collect()
 }

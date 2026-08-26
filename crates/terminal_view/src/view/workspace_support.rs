@@ -40,6 +40,12 @@ impl TerminalView {
         }
     }
 
+    pub(crate) fn on_host_activated(&mut self, cx: &mut Context<Self>) {
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.on_host_activated(cx);
+        });
+    }
+
     pub(crate) fn duplicate_source_snapshot(&self, cx: &App) -> Option<TerminalDuplicateSource> {
         let source = self.duplicate_source.clone()?;
         let current_working_dir = self
@@ -71,6 +77,9 @@ impl TerminalView {
             }
             TerminalDuplicateSource::Serial(connection) => {
                 Self::new_serial_with_index(connection, None, window, cx)
+            }
+            TerminalDuplicateSource::Telnet(connection) => {
+                Self::new_telnet_with_index(connection, None, window, cx)
             }
             TerminalDuplicateSource::Ssh {
                 connection,
@@ -116,6 +125,62 @@ impl TerminalView {
             panels: self.sidebar_tool_panels.clone(),
             colors: self.sidebar.read(cx).colors(),
         }
+    }
+
+    pub(crate) fn session_lock_capable(&self, cx: &App) -> bool {
+        self.terminal.read(cx).live_connection_kind().is_some()
+    }
+
+    pub(crate) fn is_session_locked(&self, cx: &App) -> bool {
+        self.terminal.read(cx).is_locked()
+    }
+
+    pub(crate) fn lock_pane_session(&self, password_hash: &str, hide_output: bool, cx: &mut App) {
+        self.terminal.update(cx, |terminal, cx| {
+            terminal.lock_session(password_hash.to_string(), hide_output, cx);
+        });
+    }
+
+    pub(crate) fn unlock_pane_session(&self, password_hash: &str, cx: &mut App) -> bool {
+        self.terminal.update(cx, |terminal, cx| {
+            terminal.unlock_session(password_hash, cx)
+        })
+    }
+
+    pub(crate) fn terminal_is_disconnected(&self, cx: &App) -> bool {
+        let terminal = self.terminal.read(cx);
+        matches!(
+            terminal.connection_state(),
+            ConnectionState::Disconnected { .. }
+        ) || terminal.child_exited().is_some()
+    }
+
+    pub(crate) fn terminal_connection_status(
+        &self,
+        cx: &App,
+    ) -> Option<one_core::tab_container::TabConnectionStatus> {
+        let terminal = self.terminal.read(cx);
+        map_connection_status(
+            terminal.live_connection_kind().is_some(),
+            terminal.connection_state(),
+        )
+    }
+}
+
+/// Map a terminal's connection state onto a tab-bar status badge. Read-only /
+/// recording terminals (no live connection kind) surface no badge.
+pub(crate) fn map_connection_status(
+    has_live_connection_kind: bool,
+    state: &ConnectionState,
+) -> Option<one_core::tab_container::TabConnectionStatus> {
+    use one_core::tab_container::TabConnectionStatus;
+    if !has_live_connection_kind {
+        return None;
+    }
+    match state {
+        ConnectionState::Connected => Some(TabConnectionStatus::Connected),
+        ConnectionState::Connecting => Some(TabConnectionStatus::Connecting),
+        ConnectionState::Disconnected { .. } => Some(TabConnectionStatus::Disconnected),
     }
 }
 

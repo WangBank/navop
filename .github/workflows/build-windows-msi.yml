@@ -28,7 +28,7 @@ env:
   SCCACHE_IDLE_TIMEOUT: "7200"
   WINDOWS_TARGET: ${{ inputs.architecture == 'x86' && 'i686-pc-windows-msvc' || 'x86_64-pc-windows-msvc' }}
   WINDOWS_WIX_ARCH: ${{ inputs.architecture == 'x86' && 'x86' || 'x64' }}
-  WINDOWS_BASENAME: ${{ inputs.architecture == 'x86' && 'navop-i686-pc-windows-msvc' || 'navop-x86_64-pc-windows-msvc' }}
+  WINDOWS_LABEL: ${{ inputs.architecture == 'x86' && 'win32' || 'windows-x64' }}
 
 jobs:
   build:
@@ -47,12 +47,43 @@ jobs:
           }
           "ONETCLI_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "MSI_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WINDOWS_BASENAME=navop-$version-$env:WINDOWS_LABEL" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Setup Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: ${{ env.WINDOWS_TARGET }}
           cache: false
+
+      - name: Install NASM
+        shell: pwsh
+        run: |
+          choco install nasm --no-progress --yes
+          $nasmDir = Join-Path $env:ProgramFiles "NASM"
+          $nasmExe = Join-Path $nasmDir "nasm.exe"
+          if (-not (Test-Path -LiteralPath $nasmExe -PathType Leaf)) {
+            Write-Warning "Chocolatey did not install NASM; downloading the pinned upstream archive"
+            $nasmVersion = "3.01"
+            $nasmArchive = Join-Path $env:RUNNER_TEMP "nasm-$nasmVersion-win64.zip"
+            $nasmExtractRoot = Join-Path $env:RUNNER_TEMP "nasm-$nasmVersion-win64"
+            Invoke-WebRequest `
+              -Uri "https://www.nasm.us/pub/nasm/releasebuilds/$nasmVersion/win64/nasm-$nasmVersion-win64.zip" `
+              -OutFile $nasmArchive
+            $expectedHash = "e0ba5157007abc7b1a65118a96657a961ddf55f7e3f632ee035366dfce039ca4"
+            $actualHash = (Get-FileHash -LiteralPath $nasmArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualHash -ne $expectedHash) {
+              throw "NASM archive checksum mismatch: expected $expectedHash, got $actualHash"
+            }
+            Expand-Archive -LiteralPath $nasmArchive -DestinationPath $nasmExtractRoot -Force
+            $nasmDir = Join-Path $nasmExtractRoot "nasm-$nasmVersion"
+            $nasmExe = Join-Path $nasmDir "nasm.exe"
+            if (-not (Test-Path -LiteralPath $nasmExe -PathType Leaf)) {
+              throw "NASM executable was not found at '$nasmExe'"
+            }
+          }
+          $env:Path = "$nasmDir;$env:Path"
+          $nasmDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          nasm -v
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.10
@@ -90,6 +121,15 @@ jobs:
             throw "SUPABASE_ANON_KEY secret is empty or not set"
           }
 
+      - name: Configure MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ env.WINDOWS_WIX_ARCH }}
+
+      - name: Verify native Windows RDP integration
+        shell: pwsh
+        run: ./script/build-windows-rdp-probe.ps1 -Target "$env:WINDOWS_TARGET"
+
       - name: Build release binary
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -97,7 +137,11 @@ jobs:
           NAVOP_PUBLIC_BASE_URL: ${{ vars.NAVOP_PUBLIC_BASE_URL }}
           NAVOP_WEBSITE_BASE_URL: ${{ vars.NAVOP_WEBSITE_BASE_URL }}
           ONETCLI_TEAM_MANAGEMENT_URL_TEMPLATE: ${{ vars.ONETCLI_TEAM_MANAGEMENT_URL_TEMPLATE }}
-        run: cargo build --release -p main --target $env:WINDOWS_TARGET
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:VCToolsInstallDir)) {
+            throw "VCToolsInstallDir is not configured"
+          }
+          cargo build --release -p main --features windows-native-rdp --target $env:WINDOWS_TARGET
 
       - name: Show sccache statistics
         if: always()

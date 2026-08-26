@@ -14,8 +14,8 @@ use gpui_component::notification::Notification;
 use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarShow};
 use gpui_component::slider::{Slider, SliderEvent, SliderState, SliderValue};
 use gpui_component::{
-    ActiveTheme, BlinkCursor, Disableable, ElementExt, Icon, IconName, Selectable, Sizable,
-    WindowExt, h_flex, kbd::Kbd, v_flex,
+    ActiveTheme, BlinkCursor, Disableable, ElementExt, Icon, IconName, IconSize, Selectable,
+    Sizable, WindowExt, h_flex, kbd::Kbd, v_flex,
 };
 use one_core::gpui_tokio::Tokio;
 use one_core::keybindings::{
@@ -56,6 +56,7 @@ use crate::cd_completion::{
 use crate::history_prompt::{HistoryPromptAccept, HistoryPromptMode, HistoryPromptState};
 use crate::host_key_dialog::{host_key_dialog_presentation, render_host_key_details_card};
 use crate::public_mcp::TerminalPublicMcpRegistration;
+use crate::quick_command_sync::{QuickCommandSyncEvent, QuickCommandSyncNotifier};
 use crate::settings::{
     GlobalTerminalLocalSettings, TerminalHighlightRule, TerminalSettings, TerminalSettingsEvent,
     current_settings, update_settings,
@@ -90,7 +91,7 @@ use mouse_input::{
     sgr_mouse_wheel_report, should_defer_inline_history_prompt_input_to_text_system,
     should_defer_sgr_left_press, should_extend_selection_on_shift_click,
     should_scroll_to_bottom_on_user_input, should_start_selection_from_pending_sgr_press,
-    take_whole_scroll_lines,
+    take_whole_scroll_lines, terminal_selection_autoscroll_delta_rows,
 };
 use one_core::layout::{SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, TOOLBAR_WIDTH};
 use one_core::sidebar_contribution::{SidebarContribution, SidebarPlacement};
@@ -102,7 +103,7 @@ use paste_safety::{
     UnbracketedPasteHazard, detect_unbracketed_paste_hazard, multiline_non_empty_line_count,
 };
 #[cfg(test)]
-use paste_safety::{has_trailing_line_continuation, has_unterminated_shell_quote};
+use paste_safety::has_unterminated_shell_quote;
 use remote_image_preview::image_from_local_path;
 use rust_i18n::t;
 use sftp::{RusshSftpClient, SftpClient};
@@ -110,10 +111,12 @@ use ssh::SshSessionManager;
 use std::ops::Deref;
 use terminal::GpuiEventProxy;
 use terminal::LocalConfig;
+use terminal::selection_text_from_term;
 use terminal::terminal::{
     ConnectionState, HostKeyVerificationDecision, SshConnectionUpdate, Terminal,
     TerminalConnectionKind, TerminalModelEvent, TerminalScrollProxy, TerminalScrollSnapshot,
-    TerminalSshCredentialRequest, TerminalSshCredentials, resolve_local_working_dir,
+    TerminalSshCredentialRequest, TerminalSshCredentials, TerminalTelnetCredentialRequest,
+    TerminalTelnetCredentials, resolve_local_working_dir,
 };
 use tokio::sync::Mutex;
 use workspace_explorer::{WorkspaceEditor, WorkspaceEditorEvent};
@@ -153,7 +156,9 @@ mod render_layout;
 mod render_surface;
 mod resize_event_handler;
 mod scroll;
+mod selection_autoscroll;
 mod selection_search;
+mod session_log_config;
 mod sidebar_events;
 mod state;
 mod tab_content;
@@ -167,16 +172,18 @@ mod zmodem_picker;
 
 use actions::*;
 use command_bar::{TerminalCommandBar, TerminalCommandBarConfig, TerminalCommandBarEvent};
+pub(crate) use command_bar_model::quick_command_executes_on_click;
 use helpers::*;
 use init_config::TerminalViewInit;
 use keybindings::{
     TERMINAL_CLEAR_SCREEN_SHORTCUT, TERMINAL_CONTEXT, TERMINAL_COPY_SHORTCUT,
     TERMINAL_PASTE_SHORTCUT, TERMINAL_SELECT_ALL_SHORTCUT, TERMINAL_TOGGLE_VI_MODE_SHORTCUT,
-    terminal_paste_defaults, terminal_shortcut_label,
+    is_terminal_action_shortcut, terminal_paste_defaults, terminal_shortcut_label,
 };
 pub use keybindings::{init, refresh_keybindings};
 pub use recording_playback_config::RecordingPlaybackViewConfig;
 use resize_event_handler::ResizeEventHandler;
+pub use session_log_config::SessionLogViewConfig;
 pub(crate) use state::TerminalDuplicateSource;
 use state::*;
 use tab_content::recording_playback_display_name;
@@ -189,6 +196,7 @@ pub struct TerminalView {
     terminal: Entity<Terminal>,
     duplicate_source: Option<TerminalDuplicateSource>,
     recording_playback_name: Option<SharedString>,
+    session_log_name: Option<SharedString>,
     /// 本地终端工作目录
     local_working_dir: Option<PathBuf>,
     /// 光标闪烁管理器
@@ -242,6 +250,9 @@ pub struct TerminalView {
     terminal_frame_snapshot: TerminalFrameSnapshot,
     /// Deduplicated delayed retry used when a non-blocking terminal lock misses.
     terminal_render_retry: Option<Task<()>>,
+    selection_autoscroll_position: Option<Point<Pixels>>,
+    selection_autoscroll_display_offset: Option<usize>,
+    selection_autoscroll_task: Option<Task<()>>,
     focus_handle: FocusHandle,
     /// Present only when the developer performance diagnostics switch was
     /// enabled when this terminal was created.
@@ -255,6 +266,8 @@ pub struct TerminalView {
     shell_prompt_input_active: bool,
     /// 本地 shell 命令是否处于执行阶段，由 OSC 133;C 到下一次 prompt/input 维护。
     local_command_running: bool,
+    /// 上一次已向 TabContainer 广播的连接状态，用于在变化时刷新标签页徽标。
+    last_connection_status: Option<one_core::tab_container::TabConnectionStatus>,
     /// InlineSuggest 防抖任务（30ms 延迟刷新建议）
     suggestion_debounce: Option<Task<()>>,
     /// 当前 pane 是否正在等待用户选择录制文件保存目录。
@@ -279,7 +292,7 @@ pub struct TerminalView {
     cd_completion_cache: CdCompletionCache,
     /// 当前正在加载目录候选的父目录
     cd_completion_loading_parent: Option<String>,
-    ssh_credential_inputs: Option<SshCredentialInputs>,
+    credential_inputs: Option<TerminalCredentialInputs>,
     ssh_mfa_inputs: Vec<SshMfaInput>,
     /// 当前已打开系统选择器的 ZMODEM 请求 ID，用于去重和拒绝过期结果。
     zmodem_picker_request_id: Option<u64>,
@@ -301,6 +314,8 @@ pub struct TerminalView {
     auto_copy_on_select: bool,
     /// 是否启用历史自动补全
     autocomplete_enabled: bool,
+    /// 是否显示弹框候选词
+    suggestion_popup_enabled: bool,
     /// 中键粘贴
     middle_click_paste: bool,
     /// 右键快速粘贴

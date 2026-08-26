@@ -88,11 +88,15 @@ impl IconName {
             | Self::EditBorder
             | Self::Remove
             | Self::Export
-            | Self::Home => FunctionalFilled,
+            | Self::Home
+            | Self::StatusConnected
+            | Self::StatusConnectedLocked
+            | Self::StatusDisconnected => FunctionalFilled,
 
             Self::NotesColor
             | Self::TeamColor
             | Self::File
+            | Self::Json
             | Self::MarkdownColor
             | Self::RichTextColor
             | Self::Folder

@@ -62,15 +62,17 @@ use one_core::popup_window::{PopupWindowOptions, open_popup_window};
 use one_core::storage::GlobalStorageState;
 pub const DEFAULT_SYSTEM_HOTKEY_MACOS: &str = "cmd-alt-m";
 pub const DEFAULT_SYSTEM_HOTKEY_OTHER: &str = "ctrl-alt-m";
+const SYNC_SETTINGS_PAGE_INDEX: usize = 1;
 const TEAM_KEYS_SETTINGS_PAGE_INDEX: usize = 2;
 
 use gpui_component::input::InputEvent;
 pub use one_core::settings::{
-    AppSettings, CustomFont, DatabaseOpenMode, GlobalCurrentUser, GlobalProxySettings,
-    HomeConnectionLayout, HomePageStyle, LOCALE_EN, LOCALE_SYSTEM, LOCALE_ZH_CN, LOCALE_ZH_HK,
-    LargeTextCellEditorOpenMode, LocalTerminalProfileKind, LocalTerminalProfileSettings,
-    PersonalSyncBackendKind, PersonalSyncSettings, ProxyType, StartupDefaultPage, SyncProvider,
-    effective_locale_for_setting, is_installed_font_family, is_supported_grid_monospace_font,
+    AppSettings, ConnectionSortOrder, CustomFont, DatabaseOpenMode, GlobalCurrentUser,
+    GlobalProxySettings, HomeConnectionLayout, HomePageStyle, LOCALE_EN, LOCALE_SYSTEM,
+    LOCALE_ZH_CN, LOCALE_ZH_HK, LargeTextCellEditorOpenMode, LocalTerminalProfileKind,
+    LocalTerminalProfileSettings, PersonalSyncBackendKind, PersonalSyncSettings, ProxyType,
+    StartupDefaultPage, SyncProvider, effective_locale_for_setting, is_installed_font_family,
+    is_supported_grid_monospace_font,
 };
 use one_core::tab_container::{TabContent, TabContentEvent};
 use one_core::utils::auto_save_config::AutoSaveConfig;
@@ -419,6 +421,10 @@ impl SettingsPanel {
         Self::new_with_initial_page(TEAM_KEYS_SETTINGS_PAGE_INDEX, cx)
     }
 
+    pub fn new_sync(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with_initial_page(SYNC_SETTINGS_PAGE_INDEX, cx)
+    }
+
     fn new_with_initial_page(initial_page_index: usize, cx: &mut Context<Self>) -> Self {
         let llm_providers_view = cx.new(|cx| LlmProvidersView::new(cx));
         Self {
@@ -497,9 +503,10 @@ impl SettingsPanel {
                                     },
                                     |val: SharedString, cx: &mut App| {
                                         let locale = val.to_string();
-                                        gpui_component::set_locale(effective_locale_for_setting(
-                                            &locale,
-                                        ));
+                                        let effective_locale =
+                                            effective_locale_for_setting(&locale);
+                                        gpui_component::set_locale(effective_locale);
+                                        notes::set_markdown_editor_locale(effective_locale, cx);
                                         AppSettings::update_and_save(cx, |settings| {
                                             settings.locale = locale;
                                         });
@@ -656,6 +663,48 @@ impl SettingsPanel {
                             )
                             .description(
                                 t!("Settings.General.ConnectionDisplay.home_layout_desc")
+                                    .to_string(),
+                            ),
+                            SettingItem::new(
+                                t!("Settings.General.ConnectionDisplay.connection_sort"),
+                                SettingField::dropdown(
+                                    vec![
+                                        (
+                                            ConnectionSortOrder::Natural.as_str().into(),
+                                            t!("Settings.General.ConnectionDisplay.connection_sort_natural")
+                                                .into(),
+                                        ),
+                                        (
+                                            ConnectionSortOrder::Lru.as_str().into(),
+                                            t!("Settings.General.ConnectionDisplay.connection_sort_lru")
+                                                .into(),
+                                        ),
+                                    ],
+                                    |cx: &App| {
+                                        SharedString::from(
+                                            AppSettings::global(cx).connection_sort_order.as_str(),
+                                        )
+                                    },
+                                    |value: SharedString, cx: &mut App| {
+                                        let order = ConnectionSortOrder::from_value(&value);
+                                        AppSettings::update_and_save(cx, |settings| {
+                                            settings.connection_sort_order = order;
+                                        });
+                                        // 立即刷新主页与连接侧栏，使新的排序方式即时生效
+                                        let home = cx
+                                            .try_global::<GlobalHomePage>()
+                                            .map(|global| global.home_page.clone());
+                                        if let Some(home) = home {
+                                            home.update(cx, |_, cx| cx.notify());
+                                        }
+                                    },
+                                )
+                                .default_value(SharedString::from(
+                                    default_settings.connection_sort_order.as_str(),
+                                )),
+                            )
+                            .description(
+                                t!("Settings.General.ConnectionDisplay.connection_sort_desc")
                                     .to_string(),
                             ),
                         ]),
@@ -2242,10 +2291,10 @@ impl Render for SettingsPanel {
         } else {
             self.initial_page_index
         };
-        let settings_id = if initial_page_index == TEAM_KEYS_SETTINGS_PAGE_INDEX {
-            "main-app-settings-team-keys"
-        } else {
-            "main-app-settings"
+        let settings_id = match initial_page_index {
+            SYNC_SETTINGS_PAGE_INDEX => "main-app-settings-sync",
+            TEAM_KEYS_SETTINGS_PAGE_INDEX => "main-app-settings-team-keys",
+            _ => "main-app-settings",
         };
 
         div().track_focus(&self.focus_handle).size_full().child(
@@ -2700,6 +2749,7 @@ fn show_global_proxy_settings_window(cx: &mut App) {
         PopupWindowOptions::new(t!("Settings.General.Proxy.dialog_title").to_string())
             .size(560.0, 460.0),
         move |window, cx| cx.new(|cx| GlobalProxySettingsView::new(window, cx)),
+        None,
         cx,
     );
 }
@@ -2986,8 +3036,8 @@ const WINDOW_SHORTCUTS: &[ShortcutEntry] = &[
         system_hotkey: false,
     },
     ShortcutEntry {
-        keys_macos: &["ctrl-w"],
-        keys_other: &["ctrl-w"],
+        keys_macos: &["ctrl-d"],
+        keys_other: &["ctrl-d"],
         label_key: "Settings.Shortcuts.close_panel",
         action_id: Some(action_id::WINDOW_CLOSE_ACTIVE_WINDOW),
         system_hotkey: false,
@@ -3121,8 +3171,8 @@ const TERMINAL_SHORTCUTS: &[ShortcutEntry] = &[
         system_hotkey: false,
     },
     ShortcutEntry {
-        keys_macos: &["escape"],
-        keys_other: &["escape"],
+        keys_macos: &[],
+        keys_other: &[],
         label_key: "Settings.Shortcuts.terminal_clear_selection",
         action_id: Some(action_id::TERMINAL_CLEAR_SELECTION),
         system_hotkey: false,

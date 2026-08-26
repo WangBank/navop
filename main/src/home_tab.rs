@@ -43,10 +43,10 @@ use one_core::popup_window::{PopupWindowOptions, open_popup_window};
 use one_core::settings::{AppSettings, HomeConnectionLayout, HomePageStyle, SyncProvider};
 use one_core::storage::traits::Repository;
 use one_core::storage::{
-    ActiveConnections, ConnectionRepository, ConnectionType, DatabaseType, GlobalStorageState,
-    PendingCloudDeletionRepository, RedisMode, RemoteDesktopParams,
-    RemoteDesktopProtocol as StoredRemoteDesktopProtocol, StoredConnection, TeamMembershipState,
-    Workspace, WorkspaceRepository,
+    ActiveConnections, ConnectionRepository, ConnectionType, CredentialResolutionError,
+    DatabaseType, GlobalStorageState, PendingCloudDeletionRepository, RedisMode,
+    RemoteDesktopParams, RemoteDesktopProtocol as StoredRemoteDesktopProtocol, SshAuthMethod,
+    StoredConnection, TeamMembershipState, TelnetLoginStep, Workspace, WorkspaceRepository,
 };
 use one_core::tab_container::{TabContainer, TabContent, TabContentEvent, TabItem, TabOpenMode};
 use port_forwarding::PortForwardingRuntime;
@@ -58,6 +58,7 @@ use redis_view::{RedisFormWindow, RedisFormWindowConfig};
 use rust_i18n::t;
 use terminal_view::{SerialFormWindow, SerialFormWindowConfig};
 use terminal_view::{SshFormWindow, SshFormWindowConfig};
+use terminal_view::{TelnetFormWindow, TelnetFormWindowConfig};
 
 use crate::auth::{AuthService, load_auth_data, show_auth_dialog};
 use crate::connection_visuals::{
@@ -228,8 +229,10 @@ mod lifecycle;
 mod local_terminal;
 mod modern_home;
 mod modern_home_shortcuts;
+mod navigation;
 mod render;
 mod sidebar;
+mod sidebar_navigation;
 mod sync_route;
 mod team_permissions;
 mod toolbar;
@@ -252,8 +255,9 @@ pub(super) use keybindings::{
 pub use keybindings::{init, refresh_keybindings};
 pub(crate) use sync_route::should_show_team_management_entry;
 use sync_route::{
-    HomeSyncRoute, refreshed_pending_conflicts, should_auto_onet_cloud_sync,
-    should_show_team_key_menu_item, sync_route,
+    HomeSyncButtonContext, HomeSyncButtonState, HomeSyncRoute, home_sync_button_state,
+    refreshed_pending_conflicts, should_auto_onet_cloud_sync, should_show_team_key_menu_item,
+    sync_route,
 };
 pub(crate) use team_permissions::TeamPermissionSnapshot;
 

@@ -1,79 +1,34 @@
-use gpui::{
-    AnyElement, Context, IntoElement, ParentElement, Render, Styled, Window, div,
-    prelude::FluentBuilder as _,
-};
-use gpui_component::{
-    ActiveTheme, Disableable, checkbox::Checkbox, h_flex, select::Select, v_flex,
-};
+use gpui::{AnyElement, Context, IntoElement, ParentElement, Render, Styled, Window, div};
+use gpui_component::{ActiveTheme, h_flex, select::Select};
 use one_core::storage::CredentialSummary;
+use rust_i18n::t;
 
 use super::{CredentialField, CredentialReferencePicker};
 
 impl Render for CredentialReferencePicker {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let summary = self.selected_summary();
-        let checkboxes = self.field_checkboxes(cx);
         let messages = self.messages(summary, cx);
 
-        v_flex()
+        h_flex()
             .w_full()
             .gap_2()
             .child(
                 Select::new(&self.select)
                     .w_full()
                     .cleanable(false)
-                    .placeholder("手工输入"),
+                    .placeholder(t!("Credential.manual_input")),
             )
-            .when(!checkboxes.is_empty(), |this| {
-                this.child(h_flex().w_full().flex_wrap().gap_3().children(checkboxes))
-            })
             .children(messages)
     }
 }
 
 impl CredentialReferencePicker {
     pub(super) fn selected_summary(&self) -> Option<&CredentialSummary> {
-        let id = self.reference?.credential_id;
-        self.summaries.iter().find(|summary| summary.id == id)
-    }
-
-    fn field_checkboxes(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let mut fields = Vec::new();
-        if self.capabilities.username {
-            fields.push(self.field_checkbox(CredentialField::Username, "用户名", false, cx));
-        }
-        if self.capabilities.password {
-            fields.push(self.field_checkbox(CredentialField::Password, "密码", false, cx));
-        }
-        if self.capabilities.private_key {
-            fields.push(self.field_checkbox(CredentialField::PrivateKey, "私钥", false, cx));
-        }
-        if self.capabilities.passphrase {
-            let disabled = !self.field_referenced(CredentialField::PrivateKey);
-            fields.push(self.field_checkbox(CredentialField::Passphrase, "私钥密码", disabled, cx));
-        }
-        if self.reference.is_some() {
-            fields
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn field_checkbox(
-        &self,
-        field: CredentialField,
-        label: &'static str,
-        disabled: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        Checkbox::new(format!("{}-{field:?}", self.id))
-            .label(label)
-            .checked(self.field_referenced(field))
-            .disabled(disabled)
-            .on_click(cx.listener(move |this, selected, window, cx| {
-                this.set_field_selection(field, *selected, window, cx);
-            }))
-            .into_any_element()
+        let reference = self.reference.as_ref()?;
+        self.summaries
+            .iter()
+            .find(|summary| super::summary_matches_reference(summary, reference))
     }
 
     fn messages(
@@ -87,16 +42,22 @@ impl CredentialReferencePicker {
             return messages;
         }
         let Some(summary) = summary else {
+            if self.reference.as_ref().is_some_and(|reference| {
+                super::reference_is_unavailable(reference, &self.summaries)
+            }) {
+                messages.push(message(t!("Credential.reference_unavailable"), false, cx));
+                return messages;
+            }
             if self.summaries.is_empty() {
-                messages.push(message("钥匙串中暂无可用凭据，请先创建。", true, cx));
+                messages.push(message(t!("Credential.empty"), true, cx));
             }
             return messages;
         };
         messages.extend(self.missing_field_warnings(summary, cx));
         let sync_status = if summary.sync_enabled {
-            "允许同步（跨设备同步尚未启用）"
+            t!("Credential.sync_enabled")
         } else {
-            "仅本地"
+            t!("Credential.local_only")
         };
         messages.push(message(sync_status, true, cx));
         messages
@@ -109,17 +70,17 @@ impl CredentialReferencePicker {
     ) -> Vec<AnyElement> {
         let mut warnings = Vec::new();
         if self.field_referenced(CredentialField::Username) && summary.username.is_none() {
-            warnings.push(message("当前钥匙串条目已不再包含用户名。", false, cx));
+            warnings.push(message(t!("Credential.missing_username"), false, cx));
         }
         if self.field_referenced(CredentialField::Password) && !summary.has_password {
-            warnings.push(message("当前钥匙串条目已不再包含密码。", false, cx));
+            warnings.push(message(t!("Credential.missing_password"), false, cx));
         }
         let has_key = summary.has_private_key_path || summary.has_private_key_content;
         if self.field_referenced(CredentialField::PrivateKey) && !has_key {
-            warnings.push(message("当前钥匙串条目已不再包含私钥。", false, cx));
+            warnings.push(message(t!("Credential.missing_private_key"), false, cx));
         }
         if self.field_referenced(CredentialField::Passphrase) && !summary.has_passphrase {
-            warnings.push(message("当前钥匙串条目已不再包含私钥密码。", false, cx));
+            warnings.push(message(t!("Credential.missing_passphrase"), false, cx));
         }
         warnings
     }

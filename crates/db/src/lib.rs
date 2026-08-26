@@ -1,5 +1,6 @@
 rust_i18n::i18n!("locales", fallback = "en");
 
+pub mod binary_value;
 pub mod cache;
 pub mod cache_manager;
 pub mod compare;
@@ -14,10 +15,14 @@ mod manifest_helpers;
 pub mod metadata_cache;
 pub mod plugin;
 pub mod plugin_manifest;
+pub mod query_result_normalization;
 mod runtime_contract;
 pub mod rustls_provider;
 pub mod schema_preferences;
 pub mod sql_format;
+pub(crate) mod sql_literal;
+mod sql_literal_types;
+mod sql_literal_values;
 pub mod ssh_tunnel;
 pub mod streaming_parser;
 pub mod types;
@@ -26,6 +31,7 @@ pub mod types;
 pub mod clickhouse;
 #[cfg(feature = "builtin-duckdb")]
 pub mod duckdb;
+mod max_rows;
 pub mod mssql;
 pub mod mysql;
 pub mod oracle;
@@ -45,6 +51,7 @@ pub use manager::*;
 pub use metadata_cache::*;
 pub use plugin::*;
 pub use plugin_manifest::*;
+pub use query_result_normalization::*;
 pub use rustls_provider::*;
 pub use schema_preferences::*;
 pub use sql_format::*;

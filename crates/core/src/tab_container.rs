@@ -5,7 +5,7 @@ use crate::sidebar_contribution::{
 };
 use crate::tab_actions::{
     TAB_TITLE_METADATA_KEY, clear_tab_activity, duplicate_tab_id, mark_tab_activity,
-    normalize_title, resolve_tab_title,
+    next_duplicate_tab_title, normalize_title, resolve_tab_title,
 };
 use crate::tab_navigation::{ActiveTabSlot, tab_number_target};
 use crate::tab_switcher::{TabSwitcherEntry, open_tab_switcher_dialog};
@@ -25,8 +25,9 @@ use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::panel_header::{PanelHeader, PanelHeaderVariant};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{
-    ActiveTheme, Disableable, ElementExt as _, Icon, IconName, IconSize,
-    InteractiveElementExt as _, LayoutSizeTokens, Sizable, Size, h_flex, v_flex,
+    ActiveTheme, Colorize as _, Disableable, ElementExt as _, Icon, IconName, IconSize,
+    InteractiveElementExt as _, LayoutSizeTokens, Sizable, Size, WindowExt as _, h_flex,
+    notification::Notification, v_flex,
 };
 use rust_i18n::t;
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,15 @@ use std::sync::Arc;
 const TAB_MIN_WIDTH: Pixels = px(60.0);
 const TAB_RENAME_MIN_WIDTH: Pixels = px(280.0);
 const TAB_CONTAINER_CONTEXT: &str = "TabContainer";
+
+/// 标签最大宽度硬上限，防止超长标题撑爆标签栏。
+const TAB_HARD_MAX_WIDTH: f32 = 400.0;
+/// 每字符宽度的宽裕估算（含 CJK 余量），用于计算 max_w 上限。
+/// 实际渲染宽度由 GPUI flex 布局按真实字体测量，此值仅做上限保护。
+const TAB_CHAR_WIDTH_BUDGET: f32 = 12.0;
+/// 标签中除标题外的固定 UI 预算：序号 + 图标 + 状态标 + 关闭按钮 +
+/// gap_2 间距 + px_3 内边距。宽裕估算，确保上限不误伤正常标题。
+const TAB_CHROME_BUDGET: f32 = 160.0;
 
 #[derive(Clone, Copy)]
 struct TitlebarPlatform {
@@ -105,6 +115,75 @@ fn render_tab_title(title: SharedString, text_color: gpui::Hsla) -> AnyElement {
         .text_color(text_color)
         .text_ellipsis()
         .child(title)
+        .into_any_element()
+}
+
+/// SecureCRT-style connection status badges shown between the tab icon and the
+/// title: green check when connected, red no-entry when disconnected, plus a
+/// yellow lock when the connected session is also locked. Disconnected always
+/// wins over the lock badge.
+fn connection_status_badges(
+    status: Option<TabConnectionStatus>,
+    is_locked: bool,
+) -> Vec<(IconName, SharedString)> {
+    match status {
+        Some(TabConnectionStatus::Disconnected) => {
+            vec![(
+                IconName::StatusDisconnected,
+                t!("TabStatus.disconnected").into(),
+            )]
+        }
+        Some(TabConnectionStatus::Connected) if is_locked => {
+            vec![(
+                IconName::StatusConnectedLocked,
+                t!("TabStatus.connected_locked").into(),
+            )]
+        }
+        Some(TabConnectionStatus::Connected) => {
+            vec![(IconName::StatusConnected, t!("TabStatus.connected").into())]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn render_connection_status_badges(
+    status: Option<TabConnectionStatus>,
+    is_locked: bool,
+    badge_key: &str,
+) -> AnyElement {
+    let badges: Vec<AnyElement> = connection_status_badges(status, is_locked)
+        .into_iter()
+        .enumerate()
+        .map(|(index, (icon, tooltip_text))| {
+            status_badge(
+                format!("{badge_key}-{index}"),
+                icon,
+                tooltip_text.to_string(),
+            )
+        })
+        .collect();
+    if badges.is_empty() {
+        return div().flex_shrink_0().into_any_element();
+    }
+    div()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap_0p5()
+        .children(badges)
+        .into_any_element()
+}
+
+fn status_badge(id: String, icon: IconName, tooltip_text: String) -> AnyElement {
+    div()
+        .id(id)
+        .flex_shrink_0()
+        .size(px(16.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .tooltip(move |window, cx| Tooltip::new(tooltip_text.clone()).build(window, cx))
+        .child(Icon::new(icon).color().with_size(IconSize::Default))
         .into_any_element()
 }
 
@@ -225,6 +304,19 @@ pub enum TabOpenMode {
     #[default]
     Activate,
     Background,
+}
+
+/// Connection status of a tab's underlying session, surfaced as a badge on the
+/// tab bar (SecureCRT-style: green check when connected, red no-entry when
+/// disconnected).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabConnectionStatus {
+    /// The session is connected.
+    Connected,
+    /// The session is still being established.
+    Connecting,
+    /// The session has been terminated / lost its connection.
+    Disconnected,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -354,6 +446,10 @@ pub trait TabContent: EventEmitter<TabContentEvent> + Render + Focusable {
         true
     }
 
+    /// Called when the tab bar applies a final displayed title (rename or
+    /// duplicate suffix), so the content can keep derived labels in sync.
+    fn apply_title(&mut self, title: &str, window: &mut Window, cx: &mut Context<Self>) {}
+
     /// Whether this tab can be duplicated from the tab bar menu.
     fn can_duplicate(&self, cx: &App) -> bool {
         false
@@ -373,6 +469,9 @@ pub trait TabContent: EventEmitter<TabContentEvent> + Render + Focusable {
 
     /// Called when tab becomes inactive
     fn on_deactivate(&mut self, window: &mut Window, cx: &mut Context<Self>) {}
+
+    /// Temporarily obscure a native presentation without changing tab lifecycle.
+    fn set_presentation_obscured(&mut self, obscured: bool, cx: &mut Context<Self>) {}
 
     /// Try to close this tab. Returns a Task that resolves to true if close succeeded.
     fn try_close(
@@ -398,6 +497,45 @@ pub trait TabContent: EventEmitter<TabContentEvent> + Render + Focusable {
     fn sidebar_contributions(&self, cx: &App) -> Vec<SidebarContribution> {
         Vec::new()
     }
+
+    /// Whether this tab's session can be locked from the tab bar menu.
+    fn lockable(&self, cx: &App) -> bool {
+        false
+    }
+
+    /// Whether this tab's session is currently locked.
+    fn is_locked(&self, cx: &App) -> bool {
+        false
+    }
+
+    /// Whether this tab's underlying connection/session is disconnected.
+    fn is_disconnected(&self, cx: &App) -> bool {
+        false
+    }
+
+    /// Connection status shown as a badge on the tab bar. `None` (the default)
+    /// means this content has no connection status.
+    fn connection_status(&self, cx: &App) -> Option<TabConnectionStatus> {
+        None
+    }
+
+    /// Lock this tab's session. `password_hash` is the pre-computed hash of the
+    /// lock password. Returns whether the session was actually locked.
+    fn lock_session(
+        &mut self,
+        password_hash: &str,
+        hide_output: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        false
+    }
+
+    /// Unlock this tab's session when `password_hash` matches. Returns whether
+    /// the session was actually unlocked.
+    fn unlock_session(&mut self, password_hash: &str, cx: &mut Context<Self>) -> bool {
+        false
+    }
 }
 
 // ============================================================================
@@ -415,10 +553,12 @@ pub trait TabContentView: 'static + Send + Sync {
     fn closeable(&self, cx: &App) -> bool;
     fn can_rename(&self, cx: &App) -> bool;
     fn rename(&self, title: &str, window: &mut Window, cx: &mut App) -> bool;
+    fn apply_title(&self, title: &str, window: &mut Window, cx: &mut App);
     fn can_duplicate(&self, cx: &App) -> bool;
     fn duplicate(&self, window: &mut Window, cx: &mut App) -> Option<Arc<dyn TabContentView>>;
     fn on_activate(&self, window: &mut Window, cx: &mut App);
     fn on_deactivate(&self, window: &mut Window, cx: &mut App);
+    fn set_presentation_obscured(&self, obscured: bool, cx: &mut App);
     fn try_close(&self, tab_id: &str, window: &mut Window, cx: &mut App) -> Task<bool>;
     fn width_size(&self, cx: &App) -> Option<Size>;
     fn focus_handle(&self, cx: &App) -> FocusHandle;
@@ -427,6 +567,36 @@ pub trait TabContentView: 'static + Send + Sync {
     fn sidebar_contributions(&self, cx: &App) -> Vec<SidebarContribution>;
     fn subscribe_events(&self, window: &mut Window, cx: &mut Context<TabContainer>)
     -> Subscription;
+
+    fn lockable(&self, cx: &App) -> bool {
+        false
+    }
+
+    fn is_locked(&self, cx: &App) -> bool {
+        false
+    }
+
+    fn is_disconnected(&self, cx: &App) -> bool {
+        false
+    }
+
+    fn connection_status(&self, cx: &App) -> Option<TabConnectionStatus> {
+        None
+    }
+
+    fn lock_session(
+        &self,
+        password_hash: &str,
+        hide_output: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        false
+    }
+
+    fn unlock_session(&self, password_hash: &str, cx: &mut App) -> bool {
+        false
+    }
 }
 
 /// Blanket implementation: Entity<T: TabContent> automatically implements TabContentView
@@ -459,6 +629,10 @@ impl<T: TabContent> TabContentView for Entity<T> {
         self.update(cx, |this, cx| this.rename(title, window, cx))
     }
 
+    fn apply_title(&self, title: &str, window: &mut Window, cx: &mut App) {
+        self.update(cx, |this, cx| this.apply_title(title, window, cx));
+    }
+
     fn can_duplicate(&self, cx: &App) -> bool {
         self.read(cx).can_duplicate(cx)
     }
@@ -473,6 +647,10 @@ impl<T: TabContent> TabContentView for Entity<T> {
 
     fn on_deactivate(&self, window: &mut Window, cx: &mut App) {
         self.update(cx, |this, cx| this.on_deactivate(window, cx))
+    }
+
+    fn set_presentation_obscured(&self, obscured: bool, cx: &mut App) {
+        self.update(cx, |this, cx| this.set_presentation_obscured(obscured, cx))
     }
 
     fn try_close(&self, tab_id: &str, window: &mut Window, cx: &mut App) -> Task<bool> {
@@ -498,6 +676,40 @@ impl<T: TabContent> TabContentView for Entity<T> {
 
     fn sidebar_contributions(&self, cx: &App) -> Vec<SidebarContribution> {
         self.read(cx).sidebar_contributions(cx)
+    }
+
+    fn lockable(&self, cx: &App) -> bool {
+        self.read(cx).lockable(cx)
+    }
+
+    fn is_locked(&self, cx: &App) -> bool {
+        self.read(cx).is_locked(cx)
+    }
+
+    fn is_disconnected(&self, cx: &App) -> bool {
+        self.read(cx).is_disconnected(cx)
+    }
+
+    fn connection_status(&self, cx: &App) -> Option<TabConnectionStatus> {
+        self.read(cx).connection_status(cx)
+    }
+
+    fn lock_session(
+        &self,
+        password_hash: &str,
+        hide_output: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let password_hash = password_hash.to_string();
+        self.update(cx, |this, cx| {
+            this.lock_session(&password_hash, hide_output, window, cx)
+        })
+    }
+
+    fn unlock_session(&self, password_hash: &str, cx: &mut App) -> bool {
+        let password_hash = password_hash.to_string();
+        self.update(cx, |this, cx| this.unlock_session(&password_hash, cx))
     }
 
     fn subscribe_events(
@@ -851,6 +1063,10 @@ pub struct TabContainer {
     rename_input_subscription: Option<Subscription>,
     show_tab_bar_when_empty: bool,
     show_tab_content: bool,
+    presentation_obscured: bool,
+    presentation_obscured_by_main_content: bool,
+    presentation_obscured_by_dialog: bool,
+    presentation_obscured_by_legacy_caller: bool,
     show_window_controls: bool,
     #[cfg(test)]
     force_windows_titlebar_for_test: bool,
@@ -900,6 +1116,10 @@ impl TabContainer {
             rename_input_subscription: None,
             show_tab_bar_when_empty: false,
             show_tab_content: true,
+            presentation_obscured: false,
+            presentation_obscured_by_main_content: false,
+            presentation_obscured_by_dialog: false,
+            presentation_obscured_by_legacy_caller: false,
             show_window_controls: false,
             #[cfg(test)]
             force_windows_titlebar_for_test: false,
@@ -1060,14 +1280,22 @@ impl TabContainer {
         self.pinned_tabs.clear();
         self.pinned_tabs.push(tab);
         self.active_pinned_index = self.tabs.is_empty().then_some(0);
+        if self.active_pinned_index.is_some() {
+            self.sync_active_presentation_obscured(cx);
+        }
         cx.notify();
     }
 
     /// Add a pinned tab that stays fixed before the scrollable tab list.
     pub fn add_pinned_tab(&mut self, tab: TabItem, cx: &mut Context<Self>) {
         self.pinned_tabs.push(tab);
+        let mut activated = false;
         if self.tabs.is_empty() && self.active_pinned_index.is_none() {
             self.active_pinned_index = Some(0);
+            activated = true;
+        }
+        if activated {
+            self.sync_active_presentation_obscured(cx);
         }
         cx.notify();
     }
@@ -1076,12 +1304,17 @@ impl TabContainer {
     pub fn insert_pinned_tab_at(&mut self, index: usize, tab: TabItem, cx: &mut Context<Self>) {
         let index = index.min(self.pinned_tabs.len());
         self.pinned_tabs.insert(index, tab);
+        let mut activated = false;
         if let Some(active_index) = self.active_pinned_index {
             if active_index >= index {
                 self.active_pinned_index = Some(active_index + 1);
             }
         } else if self.tabs.is_empty() {
             self.active_pinned_index = Some(index);
+            activated = true;
+        }
+        if activated {
+            self.sync_active_presentation_obscured(cx);
         }
         cx.notify();
     }
@@ -1159,6 +1392,9 @@ impl TabContainer {
                     .on_activate(window, cx);
                 self.tabs[self.active_index]
                     .content()
+                    .set_presentation_obscured(self.presentation_obscured, cx);
+                self.tabs[self.active_index]
+                    .content()
                     .focus_handle(cx)
                     .focus(window, cx);
                 self.active_pinned_index = None;
@@ -1168,6 +1404,9 @@ impl TabContainer {
                 self.pinned_tabs[next_index]
                     .content()
                     .on_activate(window, cx);
+                self.pinned_tabs[next_index]
+                    .content()
+                    .set_presentation_obscured(self.presentation_obscured, cx);
                 self.pinned_tabs[next_index]
                     .content()
                     .focus_handle(cx)
@@ -1212,6 +1451,9 @@ impl TabContainer {
         self.active_pinned_index = Some(index);
         if let Some(pinned) = self.pinned_tabs.get(index) {
             pinned.content().on_activate(window, cx);
+            pinned
+                .content()
+                .set_presentation_obscured(self.presentation_obscured, cx);
             pinned.content().focus_handle(cx).focus(window, cx);
             cx.emit(TabContainerEvent::TabActivated {
                 index,
@@ -1363,6 +1605,67 @@ impl TabContainer {
             .and_then(|index| self.pinned_tabs.get(index))
     }
 
+    fn active_content(&self) -> Option<Arc<dyn TabContentView>> {
+        self.active_pinned_tab()
+            .map(|tab| tab.content().clone())
+            .or_else(|| self.active_tab().map(|tab| tab.content().clone()))
+    }
+
+    fn sync_active_presentation_obscured(&self, cx: &mut Context<Self>) {
+        if let Some(content) = self.active_content() {
+            content.set_presentation_obscured(self.presentation_obscured, cx);
+        }
+    }
+
+    fn recompute_active_presentation_obscured(&mut self, cx: &mut Context<Self>) {
+        let obscured = self.presentation_obscured_by_main_content
+            || self.presentation_obscured_by_dialog
+            || self.presentation_obscured_by_legacy_caller;
+        if self.presentation_obscured == obscured {
+            return;
+        }
+
+        self.presentation_obscured = obscured;
+        self.sync_active_presentation_obscured(cx);
+    }
+
+    pub fn set_active_presentation_obscured_by_main_content(
+        &mut self,
+        obscured: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.presentation_obscured_by_main_content == obscured {
+            return;
+        }
+
+        self.presentation_obscured_by_main_content = obscured;
+        self.recompute_active_presentation_obscured(cx);
+    }
+
+    pub fn set_active_presentation_obscured_by_dialog(
+        &mut self,
+        obscured: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.presentation_obscured_by_dialog == obscured {
+            return;
+        }
+
+        self.presentation_obscured_by_dialog = obscured;
+        self.recompute_active_presentation_obscured(cx);
+    }
+
+    /// Compatibility entry point for callers that do not own one of the
+    /// explicitly tracked obscuring sources.
+    pub fn set_active_presentation_obscured(&mut self, obscured: bool, cx: &mut Context<Self>) {
+        if self.presentation_obscured_by_legacy_caller == obscured {
+            return;
+        }
+
+        self.presentation_obscured_by_legacy_caller = obscured;
+        self.recompute_active_presentation_obscured(cx);
+    }
+
     fn deactivate_active_content(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(pinned) = self.active_pinned_tab() {
             pinned.content().on_deactivate(window, cx);
@@ -1379,6 +1682,7 @@ impl TabContainer {
         self.active_pinned_index = None;
         self.tab_bar_scroll_handle
             .scroll_to_item(self.tabs.len() - 1);
+        self.sync_active_presentation_obscured(cx);
         cx.emit(TabContainerEvent::TabActivated {
             index: self.active_index,
             id,
@@ -1448,6 +1752,9 @@ impl TabContainer {
         // 激活新 tab 的 content
         if let Some(new_tab) = self.tabs.get(self.active_index) {
             new_tab.content().on_activate(window, cx);
+            new_tab
+                .content()
+                .set_presentation_obscured(self.presentation_obscured, cx);
         }
 
         // 让 content 获取焦点
@@ -1469,6 +1776,14 @@ impl TabContainer {
         cx: &mut Context<Self>,
     ) -> Task<bool> {
         if index >= self.tabs.len() || !self.tabs[index].content().closeable(cx) {
+            return Task::ready(false);
+        }
+
+        if self.tabs[index].content().is_locked(cx) {
+            window.push_notification(
+                Notification::warning(t!("TabStatus.locked_close_blocked")),
+                cx,
+            );
             return Task::ready(false);
         }
 
@@ -1507,17 +1822,24 @@ impl TabContainer {
     fn do_remove_tab_by_id(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(index) = self.tabs.iter().position(|t| t.id() == tab_id) {
             let was_active = self.regular_tab_is_active(index);
+            if was_active {
+                self.tabs[index].content().on_deactivate(window, cx);
+            }
             let removed_tab_id = self.tabs[index].id();
             self.tabs.remove(index);
             self.closing_tabs.remove(&removed_tab_id);
             clear_tab_activity(&mut self.activity_tabs, removed_tab_id.as_ref());
 
+            let mut activated_regular = None;
             if self.tabs.is_empty() {
                 self.active_index = 0;
                 if was_active {
                     self.active_pinned_index = (!self.pinned_tabs.is_empty()).then_some(0);
                     if let Some(pinned) = self.active_pinned_tab() {
                         pinned.content().on_activate(window, cx);
+                        pinned
+                            .content()
+                            .set_presentation_obscured(self.presentation_obscured, cx);
                         pinned.content().focus_handle(cx).focus(window, cx);
                     }
                 }
@@ -1529,9 +1851,24 @@ impl TabContainer {
                 }
             }
 
+            if was_active && !self.tabs.is_empty() {
+                let new_tab = &self.tabs[self.active_index];
+                new_tab.content().on_activate(window, cx);
+                new_tab
+                    .content()
+                    .set_presentation_obscured(self.presentation_obscured, cx);
+                new_tab.content().focus_handle(cx).focus(window, cx);
+                let new_tab_id = new_tab.id().to_string();
+                clear_tab_activity(&mut self.activity_tabs, &new_tab_id);
+                activated_regular = Some((self.active_index, new_tab_id));
+            }
+
             cx.emit(TabContainerEvent::TabClosed {
                 id: tab_id.to_string(),
             });
+            if let Some((index, id)) = activated_regular {
+                cx.emit(TabContainerEvent::TabActivated { index, id });
+            }
             cx.emit(TabContainerEvent::LayoutChanged);
             cx.notify();
         }
@@ -1595,6 +1932,174 @@ impl TabContainer {
             }
             true
         })
+    }
+
+    /// Close all tabs whose underlying connection/session is disconnected.
+    pub fn close_disconnected_tabs(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<bool> {
+        let tab_ids: Vec<String> = self
+            .tabs
+            .iter()
+            .filter(|t| t.content().is_disconnected(cx) && t.content().closeable(cx))
+            .map(|t| t.id().to_string())
+            .collect();
+
+        if tab_ids.is_empty() {
+            return Task::ready(true);
+        }
+
+        let entity = cx.entity();
+        let window_handle = window.window_handle();
+
+        cx.spawn(async move |_handle, cx| {
+            for tab_id in tab_ids {
+                let should_close = cx.update_window(window_handle, |_, window, cx| {
+                    entity.update(cx, |this, cx| {
+                        if let Some(index) = this.tabs.iter().position(|t| t.id() == tab_id) {
+                            this.set_active_index(index, window, cx);
+                            let content = this.tabs[index].content().clone();
+                            Some(content.try_close(&tab_id, window, cx))
+                        } else {
+                            None
+                        }
+                    })
+                });
+
+                match should_close {
+                    Ok(Some(task)) => {
+                        let can_close = task.await;
+                        if !can_close {
+                            return false;
+                        }
+                        let _ = cx.update_window(window_handle, |_, window, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.do_remove_tab_by_id(&tab_id, window, cx);
+                            })
+                        });
+                    }
+                    Ok(None) => continue,
+                    Err(_) => return false,
+                }
+            }
+            true
+        })
+    }
+
+    /// Prompt for a lock password and lock the session (or all sessions).
+    pub fn start_lock_session(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let lockable = self
+            .tabs
+            .get(index)
+            .is_some_and(|tab| tab.content().lockable(cx) && !tab.content().is_locked(cx));
+        if !lockable {
+            return;
+        }
+
+        let entity = cx.entity();
+        let window_handle = window.window_handle();
+        let request_task = crate::session_lock::prompt_session_lock(window, cx);
+
+        cx.spawn(async move |_this, cx| {
+            let Some(request) = request_task.await else {
+                return;
+            };
+            let _ = cx.update_window(window_handle, |_, window, cx| {
+                entity.update(cx, |this, cx| {
+                    this.apply_lock_request(&request, index, window, cx);
+                })
+            });
+        })
+        .detach();
+    }
+
+    /// Prompt for a password and unlock the session (or all matching sessions).
+    pub fn start_unlock_session(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let locked = self
+            .tabs
+            .get(index)
+            .is_some_and(|tab| tab.content().lockable(cx) && tab.content().is_locked(cx));
+        if !locked {
+            return;
+        }
+
+        let entity = cx.entity();
+        let window_handle = window.window_handle();
+        let request_task = crate::session_lock::prompt_session_unlock(window, cx);
+
+        cx.spawn(async move |_this, cx| {
+            let Some(request) = request_task.await else {
+                return;
+            };
+            let _ = cx.update_window(window_handle, |_, _window, cx| {
+                entity.update(cx, |this, cx| {
+                    this.apply_unlock_request(&request, index, cx);
+                })
+            });
+        })
+        .detach();
+    }
+
+    fn apply_lock_request(
+        &mut self,
+        request: &crate::session_lock::LockSessionRequest,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let targets: Vec<usize> = if request.lock_all {
+            self.tabs
+                .iter()
+                .enumerate()
+                .filter(|(_, tab)| tab.content().lockable(cx) && !tab.content().is_locked(cx))
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            vec![index]
+        };
+        for i in targets {
+            if let Some(tab) = self.tabs.get(i) {
+                tab.content()
+                    .lock_session(&request.password_hash, request.hide_output, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn apply_unlock_request(
+        &mut self,
+        request: &crate::session_lock::UnlockSessionRequest,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let targets: Vec<usize> = if request.unlock_all {
+            self.tabs
+                .iter()
+                .enumerate()
+                .filter(|(_, tab)| tab.content().lockable(cx) && tab.content().is_locked(cx))
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            vec![index]
+        };
+        for i in targets {
+            if let Some(tab) = self.tabs.get(i) {
+                tab.content().unlock_session(&request.password_hash, cx);
+            }
+        }
+        cx.notify();
     }
 
     /// Close all tabs
@@ -1856,6 +2361,9 @@ impl TabContainer {
             let new_tab = &self.tabs[index];
             if switching_content {
                 new_tab.content().on_activate(window, cx);
+                new_tab
+                    .content()
+                    .set_presentation_obscured(self.presentation_obscured, cx);
             }
             new_tab.content().focus_handle(cx).focus(window, cx);
             let tab_id = new_tab.id().to_string();
@@ -1973,6 +2481,7 @@ impl TabContainer {
         if self.tabs[index].set_title_override(&title) {
             cx.emit(TabContainerEvent::LayoutChanged);
         }
+        self.tabs[index].content().apply_title(&title, window, cx);
         cx.notify();
     }
 
@@ -1994,14 +2503,25 @@ impl TabContainer {
         let duplicate_id = duplicate_tab_id(source_id.as_ref(), |candidate| {
             self.tabs.iter().any(|tab| tab.id() == candidate)
         });
+        // 复制标签时自动对标签名追加序号，如 "172.29.13.200" -> "172.29.13.200(1)"
+        let source_title = self.tabs[index].title(cx);
+        let duplicate_title = next_duplicate_tab_title(source_title.as_ref(), |candidate| {
+            self.tabs
+                .iter()
+                .any(|tab| tab.title(cx).as_ref() == candidate)
+        });
         let from = self.tabs[index].from();
         let metadata = self.tabs[index].metadata().clone();
-        let duplicate = TabItem {
+        let mut duplicate = TabItem {
             id: SharedString::from(duplicate_id.clone()),
             from,
             metadata,
             content: duplicate_content,
         };
+        duplicate.set_title_override(&duplicate_title);
+        duplicate
+            .content()
+            .apply_title(duplicate_title.as_ref(), window, cx);
         self.subscribe_tab_content(&duplicate, window, cx);
 
         let insert_index = (index + 1).min(self.tabs.len());
@@ -2159,6 +2679,9 @@ impl TabContainer {
                 self.active_pinned_index = (!self.pinned_tabs.is_empty()).then_some(0);
                 if let Some(pinned) = self.active_pinned_tab() {
                     pinned.content().on_activate(window, cx);
+                    pinned
+                        .content()
+                        .set_presentation_obscured(self.presentation_obscured, cx);
                     pinned.content().focus_handle(cx).focus(window, cx);
                 }
             }
@@ -2172,6 +2695,9 @@ impl TabContainer {
                 self.tabs[self.active_index]
                     .content()
                     .on_activate(window, cx);
+                self.tabs[self.active_index]
+                    .content()
+                    .set_presentation_obscured(self.presentation_obscured, cx);
             }
         }
 
@@ -2189,9 +2715,18 @@ impl TabContainer {
         self.add_and_activate_tab_with_focus(tab, window, cx);
     }
 
+    /// 计算标签的 max_w 上限。实际渲染宽度由 GPUI flex 布局按真实字体测量，
+    /// 此处只提供宽裕的上限保护，避免超长标题撑爆标签栏。优先使用内容自带
+    /// 的 `width_size`；否则按标题字符数估算一个绝不误伤正常标题的上限。
     fn get_tab_max_width(&self, tab: &TabItem, cx: &App) -> gpui::Pixels {
-        let size = tab.content().width_size(cx).unwrap_or(self.size);
-        self.size_to_pixels(size)
+        if let Some(size) = tab.content().width_size(cx) {
+            return self.size_to_pixels(size);
+        }
+
+        let title = tab.title(cx);
+        let char_count = title.chars().count() as f32;
+        let estimated = char_count * TAB_CHAR_WIDTH_BUDGET + TAB_CHROME_BUDGET;
+        px(estimated.min(TAB_HARD_MAX_WIDTH))
     }
 
     fn size_to_pixels(&self, size: Size) -> gpui::Pixels {
@@ -3046,44 +3581,72 @@ impl TabContainer {
             return content;
         }
 
-        let center_content = div()
-            .relative()
-            .size_full()
-            .min_w_0()
-            .min_h_0()
-            .overflow_hidden()
-            .child(content)
-            .child(self.render_hidden_sidebar_launcher(hidden, cx));
-        let center = if bottom.is_empty() {
-            center_content.into_any_element()
+        // 中心内容（终端）总是在左右导航浮层之间铺开：导航面板以绝对定位浮动，
+        // 不进入 flex 流，因此标签栏不会被挤动；中心内容向左/右让出面板宽度，
+        // 既保持浮动（不影响标签栏），又不被面板遮挡。
+        let left_width = if left.is_empty() {
+            Pixels::ZERO
         } else {
-            v_flex()
-                .id("tab-sidebar-center")
-                .size_full()
+            self.sidebar_side_width(&left, layout)
+        };
+        let right_width = if right.is_empty() {
+            Pixels::ZERO
+        } else {
+            self.sidebar_side_width(&right, layout)
+        };
+        let center = if bottom.is_empty() {
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(left_width)
+                .right(right_width)
+                .min_w_0()
+                .min_h_0()
+                .overflow_hidden()
+                .child(content)
+                .child(self.render_hidden_sidebar_launcher(hidden, cx))
+                .into_any_element()
+        } else {
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(left_width)
+                .right(right_width)
                 .min_w_0()
                 .min_h_0()
                 .overflow_hidden()
                 .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
+                    v_flex()
+                        .id("tab-sidebar-center")
+                        .size_full()
                         .min_w_0()
+                        .min_h_0()
                         .overflow_hidden()
-                        .child(center_content),
-                )
-                .child(
-                    div()
-                        .relative()
-                        .w_full()
-                        .h(self.sidebar_bottom_height(&bottom, layout))
-                        .flex_shrink_0()
-                        .overflow_hidden()
-                        .child(self.render_sidebar_dock(SidebarPlacement::Bottom, bottom, cx)),
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .child(content)
+                                .child(self.render_hidden_sidebar_launcher(hidden, cx)),
+                        )
+                        .child(
+                            div()
+                                .relative()
+                                .w_full()
+                                .h(self.sidebar_bottom_height(&bottom, layout))
+                                .flex_shrink_0()
+                                .overflow_hidden()
+                                .child(self.render_sidebar_dock(SidebarPlacement::Bottom, bottom, cx)),
+                        ),
                 )
                 .into_any_element()
         };
 
-        let mut root = h_flex()
+        let mut root = div()
             .id("tab-sidebar-root")
             .relative()
             .size_full()
@@ -3098,34 +3661,32 @@ impl TabContainer {
                     });
                 }
             });
+        root = root.child(center);
         if !left.is_empty() {
+            let left_width = self.sidebar_side_width(&left, layout);
             root = root.child(
                 div()
-                    .relative()
-                    .h_full()
-                    .w(self.sidebar_side_width(&left, layout))
-                    .flex_shrink_0()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left_0()
+                    .w(left_width)
                     .overflow_hidden()
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(self.render_sidebar_dock(SidebarPlacement::Left, left, cx)),
             );
         }
-        root = root.child(
-            div()
-                .flex_1()
-                .h_full()
-                .min_w_0()
-                .min_h_0()
-                .overflow_hidden()
-                .child(center),
-        );
         if !right.is_empty() {
+            let right_width = self.sidebar_side_width(&right, layout);
             root = root.child(
                 div()
-                    .relative()
-                    .h_full()
-                    .w(self.sidebar_side_width(&right, layout))
-                    .flex_shrink_0()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right_0()
+                    .w(right_width)
                     .overflow_hidden()
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(self.render_sidebar_dock(SidebarPlacement::Right, right, cx)),
             );
         }
@@ -3235,9 +3796,12 @@ impl TabContainer {
         let tab_bar_height = layout.tab_bar;
         let tab_item_height = layout.tab_item;
 
-        // When the application navigation sidebar is fully hidden on macOS,
-        // reserve the title-bar area occupied by the traffic-light controls.
-        if titlebar_platform.is_macos && navigation_sidebar_expanded == Some(false) {
+        // On macOS reserve the title-bar area occupied by the traffic-light
+        // controls. The navigation sidebar now floats (absolute) instead of
+        // pushing the tab bar, so the reservation must stay constant in both
+        // the collapsed and expanded states; otherwise the toggle button
+        // jumps left when toggled.
+        if titlebar_platform.is_macos && navigation_sidebar_expanded.is_some() {
             left_padding = layout.macos_compact_title_bar_content_padding;
         }
 
@@ -3350,6 +3914,8 @@ impl TabContainer {
                         let pinned_title = pinned.title(cx);
                         let tooltip_title = pinned_title.clone();
                         let pinned_icon = pinned.content().icon(cx);
+                        let pinned_connection_status = pinned.content().connection_status(cx);
+                        let pinned_is_locked = pinned.content().is_locked(cx);
                         let is_pinned_active = self.active_pinned_index == Some(pinned_index);
                         let view_for_pinned = view.clone();
                         let top_padding = self.top_padding;
@@ -3391,6 +3957,11 @@ impl TabContainer {
                             .when_some(pinned_icon, |el, icon| {
                                 el.child(div().flex_shrink_0().flex().items_center().child(icon))
                             })
+                            .child(render_connection_status_badges(
+                                pinned_connection_status,
+                                pinned_is_locked,
+                                &format!("pinned-status-{pinned_index}"),
+                            ))
                             .child(render_tab_title(pinned_title, text_color))
                     }),
             )
@@ -3409,7 +3980,7 @@ impl TabContainer {
                 h_flex()
                     .id("tabs")
                     .debug_selector(|| "tabs".to_owned())
-                    .flex_shrink()
+                    .flex_shrink_1()
                     .min_w_0()
                     .h_full()
                     .items_center()
@@ -3450,6 +4021,8 @@ impl TabContainer {
                     .children(self.tabs.iter().enumerate().map(|(idx, tab)| {
                         let title = tab.title(cx);
                         let icon = tab.content().icon(cx);
+                        let connection_status = tab.content().connection_status(cx);
+                        let is_locked = tab.content().is_locked(cx);
                         let closeable = tab.content().closeable(cx);
                         let is_active = self.active_pinned_index.is_none() && idx == active_index;
                         let view_clone = view.clone();
@@ -3479,7 +4052,6 @@ impl TabContainer {
                             .items_center()
                             .gap_2()
                             .h(tab_item_height)
-                            .text_ellipsis()
                             .min_w(tab_min_width)
                             .max_w(tab_max_width)
                             .px_3()
@@ -3582,6 +4154,11 @@ impl TabContainer {
                             .when_some(icon, |el, icon| {
                                 el.child(div().flex_shrink_0().flex().items_center().child(icon))
                             })
+                            .child(render_connection_status_badges(
+                                connection_status,
+                                is_locked,
+                                &format!("tab-status-{idx}"),
+                            ))
                             .child(match rename_input_for_tab {
                                 Some(input) => div()
                                     .flex_1()
@@ -3590,7 +4167,7 @@ impl TabContainer {
                                     .into_any_element(),
                                 None => render_tab_title(title_clone, text_color),
                             })
-                            .when(closeable, |el| {
+                            .when(closeable && !is_locked, |el| {
                                 let view_clone = view_clone.clone();
                                 el.child(
                                     div()
@@ -3645,6 +4222,23 @@ impl TabContainer {
                                     view_for_menu.read(cx).tabs.get(idx).is_some_and(|tab| {
                                         tab.content().content_key(cx) == "Terminal"
                                     });
+                                let lockable = view_for_menu
+                                    .read(cx)
+                                    .tabs
+                                    .get(idx)
+                                    .map(|tab| tab.content().lockable(cx))
+                                    .unwrap_or(false);
+                                let locked = view_for_menu
+                                    .read(cx)
+                                    .tabs
+                                    .get(idx)
+                                    .map(|tab| tab.content().is_locked(cx))
+                                    .unwrap_or(false);
+                                let has_disconnected = view_for_menu
+                                    .read(cx)
+                                    .tabs
+                                    .iter()
+                                    .any(|tab| tab.content().is_disconnected(cx));
 
                                 menu.item(
                                     PopupMenuItem::new(t!("TabContextMenu.rename_tab").to_string())
@@ -3670,6 +4264,30 @@ impl TabContainer {
                                         ),
                                     ),
                                 )
+                                .map(|menu| {
+                                    if !lockable {
+                                        return menu;
+                                    }
+                                    let label = if locked {
+                                        t!("TabContextMenu.unlock_session")
+                                    } else {
+                                        t!("TabContextMenu.lock_session")
+                                    };
+                                    menu.separator().item(
+                                        PopupMenuItem::new(label.to_string()).on_click(
+                                            window.listener_for(
+                                                &view_for_menu,
+                                                move |this, _, window, cx| {
+                                                    if locked {
+                                                        this.start_unlock_session(idx, window, cx);
+                                                    } else {
+                                                        this.start_lock_session(idx, window, cx);
+                                                    }
+                                                },
+                                            ),
+                                        ),
+                                    )
+                                })
                                 .item(
                                     PopupMenuItem::new(t!("TabContextMenu.close_tab").to_string())
                                         .disabled(!closeable)
@@ -3731,6 +4349,20 @@ impl TabContainer {
                                             &view_for_menu,
                                             move |this, _, window, cx| {
                                                 this.close_tabs_to_right(idx, window, cx).detach();
+                                            },
+                                        ),
+                                    ),
+                                )
+                                .item(
+                                    PopupMenuItem::new(
+                                        t!("TabContextMenu.close_disconnected_tabs").to_string(),
+                                    )
+                                    .disabled(!has_disconnected)
+                                    .on_click(
+                                        window.listener_for(
+                                            &view_for_menu,
+                                            move |this, _, window, cx| {
+                                                this.close_disconnected_tabs(window, cx).detach();
                                             },
                                         ),
                                     ),
@@ -4151,6 +4783,8 @@ mod tests {
         focus_handle: FocusHandle,
         frame: Option<Arc<RenderImage>>,
         status: Option<SharedString>,
+        lifecycle: Option<Arc<Mutex<Vec<String>>>>,
+        presentation_obscured: bool,
     }
 
     impl TestTab {
@@ -4160,6 +4794,8 @@ mod tests {
                 focus_handle: cx.focus_handle(),
                 frame: None,
                 status: None,
+                lifecycle: None,
+                presentation_obscured: false,
             }
         }
 
@@ -4173,6 +4809,23 @@ mod tests {
                 focus_handle: cx.focus_handle(),
                 frame: None,
                 status: Some(status.into()),
+                lifecycle: None,
+                presentation_obscured: false,
+            }
+        }
+
+        fn with_lifecycle(
+            title: &'static str,
+            lifecycle: Arc<Mutex<Vec<String>>>,
+            cx: &mut Context<Self>,
+        ) -> Self {
+            Self {
+                title: title.into(),
+                focus_handle: cx.focus_handle(),
+                frame: None,
+                status: None,
+                lifecycle: Some(lifecycle),
+                presentation_obscured: false,
             }
         }
 
@@ -4250,6 +4903,37 @@ mod tests {
 
         fn title(&self, _cx: &App) -> SharedString {
             self.title.clone()
+        }
+
+        fn on_activate(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+            if let Some(lifecycle) = &self.lifecycle {
+                lifecycle
+                    .lock()
+                    .expect("lifecycle lock")
+                    .push(format!("activate:{}", self.title));
+            }
+        }
+
+        fn on_deactivate(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+            if let Some(lifecycle) = &self.lifecycle {
+                lifecycle
+                    .lock()
+                    .expect("lifecycle lock")
+                    .push(format!("deactivate:{}", self.title));
+            }
+        }
+
+        fn set_presentation_obscured(&mut self, obscured: bool, _cx: &mut Context<Self>) {
+            if self.presentation_obscured == obscured {
+                return;
+            }
+            self.presentation_obscured = obscured;
+            if let Some(lifecycle) = &self.lifecycle {
+                lifecycle
+                    .lock()
+                    .expect("lifecycle lock")
+                    .push(format!("obscured:{obscured}:{}", self.title));
+            }
         }
     }
 
@@ -4596,6 +5280,199 @@ mod tests {
             })
             .expect("window opens");
         });
+    }
+
+    #[gpui::test]
+    fn closing_active_regular_tab_activates_remaining_regular_tab(cx: &mut TestAppContext) {
+        let lifecycle = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let lifecycle_for_window = lifecycle.clone();
+        let events_for_window = events.clone();
+
+        cx.update(|cx| {
+            cx.set_global(Theme::default());
+            cx.open_window(WindowOptions::default(), |window, cx| {
+                let first =
+                    cx.new(|cx| TestTab::with_lifecycle("first", lifecycle_for_window.clone(), cx));
+                let second = cx
+                    .new(|cx| TestTab::with_lifecycle("second", lifecycle_for_window.clone(), cx));
+                let container = cx.new(|cx| TabContainer::new(window, cx));
+
+                container.update(cx, |container, cx| {
+                    container.add_and_activate_tab_with_focus(
+                        TabItem::new("first", "test", first.clone()),
+                        window,
+                        cx,
+                    );
+                    container.add_and_activate_tab_with_focus(
+                        TabItem::new("second", "test", second),
+                        window,
+                        cx,
+                    );
+                });
+                let events_for_subscription = events_for_window.clone();
+                cx.subscribe(&container, move |_, event: &TabContainerEvent, _| {
+                    let event = match event {
+                        TabContainerEvent::TabClosed { id } => format!("closed:{id}"),
+                        TabContainerEvent::TabActivated { index, id } => {
+                            format!("activated:{index}:{id}")
+                        }
+                        TabContainerEvent::LayoutChanged => "layout".to_string(),
+                        TabContainerEvent::NavigationSidebarToggled { .. } => return,
+                    };
+                    events_for_subscription
+                        .lock()
+                        .expect("events lock")
+                        .push(event);
+                })
+                .detach();
+                lifecycle_for_window.lock().expect("lifecycle lock").clear();
+                events_for_window.lock().expect("events lock").clear();
+
+                container.update(cx, |container, cx| {
+                    container.force_close_tab_by_id("second", window, cx);
+                });
+
+                let container_ref = container.read(cx);
+                assert_eq!(1, container_ref.tabs().len());
+                assert_eq!(0, container_ref.active_index());
+                assert_eq!("first", container_ref.active_tab().unwrap().id().as_ref());
+                assert!(first.read(cx).focus_handle(cx).is_focused(window));
+                container
+            })
+            .expect("window opens");
+        });
+
+        assert_eq!(
+            vec![
+                "deactivate:second".to_string(),
+                "activate:first".to_string()
+            ],
+            *lifecycle.lock().expect("lifecycle lock")
+        );
+        assert_eq!(
+            vec![
+                "closed:second".to_string(),
+                "activated:0:first".to_string(),
+                "layout".to_string()
+            ],
+            *events.lock().expect("events lock")
+        );
+    }
+
+    #[gpui::test]
+    fn presentation_obscuring_combines_independent_sources_and_only_updates_active_content(
+        cx: &mut TestAppContext,
+    ) {
+        let lifecycle = Arc::new(Mutex::new(Vec::new()));
+        let lifecycle_for_window = lifecycle.clone();
+
+        cx.update(|cx| {
+            cx.set_global(Theme::default());
+            cx.open_window(WindowOptions::default(), |window, cx| {
+                let active = cx
+                    .new(|cx| TestTab::with_lifecycle("active", lifecycle_for_window.clone(), cx));
+                let background = cx.new(|cx| {
+                    TestTab::with_lifecycle("background", lifecycle_for_window.clone(), cx)
+                });
+                let container = cx.new(|cx| TabContainer::new(window, cx));
+
+                container.update(cx, |container, cx| {
+                    container.add_and_activate_tab_with_focus(
+                        TabItem::new("active", "test", active),
+                        window,
+                        cx,
+                    );
+                    container.add_tab_with_mode(
+                        TabItem::new("background", "test", background),
+                        TabOpenMode::Background,
+                        window,
+                        cx,
+                    );
+                });
+                lifecycle_for_window.lock().expect("lifecycle lock").clear();
+
+                container.update(cx, |container, cx| {
+                    container.set_active_presentation_obscured_by_main_content(true, cx);
+                    container.set_active_presentation_obscured_by_main_content(true, cx);
+                    container.set_active_presentation_obscured_by_dialog(true, cx);
+                    container.set_active_presentation_obscured_by_main_content(false, cx);
+                    container.set_active_presentation_obscured_by_dialog(false, cx);
+                    container.set_active_presentation_obscured_by_dialog(true, cx);
+                    container.set_active_presentation_obscured_by_main_content(true, cx);
+                    container.set_active_presentation_obscured_by_dialog(false, cx);
+                    container.set_active_presentation_obscured_by_main_content(false, cx);
+                    container.set_active_presentation_obscured(true, cx);
+                    container.set_active_presentation_obscured_by_main_content(true, cx);
+                    container.set_active_presentation_obscured(false, cx);
+                    container.set_active_presentation_obscured_by_main_content(false, cx);
+                });
+
+                container
+            })
+            .expect("window opens");
+        });
+
+        assert_eq!(
+            vec![
+                "obscured:true:active".to_string(),
+                "obscured:false:active".to_string(),
+                "obscured:true:active".to_string(),
+                "obscured:false:active".to_string(),
+                "obscured:true:active".to_string(),
+                "obscured:false:active".to_string(),
+            ],
+            *lifecycle.lock().expect("lifecycle lock")
+        );
+    }
+
+    #[gpui::test]
+    fn active_tab_inherits_presentation_obscuring_when_switched(cx: &mut TestAppContext) {
+        let lifecycle = Arc::new(Mutex::new(Vec::new()));
+        let lifecycle_for_window = lifecycle.clone();
+
+        cx.update(|cx| {
+            cx.set_global(Theme::default());
+            cx.open_window(WindowOptions::default(), |window, cx| {
+                let first =
+                    cx.new(|cx| TestTab::with_lifecycle("first", lifecycle_for_window.clone(), cx));
+                let second = cx
+                    .new(|cx| TestTab::with_lifecycle("second", lifecycle_for_window.clone(), cx));
+                let container = cx.new(|cx| TabContainer::new(window, cx));
+
+                container.update(cx, |container, cx| {
+                    container.add_and_activate_tab_with_focus(
+                        TabItem::new("first", "test", first),
+                        window,
+                        cx,
+                    );
+                    container.add_tab_with_mode(
+                        TabItem::new("second", "test", second),
+                        TabOpenMode::Background,
+                        window,
+                        cx,
+                    );
+                    container.set_active_presentation_obscured_by_main_content(true, cx);
+                });
+                lifecycle_for_window.lock().expect("lifecycle lock").clear();
+
+                container.update(cx, |container, cx| {
+                    container.set_active_index(1, window, cx);
+                });
+
+                container
+            })
+            .expect("window opens");
+        });
+
+        assert_eq!(
+            vec![
+                "deactivate:first".to_string(),
+                "activate:second".to_string(),
+                "obscured:true:second".to_string(),
+            ],
+            *lifecycle.lock().expect("lifecycle lock")
+        );
     }
 
     #[gpui::test]
@@ -5050,5 +5927,40 @@ mod tests {
                 .expect("reconnected frame"),
             after_reconnect.tab_content
         );
+    }
+
+    #[test]
+    fn connection_status_badges_follow_securecrt_semantics() {
+        let icons = |status, locked| {
+            connection_status_badges(status, locked)
+                .into_iter()
+                .map(|(icon, _)| icon)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            icons(Some(TabConnectionStatus::Connected), false),
+            vec![IconName::StatusConnected]
+        );
+        assert_eq!(
+            icons(Some(TabConnectionStatus::Connected), true),
+            vec![IconName::StatusConnectedLocked],
+            "locked and connected is a single combined badge"
+        );
+        assert_eq!(
+            icons(Some(TabConnectionStatus::Disconnected), false),
+            vec![IconName::StatusDisconnected]
+        );
+        assert_eq!(
+            icons(Some(TabConnectionStatus::Disconnected), true),
+            vec![IconName::StatusDisconnected],
+            "disconnected must win over the lock badge"
+        );
+        assert_eq!(
+            icons(Some(TabConnectionStatus::Connecting), false),
+            Vec::<IconName>::new(),
+            "connecting shows no badge"
+        );
+        assert_eq!(icons(None, true), Vec::<IconName>::new());
     }
 }

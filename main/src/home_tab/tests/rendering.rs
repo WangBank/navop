@@ -20,10 +20,13 @@ fn local_terminal_launcher_is_visible_in_home_toolbar() {
 }
 
 #[test]
-fn both_home_styles_expose_credential_vault_in_their_native_navigation() {
+fn both_home_styles_expose_credential_vault_in_their_sidebars() {
     let toolbar = include_str!("../toolbar.rs");
-    let legacy_sidebar = include_str!("../sidebar.rs");
-    let persistent_sidebar = include_str!("../../persistent_connection_sidebar/rail.rs");
+    let legacy_sidebar = include_str!("../sidebar_navigation.rs");
+    let persistent_sidebar =
+        include_str!("../../persistent_connection_sidebar/navigation_sections.rs");
+    let navigation = include_str!("../navigation.rs");
+    let quick_open = include_str!("../../navigation_quick_open.rs");
     let modern_home = include_str!("../modern_home.rs");
     let workspace_tools = modern_home
         .split("fn render_workspace_tools")
@@ -35,14 +38,23 @@ fn both_home_styles_expose_credential_vault_in_their_native_navigation() {
     assert!(!toolbar.contains("add_credential_vault_tab"));
 
     assert!(legacy_sidebar.contains("\"legacy-open-credential-vault\""));
-    assert!(legacy_sidebar.contains("t!(\"Home.credential_vault\")"));
-    assert!(legacy_sidebar.contains("home.add_credential_vault_tab(window, cx)"));
+    assert!(legacy_sidebar.contains("NavigationApplication::CredentialVault"));
+    assert!(
+        legacy_sidebar.contains("home.activate_navigation_application(application, window, cx)")
+    );
 
-    assert!(!persistent_sidebar.contains("\"persistent-open-credential-vault\""));
+    assert!(persistent_sidebar.contains("\"persistent-open-credential-vault\""));
+    assert!(persistent_sidebar.contains("NavigationApplication::CredentialVault"));
+    assert!(
+        persistent_sidebar
+            .contains("home.activate_navigation_application(application, window, cx)")
+    );
+    assert!(navigation.contains("NavigationApplication::CredentialVault =>"));
+    assert!(navigation.contains("self.add_credential_vault_tab(window, cx)"));
+    assert!(quick_open.contains("t!(\"Home.credential_vault\")"));
 
-    assert!(workspace_tools.contains("\"modern-home-credential-vault\""));
-    assert!(workspace_tools.contains("t!(\"Home.credential_vault\")"));
-    assert!(workspace_tools.contains("home.add_credential_vault_tab(window, cx)"));
+    assert!(!workspace_tools.contains("\"modern-home-credential-vault\""));
+    assert!(!workspace_tools.contains("home.add_credential_vault_tab(window, cx)"));
 }
 
 #[test]
@@ -136,15 +148,15 @@ fn personal_and_team_keys_share_one_toolbar_menu() {
 fn home_overview_is_compact_and_avoids_duplicate_search() {
     let toolbar = include_str!("../toolbar.rs");
     let content = include_str!("../content.rs");
-    let card = include_str!("../connection_card.rs");
+    let card = include_str!("../connection_card.rs").replace("\r\n", "\n");
     let render = include_str!("../render.rs");
-    let modern_home = include_str!("../modern_home.rs");
+    let modern_home = include_str!("../modern_home.rs").replace("\r\n", "\n");
 
     assert!(toolbar.contains("Input::new(&self.search_input)"));
     assert!(content.contains("max_w(px(1160.0))"));
     assert!(content.contains("MODERN_HOME_CARD_MIN_WIDTH"));
     assert!(content.contains("MODERN_HOME_CARD_MAX_WIDTH"));
-    assert!(content.contains(".flex_grow()"));
+    assert!(content.contains(".flex_grow_1()"));
     assert!(card.contains("px(76.0)"));
     assert!(!card.contains(".shadow_sm()\n            .group"));
     assert!(render.contains("self.render_modern_home(window, cx)"));
@@ -170,7 +182,7 @@ fn home_overview_is_compact_and_avoids_duplicate_search() {
 
 #[test]
 fn modern_start_center_separates_primary_work_from_supporting_tools() {
-    let modern_home = include_str!("../modern_home.rs");
+    let modern_home = include_str!("../modern_home.rs").replace("\r\n", "\n");
 
     for stable_id in [
         "modern-home-hero",
@@ -187,10 +199,10 @@ fn modern_start_center_separates_primary_work_from_supporting_tools() {
     assert!(modern_home.contains(".flex_basis(START_CENTER_SIDE_COLUMN_WIDTH)"));
     assert!(modern_home.contains(".items_stretch()"));
     assert!(modern_home.contains(".flex_grow_factor(2.0)"));
-    assert!(modern_home.contains(".flex_grow()"));
+    assert!(modern_home.contains(".flex_grow_1()"));
     assert!(
         modern_home
-            .contains("surface_panel(\"modern-home-status-panel\", cx)\n        .flex_grow()")
+            .contains("surface_panel(\"modern-home-status-panel\", cx)\n        .flex_grow_1()")
     );
     assert!(modern_home.contains("render_recent_connections_panel"));
     assert!(modern_home.contains("render_create_panel"));
@@ -266,6 +278,10 @@ fn legacy_and_modern_home_layouts_are_both_kept() {
     let content = include_str!("../content.rs");
     let card = include_str!("../connection_card.rs");
     let sidebar = include_str!("../sidebar.rs");
+    let sidebar_navigation = include_str!("../sidebar_navigation.rs");
+    let persistent_navigation =
+        include_str!("../../persistent_connection_sidebar/navigation_sections.rs");
+    let quick_open = include_str!("../../navigation_quick_open.rs");
 
     assert!(render.contains("self.render_legacy_home(window, cx)"));
     assert!(render.contains("self.render_modern_home(window, cx)"));
@@ -274,25 +290,35 @@ fn legacy_and_modern_home_layouts_are_both_kept() {
     assert!(content.contains("slot.min_w(MODERN_HOME_CARD_MIN_WIDTH)"));
     assert!(card.contains("if legacy { px(90.0) } else { px(76.0) }"));
     assert!(!sidebar.contains("\"legacy-open-home\""));
-    assert!(sidebar.contains("ConnectionType::all()"));
-    assert!(sidebar.contains("this.set_selected_filter(filter, cx);"));
+    assert!(sidebar_navigation.contains("visible_connection_types()"));
+    assert!(sidebar_navigation.contains("this.set_selected_filter(filter, cx);"));
+    assert!(persistent_navigation.contains("visible_connection_types()"));
+    assert!(quick_open.contains("fn overflow_connection_types()"));
     assert!(sidebar.contains("legacy-home-sidebar-toggle"));
-    assert!(sidebar.contains("FunctionalIcon::new(IconName::User)"));
-    assert!(!sidebar.contains("ObjectIcon::new(IconName::User)"));
+    assert!(sidebar_navigation.contains("FunctionalIcon::new(IconName::User)"));
+    assert!(!sidebar_navigation.contains("ObjectIcon::new(IconName::User)"));
+    assert!(sidebar_navigation.contains("\"legacy-more-connection-types\""));
+    assert!(sidebar_navigation.contains("\"legacy-more-applications\""));
+    assert_eq!(
+        sidebar_navigation.matches("show_label: false").count(),
+        2,
+        "the two legacy overflow buttons should render only their ellipsis icon"
+    );
+    assert!(persistent_navigation.contains("\"persistent-more-connection-types\""));
+    assert!(persistent_navigation.contains("\"persistent-more-applications\""));
+    assert!(sidebar_navigation.contains("show_legacy_connection_navigation_quick_open"));
+    assert!(sidebar_navigation.contains("show_application_navigation_quick_open"));
+    assert!(persistent_navigation.contains("NavigationQuickOpenRequest::connections"));
+    assert!(persistent_navigation.contains("show_application_navigation_quick_open"));
 }
 
 #[test]
-fn legacy_ai_workbench_uses_the_original_color_icon() {
-    let sidebar = include_str!("../sidebar.rs");
-    let ai_entry = sidebar
-        .split(".when(show_ai_workbench")
-        .nth(1)
-        .and_then(|source| source.split(".when(show_team").next())
-        .expect("legacy AI workbench sidebar entry");
+fn legacy_ai_workbench_uses_the_monochrome_line_icon() {
+    let sidebar = include_str!("../sidebar_navigation.rs");
 
-    assert!(ai_entry.contains("\"legacy-open-ai-workbench\""));
-    assert!(ai_entry.contains("IconName::AI,"));
-    assert!(!ai_entry.contains("IconName::AILine"));
+    assert!(sidebar.contains("\"legacy-open-ai-workbench\""));
+    assert!(sidebar.contains("NavigationApplication::AiWorkbench => IconName::AILine"));
+    assert!(!sidebar.contains("NavigationApplication::AiWorkbench => IconName::AI,"));
 }
 
 #[test]
@@ -308,7 +334,7 @@ fn modern_home_cards_are_small_and_fill_each_row() {
             .count()
             >= 3
     );
-    assert!(content.matches(".flex_grow()").count() >= 3);
+    assert!(content.matches(".flex_grow_1()").count() >= 3);
 }
 
 #[test]

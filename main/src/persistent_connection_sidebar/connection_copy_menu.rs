@@ -94,6 +94,7 @@ fn copy_action_presentation(action: ConnectionCopyAction) -> (String, IconName) 
         ConnectionCopyAction::RemoteDesktopAddress => {
             label("copy_remote_desktop_target", IconName::Network)
         }
+        ConnectionCopyAction::TelnetAddress => label("copy_telnet_target", IconName::Network),
         ConnectionCopyAction::Username => label("copy_username", IconName::User),
         ConnectionCopyAction::SerialPort => label("copy_serial_port", IconName::Network),
         ConnectionCopyAction::ForwardingRule => label("copy_forwarding_rule", IconName::Network),
@@ -130,6 +131,7 @@ mod tests {
         StoredConnection::new_ssh(
             "SSH".to_string(),
             SshParams {
+                sftp_account: None,
                 host: "ssh.example.test".to_string(),
                 port: 22,
                 username: "alice".to_string(),
@@ -154,6 +156,7 @@ mod tests {
                 proxy: None,
                 os_id: None,
                 icon: None,
+                account_expect: Default::default(),
             },
             None,
         )

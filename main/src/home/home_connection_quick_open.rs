@@ -246,6 +246,8 @@ mod tests {
                 read_only: false,
                 audio_playback: false,
                 proxy: None,
+                backend_preference: Default::default(),
+                rdp: None,
             },
             None,
         )

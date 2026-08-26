@@ -33,8 +33,9 @@ use ai_chat_view::{
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, AnyView, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, ParentElement, Pixels, Render, SharedString, Styled, Subscription, Window, div,
+    AnyElement, AnyView, App, AppContext, ColorExt as _, Context, Entity, EventEmitter,
+    FocusHandle, Focusable, IntoElement, ParentElement, Pixels, Render, SharedString, Styled,
+    Subscription, Window, div,
 };
 use gpui_component::{
     ActiveTheme, FunctionalIcon, Icon, IconName, IconSize, ObjectIcon, Selectable, Sizable, Size,
@@ -114,6 +115,7 @@ fn terminal_ai_system_instruction(connection_kind: TerminalConnectionKind) -> St
         ),
         TerminalConnectionKind::Ssh => ("远程 Linux shell 环境".to_string(), "bash"),
         TerminalConnectionKind::Serial => ("串口终端环境".to_string(), "text"),
+        TerminalConnectionKind::Telnet => ("Telnet 网络设备终端环境".to_string(), "text"),
     };
     format!(
         r#"你是终端侧边栏中的命令助手，当前目标是{environment}。
@@ -548,6 +550,8 @@ pub enum TerminalSidebarEvent {
     ScrollbackLinesChanged(usize),
     /// 粘贴命令到终端输入区（不自动回车）
     ExecuteCommand(String),
+    /// 快捷命令数据已变更
+    QuickCommandsChanged,
     /// 请求询问 AI
     AskAi,
     /// 粘贴代码到终端（用于AI生成的代码块）
@@ -558,10 +562,14 @@ pub enum TerminalSidebarEvent {
     ConfirmMultilinePasteChanged(bool),
     /// 高危命令确认开关
     ConfirmHighRiskCommandChanged(bool),
+    /// 自动会话日志开关
+    AutoSessionLoggingChanged(bool),
     /// 选中自动复制开关
     AutoCopyChanged(bool),
     /// 自动补全开关
     AutocompleteChanged(bool),
+    /// 弹框候选词开关
+    SuggestionPopupChanged(bool),
     /// 中键粘贴开关
     MiddleClickPasteChanged(bool),
     /// 右键快速粘贴开关
@@ -611,6 +619,11 @@ pub struct TerminalSidebar {
 }
 
 impl TerminalSidebar {
+    pub(crate) fn refresh_quick_commands(&mut self, cx: &mut Context<Self>) {
+        self.quick_command_panel
+            .update(cx, |panel, cx| panel.load_commands(cx));
+    }
+
     pub(crate) fn new(
         connection_id: Option<i64>,
         connection_kind: TerminalConnectionKind,
@@ -644,6 +657,7 @@ impl TerminalSidebar {
                 initial_font_size,
                 initial_font_family,
                 has_file_manager,
+                true,
                 true,
                 true,
                 true,
@@ -797,11 +811,17 @@ impl TerminalSidebar {
                         *enabled,
                     ));
                 }
+                settings_panel::SettingsPanelEvent::AutoSessionLoggingChanged(enabled) => {
+                    cx.emit(TerminalSidebarEvent::AutoSessionLoggingChanged(*enabled));
+                }
                 settings_panel::SettingsPanelEvent::AutoCopyChanged(enabled) => {
                     cx.emit(TerminalSidebarEvent::AutoCopyChanged(*enabled));
                 }
                 settings_panel::SettingsPanelEvent::AutocompleteChanged(enabled) => {
                     cx.emit(TerminalSidebarEvent::AutocompleteChanged(*enabled));
+                }
+                settings_panel::SettingsPanelEvent::SuggestionPopupChanged(enabled) => {
+                    cx.emit(TerminalSidebarEvent::SuggestionPopupChanged(*enabled));
                 }
                 settings_panel::SettingsPanelEvent::MiddleClickPasteChanged(enabled) => {
                     cx.emit(TerminalSidebarEvent::MiddleClickPasteChanged(*enabled));
@@ -834,6 +854,9 @@ impl TerminalSidebar {
                 }
                 quick_command_panel::QuickCommandPanelEvent::ExecuteCommand(cmd) => {
                     cx.emit(TerminalSidebarEvent::ExecuteCommand(cmd.clone()));
+                }
+                quick_command_panel::QuickCommandPanelEvent::QuickCommandsChanged => {
+                    cx.emit(TerminalSidebarEvent::QuickCommandsChanged);
                 }
             },
         );
@@ -991,6 +1014,14 @@ impl TerminalSidebar {
         self.tool_dock.open_panels()
     }
 
+    pub fn on_host_activated(&mut self, cx: &mut Context<Self>) {
+        if self.tool_dock.is_tool_open(SidebarPanel::AiChat) {
+            self.ai_chat_panel.update(cx, |panel, cx| {
+                panel.on_sidebar_shown(cx);
+            });
+        }
+    }
+
     pub fn panel_placement(&self, panel: SidebarPanel) -> SidebarPlacement {
         self.tool_dock.panel_placement(panel)
     }
@@ -1073,7 +1104,13 @@ impl TerminalSidebar {
     fn open_tool_internal(&mut self, panel: SidebarPanel, cx: &mut Context<Self>) -> bool {
         self.prepare_panel_open(panel, cx);
         self.update_panel_frame_placement(panel, self.panel_placement(panel), cx);
-        self.tool_dock.open_tool(panel)
+        let changed = self.tool_dock.open_tool(panel);
+        if changed && panel == SidebarPanel::AiChat {
+            self.ai_chat_panel.update(cx, |panel, cx| {
+                panel.on_sidebar_shown(cx);
+            });
+        }
+        changed
     }
 
     fn update_panel_frame_placement(
@@ -1616,6 +1653,7 @@ mod tests {
     use gpui_component::{Theme, ThemeColor};
     use one_core::sidebar_contribution::SidebarPlacement;
     use one_core::storage::{ConnectionType, StoredConnection};
+    use palette::IntoColor as _;
     use terminal::terminal::TerminalConnectionKind;
 
     fn stored_connection(id: i64, name: &str, connection_type: ConnectionType) -> StoredConnection {
@@ -1782,13 +1820,13 @@ mod tests {
     #[test]
     fn workspace_theme_maps_terminal_palette_and_application_semantic_colors() {
         let colors = TerminalColors {
-            background: rgb(0x101010).into(),
-            foreground: rgb(0xf0f0f0).into(),
-            muted: rgb(0x202020).into(),
-            muted_foreground: rgb(0x909090).into(),
-            border: rgb(0x303030).into(),
-            accent: rgb(0x3366ff).into(),
-            accent_foreground: rgb(0xffffff).into(),
+            background: rgb(0x101010).into_color(),
+            foreground: rgb(0xf0f0f0).into_color(),
+            muted: rgb(0x202020).into_color(),
+            muted_foreground: rgb(0x909090).into_color(),
+            border: rgb(0x303030).into_color(),
+            accent: rgb(0x3366ff).into_color(),
+            accent_foreground: rgb(0xffffff).into_color(),
         };
         let application_theme = Theme::from(ThemeColor::dark().as_ref());
 

@@ -23,6 +23,12 @@ pub(super) fn recording_playback_tab_title(name: &str) -> SharedString {
         .into()
 }
 
+pub(super) fn session_log_tab_title(name: &str) -> SharedString {
+    t!("TerminalSessionLog.tab_title", name = name)
+        .to_string()
+        .into()
+}
+
 impl Focusable for TerminalView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -39,6 +45,9 @@ impl TabContent for TerminalView {
     fn title(&self, cx: &App) -> SharedString {
         if let Some(name) = &self.recording_playback_name {
             return recording_playback_tab_title(name.as_ref());
+        }
+        if let Some(name) = &self.session_log_name {
+            return session_log_tab_title(name.as_ref());
         }
 
         let terminal = self.terminal.read(cx);
@@ -59,10 +68,10 @@ impl TabContent for TerminalView {
     }
 
     fn icon(&self, cx: &App) -> Option<Icon> {
-        if self.connection_kind(cx) == TerminalConnectionKind::Serial {
-            Some(IconName::SerialPort.color())
-        } else {
-            Some(IconName::TerminalColor.color())
+        match self.connection_kind(cx) {
+            TerminalConnectionKind::Serial => Some(IconName::SerialPort.color()),
+            TerminalConnectionKind::Telnet => Some(IconName::SquareTerminalColor.color()),
+            _ => Some(IconName::TerminalColor.color()),
         }
     }
 
@@ -74,9 +83,10 @@ impl TabContent for TerminalView {
         self.duplicate_supported(cx)
     }
 
-    fn on_activate(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn on_activate(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.set_performance_tab_active(true);
         self.set_performance_pane_active(true);
+        self.on_host_activated(cx);
     }
 
     fn on_deactivate(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
@@ -109,6 +119,10 @@ impl TabContent for TerminalView {
 
         self.close_terminal_now(cx);
         Task::ready(true)
+    }
+
+    fn apply_title(&mut self, title: &str, _window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_broadcast_label(title, cx);
     }
 
     fn sidebar_contributions(&self, _cx: &App) -> Vec<SidebarContribution> {

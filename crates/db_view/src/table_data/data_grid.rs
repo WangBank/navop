@@ -23,14 +23,17 @@ use crate::search_shortcut::{
     DB_SEARCH_CONTEXT, FocusSearchInput, OpenSelectedTableQuery, OpenTableDesigner,
     focus_search_input,
 };
+use crate::sidebar::execution_history::ExecutionContext;
+use crate::sidebar::execution_history_panel::ExecutionHistoryPanel;
 use crate::sql_editor::SqlEditor;
-use crate::table_data::copy_format::{CopyFormat, CopyFormatter, TableMetadata};
+use crate::table_data::copy_format::{CopyFormat, CopyFormatContext, CopyFormatter, TableMetadata};
 use crate::table_data::filter_editor::{FilterEditorEvent, TableFilterEditor, TableSchema};
 use crate::table_data::results_delegate::{EditorTableDelegate, RowChange};
 use chrono::Local;
 use db::{
-    BinaryCell, ColumnInfo, DbManager, ExecOptions, GlobalDbState, IndexInfo, QueryResult,
-    SqlResult, TableCellChange, TableCellValue, TableDataRequest, TableRowChange, TableSaveRequest,
+    BinaryCell, ColumnInfo, DatabasePlugin, DbManager, ExecOptions, GlobalDbState, IndexInfo,
+    QueryResult, SqlResult, TableCellChange, TableCellValue, TableDataRequest, TableRowChange,
+    TableSaveRequest, binary_value::format_binary_input,
 };
 use gpui_component::button::ButtonVariants;
 use gpui_component::dialog::DialogButtonProps;
@@ -41,8 +44,12 @@ use one_core::settings::{AppSettings, LargeTextCellEditorOpenMode};
 use one_core::storage::DatabaseType;
 use one_core::tab_container::TabContainer;
 use one_ui::edit_table::ColumnSort;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 actions!(
     data_grid,
@@ -89,6 +96,17 @@ where
 
     row_indices.sort_unstable_by(|left, right| right.cmp(left));
     row_indices
+}
+
+fn resolve_copy_row_indices(
+    delegate: &EditorTableDelegate,
+    display_row_indices: &[usize],
+) -> Vec<usize> {
+    display_row_indices
+        .iter()
+        .filter_map(|&display_row| delegate.resolve_display_row(display_row))
+        .filter(|&actual_row| !delegate.is_deleted_row(actual_row))
+        .collect()
 }
 
 fn build_large_text_editor_title(column_name: &str, display_row_ix: usize) -> String {
@@ -149,7 +167,12 @@ pub enum DataGridUsage {
     SqlResult,
 }
 
-type ExportPayload = (Vec<SharedString>, Vec<Vec<Option<String>>>);
+#[derive(Debug)]
+struct ExportPayload {
+    columns: Vec<SharedString>,
+    rows: Vec<Vec<Option<String>>>,
+    binary_cells: Vec<BinaryCell>,
+}
 
 struct SqlResultExportRequest {
     connection_id: String,
@@ -164,6 +187,38 @@ fn result_set_export_exec_options() -> ExecOptions {
         max_rows: None,
         ..Default::default()
     }
+}
+
+async fn list_columns_direct_on_runtime(
+    cx: &mut AsyncApp,
+    global_state: GlobalDbState,
+    connection_id: String,
+    database_name: String,
+    schema_name: Option<String>,
+    table_name: String,
+) -> anyhow::Result<Vec<ColumnInfo>> {
+    Tokio::spawn_result(cx, async move {
+        global_state
+            .list_columns_direct(&connection_id, &database_name, schema_name, &table_name)
+            .await
+    })
+    .await
+}
+
+async fn list_indexes_direct_on_runtime(
+    cx: &mut AsyncApp,
+    global_state: GlobalDbState,
+    connection_id: String,
+    database_name: String,
+    schema_name: Option<String>,
+    table_name: String,
+) -> anyhow::Result<Vec<IndexInfo>> {
+    Tokio::spawn_result(cx, async move {
+        global_state
+            .list_indexes_direct(&connection_id, &database_name, schema_name, &table_name)
+            .await
+    })
+    .await
 }
 
 async fn execute_sql_result_export(
@@ -244,6 +299,8 @@ pub struct DataGridConfig {
     pub database_type: DatabaseType,
     /// 是否允许编辑
     pub editable: bool,
+    /// Whether the SQL result has a reliable direct-table schema identity.
+    pub schema_metadata_safe: bool,
     /// 是否显示工具栏
     pub show_toolbar: bool,
     /// 使用场景
@@ -272,6 +329,7 @@ impl DataGridConfig {
             connection_id: connection_id.into(),
             database_type,
             editable: true,
+            schema_metadata_safe: false,
             show_toolbar: true,
             usage: DataGridUsage::TableData,
             sql: "".to_string(),
@@ -288,6 +346,11 @@ impl DataGridConfig {
 
     pub fn editable(mut self, editable: bool) -> Self {
         self.editable = editable;
+        self
+    }
+
+    pub fn schema_metadata_safe(mut self, safe: bool) -> Self {
+        self.schema_metadata_safe = safe;
         self
     }
 
@@ -380,12 +443,25 @@ impl ExportFormat {
     }
 }
 
+struct ExportBuildInput {
+    rows: Vec<Vec<Option<String>>>,
+    binary_cells: Vec<BinaryCell>,
+    columns: Vec<SharedString>,
+    metadata: TableMetadata,
+    plugin: Option<Arc<dyn DatabasePlugin>>,
+}
+
 fn build_export_bytes(
     format: ExportFormat,
-    rows: Vec<Vec<Option<String>>>,
-    columns: Vec<SharedString>,
-    mut metadata: TableMetadata,
+    input: ExportBuildInput,
 ) -> Result<Option<Vec<u8>>, String> {
+    let ExportBuildInput {
+        rows,
+        mut binary_cells,
+        columns,
+        metadata,
+        plugin,
+    } = input;
     if rows.is_empty() {
         return Ok(None);
     }
@@ -398,26 +474,52 @@ fn build_export_bytes(
             .map(|column| Some(column.as_ref().to_string()))
             .collect();
         export_rows.insert(0, header);
+        for cell in &mut binary_cells {
+            cell.row_index += 1;
+        }
     }
 
-    metadata.column_names = columns.clone();
+    let metadata = metadata.for_columns(&columns);
 
     match format {
-        ExportFormat::Xlsx => build_xlsx_bytes(&export_rows).map(Some),
-        _ => Ok(Some(
-            CopyFormatter::format(format.copy_format(), &export_rows, &columns, &metadata)
-                .into_bytes(),
-        )),
+        ExportFormat::Xlsx => build_xlsx_bytes(&export_rows, &binary_cells).map(Some),
+        _ => {
+            let context = CopyFormatContext::new(&export_rows, &columns, &metadata)
+                .with_binary_cells(&binary_cells);
+            let context = plugin
+                .as_deref()
+                .map_or(context, |plugin| context.with_plugin(plugin));
+            Ok(Some(
+                CopyFormatter::format(format.copy_format(), context).into_bytes(),
+            ))
+        }
     }
 }
 
-fn build_xlsx_bytes(rows: &[Vec<Option<String>>]) -> Result<Vec<u8>, String> {
+fn build_xlsx_bytes(
+    rows: &[Vec<Option<String>>],
+    binary_cells: &[BinaryCell],
+) -> Result<Vec<u8>, String> {
     let mut workbook = Workbook::new();
     let worksheet = workbook.add_worksheet();
+    let mut binary_index = HashMap::with_capacity(binary_cells.len());
+    for cell in binary_cells {
+        binary_index
+            .entry((cell.row_index, cell.column_index))
+            .or_insert_with(|| cell.bytes.as_slice());
+    }
 
     for (row_index, row) in rows.iter().enumerate() {
         for (col_index, cell) in row.iter().enumerate() {
-            if let Some(cell) = cell {
+            if let Some(bytes) = binary_index.get(&(row_index, col_index)) {
+                worksheet
+                    .write_string(
+                        row_index as u32,
+                        col_index as u16,
+                        format_binary_input(bytes),
+                    )
+                    .map_err(|error| error.to_string())?;
+            } else if let Some(cell) = cell {
                 worksheet
                     .write_string(row_index as u32, col_index as u16, cell)
                     .map_err(|error| error.to_string())?;
@@ -430,6 +532,17 @@ fn build_xlsx_bytes(rows: &[Vec<Option<String>>]) -> Result<Vec<u8>, String> {
 
 fn table_has_unsaved_changes(editing_cell: Option<(usize, usize)>, change_count: usize) -> bool {
     editing_cell.is_some() || change_count > 0
+}
+
+fn first_execution_error(results: &[SqlResult]) -> Option<&str> {
+    results.iter().find_map(|result| match result {
+        SqlResult::Error(error) => Some(error.message.as_str()),
+        _ => None,
+    })
+}
+
+fn data_generation_is_current(generation: &AtomicU64, expected: u64) -> bool {
+    generation.load(Ordering::Acquire) == expected
 }
 
 /// 数据表格组件
@@ -452,12 +565,21 @@ pub struct DataGrid {
     search_input: Entity<InputState>,
     /// 搜索输入框事件订阅
     _search_sub: Option<Subscription>,
+    /// 当前数据库 tab 的共享 SQL 执行记录
+    execution_history: Option<Entity<ExecutionHistoryPanel>>,
     /// 侧边栏大文本编辑器是否已为当前表格打开
     is_large_text_editor_sidebar_open: bool,
+    /// Invalidates stale asynchronous data and metadata callbacks.
+    data_generation: Arc<AtomicU64>,
 }
 
 impl DataGrid {
-    pub fn new(config: DataGridConfig, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        config: DataGridConfig,
+        execution_history: Option<Entity<ExecutionHistoryPanel>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let editable = config.editable;
         let is_table_data = config.usage == DataGridUsage::TableData;
         let database_type = config.database_type.clone();
@@ -481,7 +603,6 @@ impl DataGrid {
                 .clean_on_escape()
         });
         let table_data_info = cx.new(|_| TableDataInfo::default());
-
         let mut result = Self {
             config,
             table,
@@ -492,7 +613,9 @@ impl DataGrid {
             _filter_sub: None,
             search_input,
             _search_sub: None,
+            execution_history,
             is_large_text_editor_sidebar_open: false,
+            data_generation: Arc::new(AtomicU64::new(0)),
         };
         result.bind_table_event(window, cx);
         if is_table_data {
@@ -557,6 +680,37 @@ impl DataGrid {
         cx.notify();
     }
 
+    fn execution_context(&self) -> ExecutionContext {
+        ExecutionContext {
+            connection_id: self.config.connection_id.clone(),
+            database: Some(self.config.database_name.clone()),
+            schema: self.config.schema_name.clone(),
+        }
+    }
+
+    fn record_execution_results(&self, sql: String, results: &[SqlResult], cx: &mut App) {
+        let Some(execution_history) = &self.execution_history else {
+            return;
+        };
+        execution_history.update(cx, |history, cx| {
+            history.record_table_data_results(self.execution_context(), sql, results, cx);
+        });
+    }
+
+    fn record_execution_failure(&self, error: String, sql: Option<String>, cx: &mut App) {
+        let Some(execution_history) = &self.execution_history else {
+            return;
+        };
+        execution_history.update(cx, |history, cx| {
+            history.record_transport_error(
+                self.execution_context(),
+                sql.unwrap_or_default(),
+                error,
+                cx,
+            );
+        });
+    }
+
     fn on_action_focus_search(
         &mut self,
         _: &FocusSearchInput,
@@ -592,6 +746,7 @@ impl DataGrid {
         binary_cells: Vec<BinaryCell>,
         cx: &mut App,
     ) {
+        self.data_generation.fetch_add(1, Ordering::AcqRel);
         self.table.update(cx, |state, cx| {
             state.delegate_mut().update_data_with_binary_cells(
                 columns,
@@ -602,6 +757,14 @@ impl DataGrid {
             );
             state.refresh(cx);
         });
+    }
+
+    pub(crate) fn current_data_generation(&self) -> u64 {
+        self.data_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_data_generation_current(&self, expected: u64) -> bool {
+        data_generation_is_current(&self.data_generation, expected)
     }
 
     pub(crate) fn download_binary_value(
@@ -692,10 +855,12 @@ impl DataGrid {
         });
     }
 
-    pub fn load_column_meta_if_editable(&self, cx: &mut App) {
+    pub fn load_column_meta_for_sql_result(&self, cx: &mut App) {
         if self.config.usage != DataGridUsage::SqlResult
             || self.config.sql.is_empty()
-            || !self.config.editable
+            || self.config.database_type != DatabaseType::MySQL
+            || !self.config.schema_metadata_safe
+            || self.config.table_name.is_empty()
         {
             return;
         }
@@ -707,20 +872,48 @@ impl DataGrid {
         let table_name = self.config.table_name.clone();
         let table = self.table.clone();
         let table_info = self.table_data_info.clone();
+        let data_generation = self.data_generation.clone();
+        let expected_generation = data_generation.load(Ordering::Acquire);
         cx.spawn(async move |cx: &mut AsyncApp| {
-            let result = global_state
-                .list_columns(cx, connection_id, database_name, schema_name, table_name)
-                .await;
+            let result = list_columns_direct_on_runtime(
+                cx,
+                global_state,
+                connection_id,
+                database_name,
+                schema_name,
+                table_name,
+            )
+            .await;
 
             if let Ok(cols) = result {
                 cx.update(|cx| {
-                    table_info.update(cx, |info, _cx| {
-                        info.columns = cols.clone();
+                    if !data_generation_is_current(&data_generation, expected_generation) {
+                        return;
+                    }
+
+                    let reconcile_result = table.update(cx, |state, cx| {
+                        let result = state
+                            .delegate_mut()
+                            .reconcile_binary_cells_with_column_meta(cols.clone());
+                        if result.is_ok() {
+                            state.refresh(cx);
+                            cx.notify();
+                        }
+                        result
                     });
-                    table.update(cx, |state, cx| {
-                        state.delegate_mut().set_column_meta(cols);
-                        cx.notify();
-                    });
+                    match reconcile_result {
+                        Ok(()) => {
+                            table_info.update(cx, |info, cx| {
+                                info.columns = cols;
+                                cx.notify();
+                            });
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "failed to reconcile SQL result binary cells with metadata: {error}"
+                            );
+                        }
+                    }
                 })
             }
         })
@@ -781,6 +974,8 @@ impl DataGrid {
     // ========== 数据加载 ==========
 
     fn load_data_with_clauses(&self, page: usize, cx: &mut App) {
+        let expected_generation = self.data_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let data_generation = self.data_generation.clone();
         let global_state = cx.global::<GlobalDbState>().clone();
         let connection_id = self.config.connection_id.clone();
         let table_name = self.config.table_name.clone();
@@ -823,6 +1018,9 @@ impl DataGrid {
                 Err(err) => {
                     error!("load_data_with_clauses failed: {}", err);
                     cx.update(|cx| {
+                        if !data_generation_is_current(&data_generation, expected_generation) {
+                            return;
+                        }
                         table_data_info.update(cx, |info, cx| {
                             info.error_message =
                                 Some(t!("TableDataGrid.load_data_failed", error = err).to_string());
@@ -836,6 +1034,9 @@ impl DataGrid {
                     })
                 }
                 Ok(response) => {
+                    if !data_generation_is_current(&data_generation, expected_generation) {
+                        return;
+                    }
                     let query_result = response.query_result;
 
                     let (columns, rows, rowids, binary_cells) =
@@ -902,6 +1103,9 @@ impl DataGrid {
                         .collect();
 
                     cx.update(|cx| {
+                        if !data_generation_is_current(&data_generation, expected_generation) {
+                            return;
+                        }
                         table_data_info.update(cx, |info, cx| {
                             info.total_count = response.total_count;
                             info.current_sql = query_result.sql.clone();
@@ -915,6 +1119,9 @@ impl DataGrid {
                     });
 
                     cx.update(|cx| {
+                        if !data_generation_is_current(&data_generation, expected_generation) {
+                            return;
+                        }
                         filter_editor.update(cx, |editor, cx| {
                             editor.set_schema(
                                 TableSchema {
@@ -939,16 +1146,24 @@ impl DataGrid {
                         });
                     });
 
-                    match global_state
-                        .list_columns(cx, connection_id, database_name, schema_name, table_name)
-                        .await
+                    match list_columns_direct_on_runtime(
+                        cx,
+                        global_state,
+                        connection_id,
+                        database_name,
+                        schema_name,
+                        table_name,
+                    )
+                    .await
                     {
                         Ok(column_meta) => {
                             cx.update(|cx| {
-                                table_data_info.update(cx, |info, cx| {
-                                    info.columns = column_meta.clone();
-                                    cx.notify();
-                                });
+                                if !data_generation_is_current(
+                                    &data_generation,
+                                    expected_generation,
+                                ) {
+                                    return;
+                                }
 
                                 filter_editor.update(cx, |editor, cx| {
                                     editor.set_schema(
@@ -959,10 +1174,28 @@ impl DataGrid {
                                     );
                                 });
 
-                                table.update(cx, |state, cx| {
-                                    state.delegate_mut().set_column_meta(column_meta);
-                                    state.refresh(cx);
+                                let reconcile_result = table.update(cx, |state, cx| {
+                                    let result = state
+                                        .delegate_mut()
+                                        .reconcile_binary_cells_with_column_meta(
+                                            column_meta.clone(),
+                                        );
+                                    if result.is_ok() {
+                                        state.refresh(cx);
+                                    }
+                                    result
                                 });
+                                match reconcile_result {
+                                    Ok(()) => {
+                                        table_data_info.update(cx, |info, cx| {
+                                            info.columns = column_meta;
+                                            cx.notify();
+                                        });
+                                    }
+                                    Err(error) => tracing::warn!(
+                                        "failed to reconcile table data binary cells with metadata: {error}"
+                                    ),
+                                }
                             });
                         }
                         Err(err) => {
@@ -1051,15 +1284,15 @@ impl DataGrid {
             let table_name_for_columns = self.config.table_name.clone();
 
             cx.spawn(async move |cx: &mut AsyncApp| {
-                let columns_result = global_state
-                    .list_columns(
-                        cx,
-                        connection_id_for_columns,
-                        database_name_for_columns,
-                        schema_name_for_columns,
-                        table_name_for_columns,
-                    )
-                    .await;
+                let columns_result = list_columns_direct_on_runtime(
+                    cx,
+                    global_state,
+                    connection_id_for_columns,
+                    database_name_for_columns,
+                    schema_name_for_columns,
+                    table_name_for_columns,
+                )
+                .await;
 
                 match columns_result {
                     Ok(columns) => {
@@ -1081,6 +1314,7 @@ impl DataGrid {
             PopupWindowOptions::new(t!("TableDataGrid.export_table").to_string())
                 .size(800.0, 600.0),
             move |_window, _cx| export_view.clone(),
+            Some(window),
             cx,
         );
     }
@@ -1112,6 +1346,7 @@ impl DataGrid {
         let metadata = self.table.read(cx).delegate().get_table_metadata();
         let window_id = cx.active_window();
         let global_state = cx.global::<GlobalDbState>().clone();
+        let plugin = global_state.get_plugin(&self.config.database_type).ok();
         let prompt_future = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             multiple: false,
@@ -1129,7 +1364,13 @@ impl DataGrid {
             };
 
             let export_payload = match scope {
-                ExportScope::CurrentPage => Self::collect_visible_rows(&table, cx),
+                ExportScope::CurrentPage => match Self::collect_visible_rows(&table, cx) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        notify_export_failure(cx, window_id, error);
+                        return;
+                    }
+                },
                 ExportScope::All => match usage {
                     DataGridUsage::TableData => {
                         if total_count == 0 {
@@ -1150,9 +1391,7 @@ impl DataGrid {
                             {
                                 Ok(response) => {
                                     let query_result = response.query_result;
-                                    let (columns, rows) =
-                                        Self::normalize_query_result(query_result);
-                                    Some((columns, rows))
+                                    Some(Self::normalize_query_result(query_result))
                                 }
                                 Err(error) => {
                                     notify_export_failure(cx, window_id, error.to_string());
@@ -1180,7 +1419,12 @@ impl DataGrid {
                 },
             };
 
-            let Some((columns, rows)) = export_payload else {
+            let Some(ExportPayload {
+                columns,
+                rows,
+                binary_cells,
+            }) = export_payload
+            else {
                 let _ = cx.update(|cx| {
                     if let Some(window_id) = window_id {
                         let _ = cx.update_window(window_id, |_entity, window, cx| {
@@ -1194,7 +1438,14 @@ impl DataGrid {
                 return;
             };
 
-            let bytes = match build_export_bytes(format, rows, columns.clone(), metadata.clone()) {
+            let input = ExportBuildInput {
+                rows,
+                binary_cells,
+                columns: columns.clone(),
+                metadata: metadata.clone(),
+                plugin: plugin.clone(),
+            };
+            let bytes = match build_export_bytes(format, input) {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => {
                     let _ = cx.update(|cx| {
@@ -1280,12 +1531,12 @@ impl DataGrid {
     fn collect_visible_rows(
         table: &Entity<EditTableState<EditorTableDelegate>>,
         cx: &AsyncApp,
-    ) -> Option<(Vec<SharedString>, Vec<Vec<Option<String>>>)> {
+    ) -> Result<Option<ExportPayload>, String> {
         table.read_with(cx, |table_state, _cx| {
             let delegate = table_state.delegate();
             let row_count = delegate.filtered_row_count();
             if row_count == 0 {
-                return None;
+                return Ok(None);
             }
 
             let mut row_indices = Vec::with_capacity(row_count);
@@ -1299,9 +1550,11 @@ impl DataGrid {
                 row_indices.push(actual_row);
             }
 
-            let rows = delegate.get_rows_data(&row_indices);
+            let (rows, binary_cells) = delegate
+                .get_rows_with_binary_cells(&row_indices)
+                .map_err(|error| error.to_string())?;
             if rows.is_empty() {
-                return None;
+                return Ok(None);
             }
 
             let columns = delegate
@@ -1310,13 +1563,15 @@ impl DataGrid {
                 .map(|column| column.name.clone())
                 .collect();
 
-            Some((columns, rows))
+            Ok(Some(ExportPayload {
+                columns,
+                rows,
+                binary_cells,
+            }))
         })
     }
 
-    fn normalize_query_result(
-        query_result: QueryResult,
-    ) -> (Vec<SharedString>, Vec<Vec<Option<String>>>) {
+    fn normalize_query_result(query_result: QueryResult) -> ExportPayload {
         if query_result.columns.first().map(|name| name.as_str()) == Some("__rowid__") {
             let columns = query_result
                 .columns
@@ -1329,18 +1584,41 @@ impl DataGrid {
                 .into_iter()
                 .map(|row| row.into_iter().skip(1).collect())
                 .collect();
-            (columns, rows)
+            let binary_cells = query_result
+                .binary_cells
+                .into_iter()
+                .filter_map(|cell| {
+                    cell.column_index
+                        .checked_sub(1)
+                        .map(|column_index| BinaryCell {
+                            row_index: cell.row_index,
+                            column_index,
+                            bytes: cell.bytes,
+                        })
+                })
+                .collect();
+            ExportPayload {
+                columns,
+                rows,
+                binary_cells,
+            }
         } else {
             let columns = query_result
                 .columns
                 .into_iter()
                 .map(SharedString::from)
                 .collect();
-            (columns, query_result.rows)
+            ExportPayload {
+                columns,
+                rows: query_result.rows,
+                binary_cells: query_result.binary_cells,
+            }
         }
     }
 
     fn load_data_with_sql(&self, sql: String, cx: &mut App) {
+        let expected_generation = self.data_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let data_generation = self.data_generation.clone();
         let global_state = cx.global::<GlobalDbState>().clone();
         let connection_id = self.config.connection_id.clone();
         let database_name = self.config.database_name.clone();
@@ -1361,15 +1639,15 @@ impl DataGrid {
                     )
                     .await?;
                 if editable {
-                    let column_meta = global_state
-                        .list_columns(
-                            cx,
-                            connection_id.clone(),
-                            database_name.clone(),
-                            schema_name.clone(),
-                            table_name.clone(),
-                        )
-                        .await?;
+                    let column_meta = list_columns_direct_on_runtime(
+                        cx,
+                        global_state.clone(),
+                        connection_id.clone(),
+                        database_name.clone(),
+                        schema_name.clone(),
+                        table_name.clone(),
+                    )
+                    .await?;
                     return Ok((sql_result, Some(column_meta)));
                 }
                 Ok((sql_result, None))
@@ -1378,12 +1656,18 @@ impl DataGrid {
 
             match result {
                 Err(err) => cx.update(|cx| {
+                    if !data_generation_is_current(&data_generation, expected_generation) {
+                        return;
+                    }
                     notification(
                         cx,
                         t!("TableDataGrid.execute_sql_failed", error = err.to_string()).to_string(),
                     );
                 }),
                 Ok(results) => {
+                    if !data_generation_is_current(&data_generation, expected_generation) {
+                        return;
+                    }
                     let (result, column_meta) = results;
                     if let SqlResult::Query(query_result) = result {
                         let binary_cells = query_result.binary_cells.clone();
@@ -1398,10 +1682,13 @@ impl DataGrid {
                             .map(|row| row.iter().cloned().collect())
                             .collect();
                         cx.update(|cx| {
+                            if !data_generation_is_current(
+                                &data_generation,
+                                expected_generation,
+                            ) {
+                                return;
+                            }
                             table.update(cx, |state, cx| {
-                                if let Some(columns) = column_meta {
-                                    state.delegate_mut().set_column_meta(columns);
-                                }
                                 state.delegate_mut().update_data_with_binary_cells(
                                     columns,
                                     rows,
@@ -1409,6 +1696,15 @@ impl DataGrid {
                                     binary_cells,
                                     cx,
                                 );
+                                if let Some(columns) = column_meta
+                                    && let Err(error) = state
+                                        .delegate_mut()
+                                        .reconcile_binary_cells_with_column_meta(columns)
+                                {
+                                    tracing::warn!(
+                                        "failed to reconcile refreshed SQL result binary cells with metadata: {error}"
+                                    );
+                                }
                                 state.refresh(cx);
                             });
                         })
@@ -1608,16 +1904,7 @@ impl DataGrid {
         let col_ix = selected_col_ix.checked_sub(1)?;
         let delegate = table.delegate();
         let actual_row_ix = delegate.resolve_display_row(display_row_ix)?;
-        if delegate.is_binary_cell(actual_row_ix, col_ix) {
-            return None;
-        }
-        let value = delegate
-            .rows
-            .get(actual_row_ix)
-            .and_then(|row| row.get(col_ix))
-            .cloned()
-            .flatten()
-            .unwrap_or_default();
+        let value = delegate.editable_cell_text(actual_row_ix, col_ix);
         let column_name = delegate
             .columns
             .get(col_ix)
@@ -1778,7 +2065,10 @@ impl DataGrid {
         let table = self.table.read(cx);
         let delegate = table.delegate();
 
-        let rows_data = delegate.get_rows_data(row_indices);
+        let row_indices = resolve_copy_row_indices(delegate, row_indices);
+        let Ok(rows_data) = delegate.get_typed_rows_data(&row_indices) else {
+            return String::new();
+        };
         if rows_data.is_empty() {
             return String::new();
         }
@@ -1793,7 +2083,7 @@ impl DataGrid {
         {
             Ok(plugin) => {
                 let mut request = CopySqlRequest::new(&self.config.table_name, columns_meta)
-                    .with_rows(rows_data)
+                    .with_typed_rows(rows_data)
                     .with_column_names(column_names);
                 if let Some(schema) = &self.config.schema_name {
                     request = request.with_schema(schema);
@@ -1811,7 +2101,10 @@ impl DataGrid {
         let table = self.table.read(cx);
         let delegate = table.delegate();
 
-        let rows_data = delegate.get_rows_data(row_indices);
+        let row_indices = resolve_copy_row_indices(delegate, row_indices);
+        let Ok(rows_data) = delegate.get_typed_rows_data(&row_indices) else {
+            return String::new();
+        };
         if rows_data.is_empty() {
             return String::new();
         }
@@ -1826,7 +2119,7 @@ impl DataGrid {
         {
             Ok(plugin) => {
                 let mut request = CopySqlRequest::new(&self.config.table_name, columns_meta)
-                    .with_rows(rows_data)
+                    .with_typed_rows(rows_data)
                     .with_column_names(column_names);
                 if let Some(schema) = &self.config.schema_name {
                     request = request.with_schema(schema);
@@ -1844,8 +2137,13 @@ impl DataGrid {
         let table = self.table.read(cx);
         let delegate = table.delegate();
 
-        let rows_data = delegate.get_rows_data(row_indices);
-        let original_rows = delegate.get_original_rows_data(row_indices);
+        let row_indices = resolve_copy_row_indices(delegate, row_indices);
+        let Ok(rows_data) = delegate.get_typed_rows_data(&row_indices) else {
+            return String::new();
+        };
+        let Ok(original_rows) = delegate.get_typed_original_rows_data(&row_indices) else {
+            return String::new();
+        };
         if rows_data.is_empty() {
             return String::new();
         }
@@ -1860,8 +2158,8 @@ impl DataGrid {
         {
             Ok(plugin) => {
                 let mut request = CopySqlRequest::new(&self.config.table_name, columns_meta)
-                    .with_rows(rows_data)
-                    .with_original_rows(original_rows)
+                    .with_typed_rows(rows_data)
+                    .with_typed_original_rows(original_rows)
                     .with_column_names(column_names);
                 if let Some(schema) = &self.config.schema_name {
                     request = request.with_schema(schema);
@@ -1879,8 +2177,11 @@ impl DataGrid {
         let table = self.table.read(cx);
         let delegate = table.delegate();
 
-        let rows_data = delegate.get_rows_data(row_indices);
-        if rows_data.is_empty() {
+        let row_indices = resolve_copy_row_indices(delegate, row_indices);
+        let Ok(original_rows) = delegate.get_typed_original_rows_data(&row_indices) else {
+            return String::new();
+        };
+        if original_rows.is_empty() {
             return String::new();
         }
 
@@ -1894,7 +2195,7 @@ impl DataGrid {
         {
             Ok(plugin) => {
                 let mut request = CopySqlRequest::new(&self.config.table_name, columns_meta)
-                    .with_rows(rows_data)
+                    .with_typed_original_rows(original_rows)
                     .with_column_names(column_names);
                 if let Some(schema) = &self.config.schema_name {
                     request = request.with_schema(schema);
@@ -2072,27 +2373,23 @@ impl DataGrid {
         cx.spawn(async move |cx: &mut AsyncApp| {
             let mut index_infos = vec![];
             if need_index_infos {
-                let index_infos_result = global_state
-                    .list_indexes(
-                        cx,
-                        connection_id.clone(),
-                        database_name.clone(),
-                        schema_name.clone(),
-                        table_name.clone(),
-                    )
-                    .await;
+                let index_infos_result = list_indexes_direct_on_runtime(
+                    cx,
+                    global_state.clone(),
+                    connection_id.clone(),
+                    database_name.clone(),
+                    schema_name.clone(),
+                    table_name.clone(),
+                )
+                .await;
                 index_infos = match index_infos_result {
                     Ok(infos) => infos,
                     Err(err) => {
                         cx.update(|cx| {
-                            notification(
-                                cx,
-                                t!(
-                                    "TableDataGrid.get_table_keys_failed",
-                                    error = err.to_string()
-                                )
-                                .to_string(),
-                            );
+                            let error = err.to_string();
+                            let summary = t!("TableDataGrid.get_table_keys_failed", error = error)
+                                .to_string();
+                            notification(cx, summary);
                         });
                         return;
                     }
@@ -2125,7 +2422,9 @@ impl DataGrid {
             let (sql_content, change_count) = match save_result {
                 Ok((sql, count)) => (sql, count),
                 Err(msg) => {
-                    cx.update(|cx| notification(cx, msg));
+                    cx.update(|cx| {
+                        notification(cx, msg);
+                    });
                     return;
                 }
             };
@@ -2150,33 +2449,35 @@ impl DataGrid {
 
             cx.update(|cx| match result {
                 Ok(results) => {
-                    if let Some(err_msg) = results.iter().find_map(|res| match res {
-                        SqlResult::Error(err) => Some(err.message.clone()),
-                        _ => None,
-                    }) {
-                        notification(
-                            cx,
-                            t!("TableDataGrid.save_changes_failed", error = err_msg).to_string(),
-                        );
-                    } else {
-                        this.clear_changes(cx);
-                        notification(
-                            cx,
+                    let sql = sql_content.clone();
+                    let first_error = first_execution_error(&results).map(str::to_owned);
+                    let succeeded = first_error.is_none();
+                    this.record_execution_results(sql, &results, cx);
+                    let summary = first_error
+                        .map(|error| {
+                            t!("TableDataGrid.save_changes_failed", error = error).to_string()
+                        })
+                        .unwrap_or_else(|| {
                             t!("TableDataGrid.save_changes_success", count = change_count)
-                                .to_string(),
-                        );
+                                .to_string()
+                        });
+
+                    if succeeded {
+                        this.clear_changes(cx);
                         let _ = cx.update_window(window_handle, |_, window, cx| {
                             tab_container.update(cx, |container, cx| {
                                 container.force_close_tab_by_id(&tab_id, window, cx);
                             });
                         });
                     }
+                    notification(cx, summary);
                 }
-                Err(e) => {
-                    notification(
-                        cx,
-                        t!("TableDataGrid.save_changes_failed", error = e.to_string()).to_string(),
-                    );
+                Err(error) => {
+                    let error = error.to_string();
+                    let summary =
+                        t!("TableDataGrid.save_changes_failed", error = error).to_string();
+                    this.record_execution_failure(error, Some(sql_content), cx);
+                    notification(cx, summary);
                 }
             });
         })
@@ -2205,27 +2506,23 @@ impl DataGrid {
         cx.spawn(async move |cx: &mut AsyncApp| {
             let mut index_infos = vec![];
             if need_index_infos {
-                let index_infos_result = global_state
-                    .list_indexes(
-                        cx,
-                        connection_id.clone(),
-                        database_name.clone(),
-                        schema_name.clone(),
-                        table_name.clone(),
-                    )
-                    .await;
+                let index_infos_result = list_indexes_direct_on_runtime(
+                    cx,
+                    global_state.clone(),
+                    connection_id.clone(),
+                    database_name.clone(),
+                    schema_name.clone(),
+                    table_name.clone(),
+                )
+                .await;
                 index_infos = match index_infos_result {
                     Ok(infos) => infos,
                     Err(err) => {
                         cx.update(|cx| {
-                            notification(
-                                cx,
-                                t!(
-                                    "TableDataGrid.get_table_keys_failed",
-                                    error = err.to_string()
-                                )
-                                .to_string(),
-                            );
+                            let error = err.to_string();
+                            let summary = t!("TableDataGrid.get_table_keys_failed", error = error)
+                                .to_string();
+                            notification(cx, summary);
                         });
                         return;
                     }
@@ -2258,7 +2555,9 @@ impl DataGrid {
             let (sql_content, change_count) = match save_result {
                 Ok((sql, count)) => (sql, count),
                 Err(msg) => {
-                    cx.update(|cx| notification(cx, msg));
+                    cx.update(|cx| {
+                        notification(cx, msg);
+                    });
                     return;
                 }
             };
@@ -2283,28 +2582,30 @@ impl DataGrid {
 
             cx.update(|cx| match result {
                 Ok(results) => {
-                    if let Some(err_msg) = results.iter().find_map(|res| match res {
-                        SqlResult::Error(err) => Some(err.message.clone()),
-                        _ => None,
-                    }) {
-                        notification(
-                            cx,
-                            t!("TableDataGrid.save_changes_failed", error = err_msg).to_string(),
-                        );
-                    } else {
-                        this.clear_changes_and_refresh(cx);
-                        notification(
-                            cx,
+                    let sql = sql_content.clone();
+                    let first_error = first_execution_error(&results).map(str::to_owned);
+                    let succeeded = first_error.is_none();
+                    this.record_execution_results(sql, &results, cx);
+                    let summary = first_error
+                        .map(|error| {
+                            t!("TableDataGrid.save_changes_failed", error = error).to_string()
+                        })
+                        .unwrap_or_else(|| {
                             t!("TableDataGrid.save_changes_success", count = change_count)
-                                .to_string(),
-                        );
+                                .to_string()
+                        });
+
+                    if succeeded {
+                        this.clear_changes_and_refresh(cx);
                     }
+                    notification(cx, summary);
                 }
-                Err(e) => {
-                    notification(
-                        cx,
-                        t!("TableDataGrid.save_changes_failed", error = e.to_string()).to_string(),
-                    );
+                Err(error) => {
+                    let error = error.to_string();
+                    let summary =
+                        t!("TableDataGrid.save_changes_failed", error = error).to_string();
+                    this.record_execution_failure(error, Some(sql_content), cx);
+                    notification(cx, summary);
                 }
             });
         })
@@ -2333,27 +2634,23 @@ impl DataGrid {
         cx.spawn(async move |cx: &mut AsyncApp| {
             let mut index_infos = vec![];
             if need_index_infos {
-                let index_infos_result = global_state
-                    .list_indexes(
-                        cx,
-                        connection_id.clone(),
-                        database_name.clone(),
-                        schema_name.clone(),
-                        table_name.clone(),
-                    )
-                    .await;
+                let index_infos_result = list_indexes_direct_on_runtime(
+                    cx,
+                    global_state,
+                    connection_id,
+                    database_name,
+                    schema_name,
+                    table_name,
+                )
+                .await;
                 index_infos = match index_infos_result {
                     Ok(index_infos) => index_infos,
                     Err(err) => {
                         cx.update(|cx| {
-                            notification(
-                                cx,
-                                t!(
-                                    "TableDataGrid.get_table_keys_failed",
-                                    error = err.to_string()
-                                )
-                                .to_string(),
-                            );
+                            let error = err.to_string();
+                            let summary = t!("TableDataGrid.get_table_keys_failed", error = error)
+                                .to_string();
+                            notification(cx, summary);
                         });
                         return;
                     }
@@ -2455,7 +2752,7 @@ impl DataGrid {
         connection_id: String,
         database_name: String,
         cx: &mut AsyncApp,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<SqlResult>, String> {
         let exec_options = ExecOptions {
             stop_on_error: true,
             transactional: true,
@@ -2463,30 +2760,17 @@ impl DataGrid {
             streaming: false,
         };
 
-        let result = global_state
+        global_state
             .execute_script(
                 cx,
-                connection_id.clone(),
-                sql.clone(),
-                Some(database_name.clone()),
+                connection_id,
+                sql,
+                Some(database_name),
                 None,
                 Some(exec_options),
             )
-            .await;
-
-        match result {
-            Ok(results) => {
-                if let Some(err_msg) = results.iter().find_map(|res| match res {
-                    SqlResult::Error(err) => Some(err.message.clone()),
-                    _ => None,
-                }) {
-                    Err(t!("TableDataGrid.execute_failed", error = err_msg).to_string())
-                } else {
-                    Ok(())
-                }
-            }
-            Err(e) => Err(t!("TableDataGrid.execute_failed", error = e).to_string()),
-        }
+            .await
+            .map_err(|error| error.to_string())
     }
 
     fn execute_sql_and_refresh(
@@ -2501,6 +2785,7 @@ impl DataGrid {
         let data_grid = self.clone();
 
         cx.spawn(async move |cx: &mut AsyncApp| {
+            let executed_sql = sql.clone();
             match Self::execute_sql_and_refresh_async(
                 sql,
                 global_state,
@@ -2510,27 +2795,33 @@ impl DataGrid {
             )
             .await
             {
-                Ok(_) => {
+                Ok(results) => {
                     cx.update(|cx| {
-                        if let Some(window_id) = cx.active_window() {
-                            let _ = cx.update_window(window_id, |_entity, window, cx| {
-                                data_grid.clear_changes_and_refresh(cx);
-                                window.close_dialog(cx);
-                                window.push_notification(
-                                    t!("TableDataGrid.execute_success").to_string(),
-                                    cx,
-                                );
-                            });
+                        let first_error = first_execution_error(&results).map(str::to_owned);
+                        let succeeded = first_error.is_none();
+                        data_grid.record_execution_results(executed_sql.clone(), &results, cx);
+                        let summary = first_error
+                            .map(|error| {
+                                t!("TableDataGrid.execute_failed", error = error).to_string()
+                            })
+                            .unwrap_or_else(|| t!("TableDataGrid.execute_success").to_string());
+
+                        if succeeded {
+                            data_grid.clear_changes_and_refresh(cx);
+                            if let Some(window_id) = cx.active_window() {
+                                let _ = cx.update_window(window_id, |_entity, window, cx| {
+                                    window.close_dialog(cx);
+                                });
+                            }
                         }
+                        notification(cx, summary);
                     });
                 }
-                Err(error_msg) => {
+                Err(error) => {
                     cx.update(|cx| {
-                        if let Some(window_id) = cx.active_window() {
-                            let _ = cx.update_window(window_id, |_entity, window, cx| {
-                                window.push_notification(error_msg, cx);
-                            });
-                        }
+                        let summary = t!("TableDataGrid.execute_failed", error = error).to_string();
+                        data_grid.record_execution_failure(error, Some(executed_sql), cx);
+                        notification(cx, summary);
                     });
                 }
             }
@@ -2977,6 +3268,7 @@ impl Render for DataGrid {
                 div()
                     .flex_1()
                     .w_full()
+                    .h_full()
                     .overflow_hidden()
                     .child(self.render_table_area(window, cx)),
             )
@@ -3000,7 +3292,9 @@ impl Clone for DataGrid {
             _filter_sub: None,
             search_input: self.search_input.clone(),
             _search_sub: None,
+            execution_history: self.execution_history.clone(),
             is_large_text_editor_sidebar_open: self.is_large_text_editor_sidebar_open,
+            data_generation: self.data_generation.clone(),
         }
     }
 }
@@ -3024,12 +3318,14 @@ pub fn notification(cx: &mut App, error: String) {
 mod tests {
     use super::{
         DataGrid, ExportFormat, LargeTextEditorRoute, TableMetadata, build_header_order_by_clause,
-        build_large_text_editor_title, collect_delete_row_indices, query_result_for_export,
-        resolve_large_text_editor_route, result_set_export_exec_options, table_has_unsaved_changes,
+        build_large_text_editor_title, collect_delete_row_indices, data_generation_is_current,
+        query_result_for_export, resolve_large_text_editor_route, result_set_export_exec_options,
+        table_has_unsaved_changes,
     };
     use crate::table_data::results_delegate::{CellChange, RowChange};
     use db::{
-        DbManager, ExecResult, QueryResult, SqlErrorInfo, SqlResult, TableCellValue, TableRowChange,
+        BinaryCell, ColumnInfo, DbManager, ExecResult, QueryResult, SqlErrorInfo, SqlResult,
+        TableCellValue, TableRowChange,
     };
     use gpui::SharedString;
     use one_core::settings::LargeTextCellEditorOpenMode;
@@ -3037,7 +3333,18 @@ mod tests {
     use one_ui::edit_table::ColumnSort;
     use rust_i18n::t;
     use std::io::{Cursor, Read};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use zip::ZipArchive;
+
+    #[test]
+    fn data_generation_rejects_stale_async_callbacks() {
+        let generation = AtomicU64::new(7);
+
+        assert!(data_generation_is_current(&generation, 7));
+        generation.fetch_add(1, Ordering::AcqRel);
+        assert!(!data_generation_is_current(&generation, 7));
+        assert!(data_generation_is_current(&generation, 8));
+    }
 
     fn sample_export_input() -> (Vec<Vec<Option<String>>>, Vec<SharedString>, TableMetadata) {
         let rows = vec![vec![
@@ -3069,9 +3376,59 @@ mod tests {
 
     #[test]
     fn query_result_export_preserves_all_rows() {
-        let (_, rows) =
+        let payload =
             query_result_for_export(vec![SqlResult::Query(sample_query_result(1001))]).unwrap();
-        assert_eq!(1001, rows.len());
+        assert_eq!(1001, payload.rows.len());
+        assert!(payload.binary_cells.is_empty());
+    }
+
+    #[test]
+    fn query_result_export_preserves_binary_sidecar() {
+        let mut result = sample_query_result(1);
+        result.rows[0][0] = Some("wrong".to_string());
+        result.binary_cells = vec![BinaryCell {
+            row_index: 0,
+            column_index: 0,
+            bytes: vec![1, 2, 3],
+        }];
+
+        let payload = query_result_for_export(vec![SqlResult::Query(result)]).unwrap();
+
+        assert_eq!(payload.rows, vec![vec![Some("wrong".to_string())]]);
+        assert_eq!(payload.binary_cells.len(), 1);
+        assert_eq!(payload.binary_cells[0].bytes, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn normalize_query_result_remaps_binary_sidecar_after_rowid_column() {
+        let result = QueryResult {
+            sql: "select __rowid__, payload from sample".to_string(),
+            columns: vec!["__rowid__".to_string(), "payload".to_string()],
+            column_meta: vec![],
+            rows: vec![vec![Some("row-1".to_string()), Some("wrong".to_string())]],
+            binary_cells: vec![
+                BinaryCell {
+                    row_index: 0,
+                    column_index: 0,
+                    bytes: vec![0xaa],
+                },
+                BinaryCell {
+                    row_index: 0,
+                    column_index: 1,
+                    bytes: vec![1, 2, 3],
+                },
+            ],
+            elapsed_ms: 0,
+        };
+
+        let payload = DataGrid::normalize_query_result(result);
+
+        assert_eq!(payload.columns, vec![SharedString::from("payload")]);
+        assert_eq!(payload.rows, vec![vec![Some("wrong".to_string())]]);
+        assert_eq!(payload.binary_cells.len(), 1);
+        assert_eq!(payload.binary_cells[0].row_index, 0);
+        assert_eq!(payload.binary_cells[0].column_index, 0);
+        assert_eq!(payload.binary_cells[0].bytes, vec![1, 2, 3]);
     }
 
     #[test]
@@ -3328,9 +3685,18 @@ mod tests {
     fn build_export_bytes_creates_zip_based_xlsx_payload() {
         let (rows, columns, metadata) = sample_export_input();
 
-        let bytes = super::build_export_bytes(ExportFormat::Xlsx, rows, columns, metadata)
-            .expect("xlsx export should build successfully")
-            .expect("xlsx export should produce bytes");
+        let bytes = super::build_export_bytes(
+            ExportFormat::Xlsx,
+            super::ExportBuildInput {
+                rows,
+                binary_cells: vec![],
+                columns,
+                metadata,
+                plugin: None,
+            },
+        )
+        .expect("xlsx export should build successfully")
+        .expect("xlsx export should produce bytes");
 
         assert!(bytes.starts_with(b"PK"));
         let sheet_xml = read_xlsx_entry(&bytes, "xl/worksheets/sheet1.xml");
@@ -3341,9 +3707,18 @@ mod tests {
     fn build_export_bytes_preserves_newlines_in_xlsx_cells() {
         let (rows, columns, metadata) = sample_export_input();
 
-        let bytes = super::build_export_bytes(ExportFormat::Xlsx, rows, columns, metadata)
-            .expect("xlsx export should build successfully")
-            .expect("xlsx export should produce bytes");
+        let bytes = super::build_export_bytes(
+            ExportFormat::Xlsx,
+            super::ExportBuildInput {
+                rows,
+                binary_cells: vec![],
+                columns,
+                metadata,
+                plugin: None,
+            },
+        )
+        .expect("xlsx export should build successfully")
+        .expect("xlsx export should produce bytes");
 
         let shared_strings = read_xlsx_entry(&bytes, "xl/sharedStrings.xml");
         assert!(
@@ -3361,9 +3736,13 @@ mod tests {
 
         let csv = super::build_export_bytes(
             ExportFormat::Csv,
-            rows.clone(),
-            columns.clone(),
-            metadata.clone(),
+            super::ExportBuildInput {
+                rows: rows.clone(),
+                binary_cells: vec![],
+                columns: columns.clone(),
+                metadata: metadata.clone(),
+                plugin: None,
+            },
         )
         .expect("CSV export should build")
         .expect("CSV export should produce bytes");
@@ -3372,13 +3751,150 @@ mod tests {
             "nullable,empty,literal\n\\N,\"\",NULL"
         );
 
-        let sql = super::build_export_bytes(ExportFormat::InsertSql, rows, columns, metadata)
-            .expect("SQL export should build")
-            .expect("SQL export should produce bytes");
+        let sql = super::build_export_bytes(
+            ExportFormat::InsertSql,
+            super::ExportBuildInput {
+                rows,
+                binary_cells: vec![],
+                columns,
+                metadata,
+                plugin: None,
+            },
+        )
+        .expect("SQL export should build")
+        .expect("SQL export should produce bytes");
         assert!(
             String::from_utf8(sql)
                 .expect("SQL is UTF-8")
                 .contains("(NULL, '', 'NULL')")
+        );
+    }
+
+    #[test]
+    fn build_export_bytes_uses_mysql_bit_literal() {
+        let plugin = DbManager::default()
+            .get_plugin(&DatabaseType::MySQL)
+            .expect("MySQL plugin should exist");
+        let rows = vec![vec![Some("1".to_string()), Some("1".to_string())]];
+        let columns = vec!["id".into(), "bit_name".into()];
+        let metadata = TableMetadata::new("test_bit")
+            .with_columns(columns.clone())
+            .with_column_meta(vec![
+                ColumnInfo {
+                    name: "id".to_string(),
+                    data_type: "INT".to_string(),
+                    is_nullable: false,
+                    is_primary_key: true,
+                    default_value: None,
+                    comment: None,
+                    charset: None,
+                    collation: None,
+                },
+                ColumnInfo {
+                    name: "bit_name".to_string(),
+                    data_type: "BIT(1)".to_string(),
+                    is_nullable: false,
+                    is_primary_key: false,
+                    default_value: None,
+                    comment: None,
+                    charset: None,
+                    collation: None,
+                },
+            ]);
+
+        let sql = super::build_export_bytes(
+            ExportFormat::InsertSql,
+            super::ExportBuildInput {
+                rows,
+                binary_cells: vec![],
+                columns,
+                metadata,
+                plugin: Some(plugin),
+            },
+        )
+        .expect("SQL export should build")
+        .expect("SQL export should produce bytes");
+
+        assert_eq!(
+            String::from_utf8(sql).expect("SQL is UTF-8"),
+            "INSERT INTO `test_bit` (`id`, `bit_name`) VALUES\n(1, 1);"
+        );
+    }
+
+    #[test]
+    fn build_export_bytes_uses_binary_sidecar_for_csv_xlsx_and_sql() {
+        let rows = vec![vec![Some("wrong".to_string()), None]];
+        let columns = vec![
+            SharedString::from("payload"),
+            SharedString::from("empty_payload"),
+        ];
+        let metadata =
+            TableMetadata::new("binary_values").with_columns(vec!["payload", "empty_payload"]);
+        let binary_cells = vec![
+            BinaryCell {
+                row_index: 0,
+                column_index: 0,
+                bytes: vec![1, 2, 3],
+            },
+            BinaryCell {
+                row_index: 0,
+                column_index: 1,
+                bytes: vec![],
+            },
+        ];
+
+        let csv = super::build_export_bytes(
+            ExportFormat::Csv,
+            super::ExportBuildInput {
+                rows: rows.clone(),
+                binary_cells: binary_cells.clone(),
+                columns: columns.clone(),
+                metadata: metadata.clone(),
+                plugin: None,
+            },
+        )
+        .expect("CSV export should build")
+        .expect("CSV export should produce bytes");
+        assert_eq!(
+            String::from_utf8(csv).expect("CSV is UTF-8"),
+            "payload,empty_payload\nbase64:AQID,base64:"
+        );
+
+        let xlsx = super::build_export_bytes(
+            ExportFormat::Xlsx,
+            super::ExportBuildInput {
+                rows: rows.clone(),
+                binary_cells: binary_cells.clone(),
+                columns: columns.clone(),
+                metadata: metadata.clone(),
+                plugin: None,
+            },
+        )
+        .expect("XLSX export should build")
+        .expect("XLSX export should produce bytes");
+        let shared_strings = read_xlsx_entry(&xlsx, "xl/sharedStrings.xml");
+        assert!(shared_strings.contains("base64:AQID"), "{shared_strings}");
+        assert!(shared_strings.contains("base64:"), "{shared_strings}");
+        assert!(!shared_strings.contains("wrong"), "{shared_strings}");
+
+        let plugin = DbManager::default()
+            .get_plugin(&DatabaseType::MySQL)
+            .expect("MySQL plugin should exist");
+        let sql = super::build_export_bytes(
+            ExportFormat::InsertSql,
+            super::ExportBuildInput {
+                rows,
+                binary_cells,
+                columns,
+                metadata,
+                plugin: Some(plugin),
+            },
+        )
+        .expect("SQL export should build")
+        .expect("SQL export should produce bytes");
+        assert_eq!(
+            String::from_utf8(sql).expect("SQL is UTF-8"),
+            "INSERT INTO `binary_values` (`payload`, `empty_payload`) VALUES\n(X'010203', X'');"
         );
     }
 }

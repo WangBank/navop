@@ -6,11 +6,12 @@ use super::render_surface::{
 };
 use super::tab_content::recording_playback_tab_title;
 use super::terminal_layout::terminal_grid_size;
+use super::workspace_support::map_connection_status;
 use super::{
     TERMINAL_RESET_FONT_SIZE, TERMINAL_TOOLS_SIDEBAR_DEFAULT_WIDTH, TerminalDuplicateSource,
     UnbracketedPasteHazard, WrappedLineSegment, block_selection_text_from_rows,
     clipboard_image_from_item, detect_unbracketed_paste_hazard, encode_mouse_modifiers,
-    has_trailing_line_continuation, has_unterminated_shell_quote, history_prompt_available,
+    has_unterminated_shell_quote, history_prompt_available,
     history_prompt_dropdown_origin, history_prompt_overlay_bounds, live_ssh_feature_supported,
     live_terminal_input_supported, mouse_button_code, multiline_non_empty_line_count,
     recording_playback_display_name, remote_clipboard_image_path, resolve_ssh_reconnect_source,
@@ -24,7 +25,8 @@ use super::{
     should_start_block_selection, should_start_selection_from_pending_sgr_press,
     should_upload_clipboard_image_to_remote_cli, take_whole_scroll_lines,
     terminal_duplicate_source_with_cwd, terminal_history_scope, terminal_paste_bytes,
-    terminal_tab_duplicate_supported, wrapped_addon_line_text,
+    terminal_selection_autoscroll_delta_rows, terminal_tab_duplicate_supported,
+    wrapped_addon_line_text,
 };
 use crate::history_prompt::{HistoryPromptAccept, HistoryPromptState};
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
@@ -38,6 +40,7 @@ use terminal::LocalConfig;
 use terminal::terminal::{ConnectionState, TerminalConnectionKind, TerminalModelEvent};
 
 mod capabilities;
+mod connection_status;
 mod core;
 mod history_availability;
 mod history_interaction;

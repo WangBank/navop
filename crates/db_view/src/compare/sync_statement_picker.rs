@@ -2,15 +2,16 @@ use std::collections::HashSet;
 
 use db::compare::{SyncPlan, SyncStatement, SyncStatementKind};
 use gpui::{
-    App, AppContext, Context, Entity, IntoElement, ParentElement, Styled, Task, Window, div,
-    prelude::FluentBuilder, px,
+    App, AppContext, ColorExt, Context, Entity, InteractiveElement, IntoElement, ParentElement,
+    Styled, Task, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
-    ActiveTheme, IndexPath, Sizable, StyledExt,
+    ActiveTheme, ContentState, IconName, IndexPath, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
     h_flex,
     list::{List, ListDelegate, ListItem, ListState},
+    scroll::ScrollableElement,
     tag::Tag,
     v_flex,
 };
@@ -18,7 +19,61 @@ use rust_i18n::t;
 
 pub(super) type SyncStatementListState = Entity<ListState<SyncStatementListDelegate>>;
 
-const SYNC_STATEMENT_ROW_HEIGHT: f32 = 54.0;
+const SYNC_STATEMENT_ROW_HEIGHT: f32 = 74.0;
+
+pub(super) fn sync_statement_empty_picker(cx: &App) -> impl IntoElement {
+    v_flex()
+        .flex_1()
+        .min_h_0()
+        .gap_1()
+        .child(
+            div()
+                .text_sm()
+                .font_semibold()
+                .child(t!("Compare.sync_statements").to_string()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .h_full()
+                .min_h_0()
+                .min_w_0()
+                .border_1()
+                .border_color(cx.theme().border)
+                .rounded_md()
+                .overflow_hidden()
+                .child(
+                    ContentState::empty(t!("Compare.no_sync_statements").to_string())
+                        .icon(IconName::File)
+                        .detail(t!("Compare.sync_statements_empty_detail").to_string())
+                        .compact(),
+                ),
+        )
+}
+
+/// Immutable execution input derived from a sync plan and the selected statement ids.
+///
+/// The SQL preview editor is intentionally not part of this snapshot. It may contain
+/// user edits, while execution safety and destructive confirmation must use the same
+/// structured statements that were selected from the generated plan.
+#[derive(Clone, Debug)]
+pub(super) struct SyncExecutionSnapshot {
+    pub plan_id: String,
+    pub statements: Vec<SyncStatement>,
+    pub sql: String,
+}
+
+impl SyncExecutionSnapshot {
+    pub(super) fn is_empty(&self) -> bool {
+        self.statements.is_empty() || self.sql.trim().is_empty()
+    }
+
+    pub(super) fn is_destructive(&self) -> bool {
+        self.statements
+            .iter()
+            .any(|statement| statement.destructive)
+    }
+}
 
 pub(super) fn sync_statement_list_state<T: 'static>(
     selected_ids: Entity<HashSet<String>>,
@@ -63,12 +118,29 @@ pub(super) fn selected_sync_sql_text_for_ids(
     plan: &SyncPlan,
     selected_ids: &HashSet<String>,
 ) -> String {
-    plan.statements
+    selected_sync_execution_snapshot(plan, selected_ids).sql
+}
+
+pub(super) fn selected_sync_execution_snapshot(
+    plan: &SyncPlan,
+    selected_ids: &HashSet<String>,
+) -> SyncExecutionSnapshot {
+    let statements = plan
+        .statements
         .iter()
         .filter(|statement| selected_ids.contains(&statement.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let sql = statements
+        .iter()
         .map(|statement| statement.sql.as_str())
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    SyncExecutionSnapshot {
+        plan_id: plan.id.clone(),
+        statements,
+        sql,
+    }
 }
 
 pub(super) fn selected_sync_sql_summary_for_ids(
@@ -97,6 +169,7 @@ pub(super) fn sync_statement_picker(
     plan: SyncPlan,
     selected_ids: Entity<HashSet<String>>,
     list_state: SyncStatementListState,
+    warnings_expanded: Entity<bool>,
     cx: &App,
 ) -> impl IntoElement {
     let all_ids: Vec<String> = plan.statements.iter().map(|s| s.id.clone()).collect();
@@ -106,12 +179,22 @@ pub(super) fn sync_statement_picker(
         .filter(|s| !s.destructive)
         .map(|s| s.id.clone())
         .collect();
+    let plan_warnings = plan.warnings.clone();
+    let warnings_are_expanded = *warnings_expanded.read(cx);
 
     v_flex()
         .flex_1()
         .min_h_0()
         .gap_1()
         .child(picker_header(all_ids, safe_ids, selected_ids.clone()))
+        .when(!plan_warnings.is_empty(), |this| {
+            this.child(sync_plan_warnings_panel(
+                plan_warnings,
+                warnings_are_expanded,
+                warnings_expanded,
+                cx,
+            ))
+        })
         .child(
             v_flex()
                 .flex_1()
@@ -122,6 +205,71 @@ pub(super) fn sync_statement_picker(
                 .overflow_hidden()
                 .child(List::new(&list_state).size_full()),
         )
+}
+
+fn sync_plan_warnings_panel(
+    warnings: Vec<String>,
+    expanded: bool,
+    expanded_state: Entity<bool>,
+    cx: &App,
+) -> impl IntoElement {
+    let warning_count = warnings.len();
+
+    v_flex()
+        .id("sync-plan-warnings")
+        .flex_none()
+        .gap_1()
+        .p_1()
+        .border_1()
+        .border_color(cx.theme().warning.opacity(0.45))
+        .rounded_md()
+        .bg(cx.theme().warning.opacity(0.08))
+        .child(
+            h_flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    Button::new("toggle-sync-plan-warnings")
+                        .icon(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .xsmall()
+                        .ghost()
+                        .on_click(move |_, _, cx| {
+                            expanded_state.update(cx, |expanded, cx| {
+                                *expanded = !*expanded;
+                                cx.notify();
+                            });
+                        }),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .font_semibold()
+                        .text_color(cx.theme().warning)
+                        .child(t!("Compare.sync_plan_warnings", count = warning_count).to_string()),
+                ),
+        )
+        .when(expanded, |this| {
+            this.child(
+                v_flex()
+                    .id("sync-plan-warning-details")
+                    .max_h(px(112.0))
+                    .gap_1()
+                    .px_2()
+                    .pb_1()
+                    .overflow_y_scrollbar()
+                    .children(warnings.into_iter().enumerate().map(|(index, warning)| {
+                        div()
+                            .id(("sync-plan-warning", index))
+                            .text_xs()
+                            .text_color(cx.theme().warning)
+                            .child(warning)
+                    })),
+            )
+        })
 }
 
 fn picker_header(
@@ -235,14 +383,11 @@ impl ListDelegate for SyncStatementListDelegate {
     fn render_empty(
         &mut self,
         _window: &mut Window,
-        cx: &mut Context<ListState<Self>>,
+        _cx: &mut Context<ListState<Self>>,
     ) -> impl IntoElement {
-        div()
-            .size_full()
-            .p_3()
-            .text_sm()
-            .text_color(cx.theme().muted_foreground)
-            .child(t!("Compare.no_sync_statements").to_string())
+        ContentState::empty(t!("Compare.no_sync_statements").to_string())
+            .icon(IconName::File)
+            .compact()
     }
 
     fn perform_search(
@@ -278,6 +423,7 @@ fn statement_row(
         .unwrap_or_else(|| t!("Compare.unnamed_object").to_string());
     let destructive = statement.destructive;
     let sql_preview = sql_preview(&statement.sql);
+    let warnings = statement.warnings.join(" · ");
 
     let row = h_flex()
         .w_full()
@@ -310,6 +456,13 @@ fn statement_row(
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(sql_preview),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_xs()
+                        .text_color(cx.theme().warning)
+                        .child(warnings),
                 ),
         );
 

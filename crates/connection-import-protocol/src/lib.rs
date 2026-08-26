@@ -23,12 +23,15 @@ mod tests {
                 host: "prod.example.com".to_string(),
                 port: Some(22),
                 username: "root".to_string(),
+                group_path: None,
                 auth_method: SshImportAuthMethod::Agent,
                 init_script: None,
                 jump_server: None,
                 proxy: None,
             }),
             port_forwarding: None,
+            quick_command: None,
+            workspace: None,
             password_status: PasswordImportStatus::Unsupported,
             warnings: Vec::new(),
         };
@@ -60,6 +63,8 @@ mod tests {
             }),
             ssh: None,
             port_forwarding: None,
+            quick_command: None,
+            workspace: None,
             password_status: PasswordImportStatus::Unsupported,
             warnings: Vec::new(),
         };
@@ -78,5 +83,22 @@ mod tests {
         let decoded: PasswordImportStatus = serde_json::from_str(&json).unwrap();
 
         assert_eq!(status, decoded);
+    }
+
+    #[test]
+    fn importer_capabilities_defaults_manual_directory_fields() {
+        let decoded: ImporterCapabilities = serde_json::from_str(
+            r#"{
+                "supports_scan": true,
+                "supports_password_import": false,
+                "supports_manual_file_pick": true,
+                "manual_file_pick_prompt": "Choose a configuration file",
+                "supports_incremental_preview": false
+            }"#,
+        )
+        .unwrap();
+
+        assert!(!decoded.supports_manual_directory_pick);
+        assert!(decoded.manual_directory_pick_prompt.is_none());
     }
 }

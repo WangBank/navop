@@ -7,6 +7,7 @@ use one_core::storage::{CredentialReference, CredentialSummary};
 use super::{
     CredentialCapabilities, CredentialField, CredentialPickerConfig, CredentialReferencePicker,
     CredentialSelectValue, create_credential_picker, create_credential_picker_with_summaries,
+    reference_is_unavailable,
 };
 
 struct PickerTestRoot {
@@ -23,12 +24,12 @@ fn summary() -> CredentialSummary {
     CredentialSummary {
         id: 42,
         name: "Production".to_string(),
-        kind: "SSH".to_string(),
         username: Some("root".to_string()),
         has_password: true,
         has_private_key_path: true,
         has_private_key_content: false,
         has_passphrase: true,
+        has_ssh_expect: false,
         sync_enabled: false,
         cloud_id: None,
         last_synced_at: None,
@@ -91,12 +92,35 @@ fn picker_selection_and_fields_follow_the_reference_contract(cx: &mut TestAppCon
         let picker = form.read(cx).picker.clone();
         picker.update(cx, |picker, cx| {
             picker.select_value(CredentialSelectValue::Credential(42), cx);
-            picker.select_field(CredentialField::PrivateKey, true, cx);
         });
         let picker = form.read(cx).picker.read(cx);
-        assert!(picker.field_referenced(CredentialField::PrivateKey));
-        assert!(picker.field_referenced(CredentialField::Passphrase));
-        assert!(!picker.field_referenced(CredentialField::Password));
+        assert!(picker.field_referenced(CredentialField::Username));
+        assert!(picker.field_referenced(CredentialField::Password));
+        assert!(!picker.field_referenced(CredentialField::PrivateKey));
+        assert!(!picker.field_referenced(CredentialField::Passphrase));
+    });
+}
+
+#[gpui::test]
+fn selecting_manual_clears_the_whole_reference(cx: &mut TestAppContext) {
+    let form = with_picker(cx, |window, cx| {
+        create_credential_picker_with_summaries(
+            CredentialPickerConfig::new("credential-test", CredentialCapabilities::login()),
+            vec![summary()],
+            window,
+            cx,
+        )
+    });
+
+    cx.update(|cx| {
+        let picker = form.read(cx).picker.clone();
+        picker.update(cx, |picker, cx| {
+            picker.select_value(CredentialSelectValue::Credential(42), cx);
+            picker.select_value(CredentialSelectValue::Manual, cx);
+        });
+        let picker = form.read(cx).picker.read(cx);
+        assert_eq!(None, picker.selected_reference());
+        assert_eq!(CredentialSelectValue::Manual, picker.selected_value());
     });
 }
 
@@ -104,6 +128,7 @@ fn picker_selection_and_fields_follow_the_reference_contract(cx: &mut TestAppCon
 fn capability_changes_normalize_existing_references(cx: &mut TestAppContext) {
     let reference = CredentialReference {
         credential_id: 42,
+        credential_cloud_id: None,
         username: true,
         password: true,
         private_key: false,
@@ -132,8 +157,60 @@ fn capability_changes_normalize_existing_references(cx: &mut TestAppContext) {
 
 #[test]
 fn picker_source_never_reads_plaintext_credentials() {
-    let source = include_str!("picker.rs");
+    let source = concat!(include_str!("picker.rs"), include_str!("repository.rs"),);
 
     assert!(source.contains("list_summaries"));
     assert!(!source.contains("get_plaintext"));
+}
+
+#[test]
+fn missing_local_reference_is_reported_as_unavailable() {
+    let reference = CredentialReference {
+        credential_id: 99,
+        credential_cloud_id: None,
+        username: true,
+        password: true,
+        private_key: false,
+        passphrase: false,
+    };
+
+    assert!(reference_is_unavailable(&reference, &[summary()]));
+}
+
+#[test]
+fn missing_cloud_reference_does_not_match_a_colliding_local_id() {
+    let reference = CredentialReference {
+        credential_id: 42,
+        credential_cloud_id: Some("missing-cloud-id".to_string()),
+        username: true,
+        password: true,
+        private_key: false,
+        passphrase: false,
+    };
+
+    assert!(reference_is_unavailable(&reference, &[summary()]));
+}
+
+#[test]
+fn matching_cloud_reference_is_available() {
+    let mut matching = summary();
+    matching.cloud_id = Some("credential-cloud-id".to_string());
+    let reference = CredentialReference {
+        credential_id: 900,
+        credential_cloud_id: matching.cloud_id.clone(),
+        username: true,
+        password: true,
+        private_key: false,
+        passphrase: false,
+    };
+
+    assert!(!reference_is_unavailable(&reference, &[matching]));
+}
+
+#[test]
+fn picker_render_warns_when_the_referenced_keychain_item_is_unavailable() {
+    let source = include_str!("render.rs");
+
+    assert!(source.contains("reference_is_unavailable"));
+    assert!(source.contains("Credential.reference_unavailable"));
 }

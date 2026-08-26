@@ -5,13 +5,14 @@ use crate::storage::{
     ConnectionRepository, CredentialEntry, CredentialReference, CredentialReferenceLocation,
     DatabaseType, DbConnectionConfig, JumpServerConfig, MongoDBParams, MongoDriverVariant,
     PortForwardingKind, PortForwardingParams, ProxyConfig, ProxyType, RedisMode, RedisParams,
-    RedisSentinelConfig, RemoteDesktopParams, RemoteDesktopProtocol, SshAuthMethod, SshParams,
-    StoredConnection,
+    RedisSentinelConfig, RemoteDesktopBackendPreference, RemoteDesktopParams,
+    RemoteDesktopProtocol, SshAuthMethod, SshParams, StoredConnection, TelnetParams,
 };
 
 fn reference(id: i64) -> CredentialReference {
     CredentialReference {
         credential_id: id,
+        credential_cloud_id: None,
         username: true,
         password: true,
         private_key: false,
@@ -34,6 +35,7 @@ pub(super) fn ssh_connection(id: i64) -> StoredConnection {
     StoredConnection::new_ssh(
         "SSH".to_string(),
         SshParams {
+            sftp_account: None,
             host: "ssh.example.com".to_string(),
             port: 22,
             username: String::new(),
@@ -66,6 +68,7 @@ pub(super) fn ssh_connection(id: i64) -> StoredConnection {
             proxy: Some(proxy(id)),
             os_id: None,
             icon: None,
+            account_expect: Default::default(),
         },
         None,
     )
@@ -160,6 +163,24 @@ pub(super) fn remote_desktop_connection(id: i64) -> StoredConnection {
             read_only: false,
             audio_playback: false,
             proxy: Some(proxy(id)),
+            backend_preference: RemoteDesktopBackendPreference::Canvas,
+            rdp: None,
+        },
+        None,
+    )
+}
+
+pub(super) fn telnet_connection(id: i64) -> StoredConnection {
+    StoredConnection::new_telnet(
+        "Telnet".to_string(),
+        TelnetParams {
+            host: "telnet.example.com".to_string(),
+            port: 23,
+            credential_reference: Some(reference(id)),
+            prompt_username: None,
+            prompt_password: None,
+            backspace_code: Default::default(),
+            login_script: Vec::new(),
         },
         None,
     )
@@ -231,7 +252,7 @@ pub(super) fn repositories() -> (
 }
 
 pub(super) fn insert_credential(repository: &ConnectionRepository) -> i64 {
-    let mut credential = CredentialEntry::new("Shared", "username_password");
+    let mut credential = CredentialEntry::new("Shared");
     repository
         .credential_repository()
         .insert(&mut credential)
@@ -283,4 +304,28 @@ fn reference_scanner_finds_all_direct_and_tunnel_locations() {
             .filter(|hit| hit.via_ssh_connection_id.is_some())
             .count()
     );
+}
+
+#[test]
+fn reference_scanner_finds_telnet_primary_reference() {
+    let (_temp, _connection, repository) = repositories();
+    let credential_id = insert_credential(&repository);
+    let mut connection = telnet_connection(credential_id);
+    let connection_id = repository
+        .insert(&mut connection)
+        .expect("insert Telnet connection");
+
+    let hits = repository
+        .credential_repository()
+        .referencing_connections(credential_id)
+        .expect("scan Telnet references");
+
+    assert_eq!(1, hits.len());
+    assert_eq!(connection_id, hits[0].connection_id);
+    assert_eq!(
+        crate::storage::ConnectionType::Telnet,
+        hits[0].connection_type
+    );
+    assert_eq!(CredentialReferenceLocation::Primary, hits[0].location);
+    assert_eq!(None, hits[0].via_ssh_connection_id);
 }

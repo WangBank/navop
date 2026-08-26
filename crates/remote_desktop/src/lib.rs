@@ -19,11 +19,13 @@ mod helper_protocol_debug;
 mod input_debug;
 mod output_debug;
 
-pub use backend::{RemoteDesktopBackend, RemoteDesktopProviderVersionError, create_backend};
+pub use backend::{
+    RemoteDesktopBackend, RemoteDesktopProviderVersionError, create_backend, parse_destination,
+};
 pub use capabilities::{RemoteDesktopCapabilities, ResizeSupport};
 pub use config::{
-    RemoteDesktopConnectionOptions, RemoteDesktopProtocol, RemoteDesktopSharedFolder,
-    RemoteDesktopSize,
+    RemoteDesktopBackendPreference, RemoteDesktopConnectionOptions, RemoteDesktopProtocol,
+    RemoteDesktopSharedFolder, RemoteDesktopSize,
 };
 pub use connection_test::{RemoteDesktopConnectionTestFailure, test_connection};
 pub use connection_tunnel::{ProxyTunnelConfig, ProxyTunnelType};
@@ -43,6 +45,20 @@ pub use provider_registry::{
     default_provider_dir, default_provider_dirs,
 };
 pub use runtime::RemoteDesktopRuntime;
+
+/// Whether the Windows native MSTSC presentation backend was compiled into
+/// this build.
+///
+/// The actual native implementation lives in `remote_desktop_view` (behind
+/// its `windows-native-rdp` feature), but that feature also enables this
+/// crate's marker feature so lower-level crates — such as the
+/// extension-runtime provider guard that decides whether the
+/// `onetcli-rdp-helper` extension is required — can check native
+/// availability without threading the feature through every dependent.
+#[must_use]
+pub fn windows_native_rdp_compiled() -> bool {
+    cfg!(all(feature = "windows-native-rdp", target_os = "windows"))
+}
 
 #[cfg(test)]
 mod provider_registry_tests {

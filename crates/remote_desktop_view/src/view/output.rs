@@ -5,6 +5,9 @@ use std::sync::atomic::Ordering;
 
 impl RemoteDesktopView {
     pub(super) fn start_runtime(&mut self, size: (u16, u16), cx: &mut Context<Self>) {
+        if !self.presentation_initialization.allows_canvas_runtime() {
+            return;
+        }
         if self.input_tx.is_some() {
             return;
         }
@@ -51,6 +54,7 @@ impl RemoteDesktopView {
         self._output_ready_task = Some(output_ready_task);
         self.last_resize_size = Some(size);
         self.connected = false;
+        self.failure_detail = None;
         self.status = SharedString::from(t!("RemoteDesktop.status_connecting").to_string());
     }
 
@@ -327,6 +331,7 @@ impl RemoteDesktopView {
                 self.remote_size = Some((width, height));
                 self.capabilities = Some(capabilities);
                 self.connected = true;
+                self.failure_detail = None;
                 self.frame_sync.connected();
                 let generation = self.frame_sync.snapshot().session_generation;
                 self.enqueue_presentation(
@@ -592,6 +597,19 @@ impl RemoteDesktopView {
     ) {
         self.content_bounds = Some(bounds);
         self.display_scale_factor = resize::scale_factor_percent(display_scale_factor);
+        if self.uses_windows_native_presentation() {
+            // Queue the intent only: the native SetBounds call may pump Win32
+            // messages, so it runs in the maintenance operation outside any
+            // entity borrow. A failed native bounds update must never fall back
+            // to the canvas runtime; the maintenance task re-synchronizes
+            // bounds after LoginComplete/Reconnected.
+            #[cfg(all(feature = "windows-native-rdp", target_os = "windows"))]
+            {
+                self.observe_windows_native_viewport(bounds, display_scale_factor);
+                self.pending_windows_native_bounds = Some((bounds, display_scale_factor));
+            }
+            return;
+        }
         let Some(size) = resize::resize_dimensions(bounds, display_scale_factor) else {
             return;
         };

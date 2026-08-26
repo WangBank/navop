@@ -250,14 +250,46 @@ pub struct IndexInfo {
     pub index_type: Option<String>,
 }
 
+/// Parameters for loading all metadata needed to compare one table-like object.
+#[derive(Debug, Clone)]
+pub struct DirectTableMetadataRequest {
+    pub connection_id: String,
+    pub database: String,
+    pub schema: Option<String>,
+    pub table: String,
+    pub include_table_metadata: bool,
+}
+
+/// Metadata loaded from one direct database session.
+#[derive(Debug, Clone, Default)]
+pub struct DirectTableMetadata {
+    pub columns: Vec<ColumnInfo>,
+    pub indexes: Vec<IndexInfo>,
+    pub foreign_keys: Vec<ForeignKeyDefinition>,
+}
+
 /// Table information with description/metadata
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TableObjectType {
+    #[default]
+    Table,
+    View,
+}
+
+/// Table-like object information with description/metadata.
+///
+/// `list_tables` implementations historically returned only tables, but a few
+/// drivers also return views. Keeping the kind here prevents schema compare
+/// from generating destructive table DDL for a view.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TableInfo {
     pub name: String,
+    #[serde(default)]
+    pub object_type: TableObjectType,
     pub schema: Option<String>,
     pub comment: Option<String>,
     pub engine: Option<String>,
-    pub row_count: Option<i64>,
     pub create_time: Option<String>,
     pub charset: Option<String>,
     pub collation: Option<String>,
@@ -609,34 +641,87 @@ pub enum FieldType {
 impl FieldType {
     /// Infer field type from database type string
     pub fn from_db_type(db_type: &str) -> Self {
-        let upper = db_type.to_uppercase();
-        let base_type = upper.split('(').next().unwrap_or(&upper).trim();
+        let mut normalized = db_type.trim().to_uppercase();
+
+        // ClickHouse wraps the actual type in Nullable/LowCardinality.
+        loop {
+            let unwrapped = normalized
+                .strip_prefix("NULLABLE(")
+                .or_else(|| normalized.strip_prefix("LOWCARDINALITY("))
+                .and_then(|value| value.strip_suffix(')'));
+            let Some(inner) = unwrapped else {
+                break;
+            };
+            normalized = inner.trim().to_string();
+        }
+
+        if let Some(type_name) = normalized.strip_prefix("MYSQL_TYPE_") {
+            normalized = type_name.to_string();
+        }
+
+        // MySQL may append these attributes to a type name.
+        normalized = normalized
+            .trim_end_matches(" ZEROFILL")
+            .trim_end_matches(" UNSIGNED")
+            .trim()
+            .to_string();
+
+        let base_type = normalized.split('(').next().unwrap_or(&normalized).trim();
+
+        // Preserve the full prefix for qualified types such as
+        // Oracle TIMESTAMP(6) WITH TIME ZONE and ClickHouse DateTime64(3).
+        if normalized.starts_with("TIMESTAMP") || normalized.starts_with("DATETIME") {
+            return Self::DateTime;
+        }
 
         match base_type {
-            // Integer types
+            // SQL dialects, protocol enums, and Arrow integer names.
             "INT" | "INTEGER" | "BIGINT" | "SMALLINT" | "TINYINT" | "MEDIUMINT" | "SERIAL"
-            | "BIGSERIAL" | "SMALLSERIAL" => Self::Integer,
-            // Decimal types
-            "DECIMAL" | "NUMERIC" | "FLOAT" | "DOUBLE" | "REAL" | "DOUBLE PRECISION" | "MONEY" => {
+            | "BIGSERIAL" | "SMALLSERIAL" | "INT1" | "INT2" | "INT4" | "INT8" | "INT16"
+            | "INT32" | "INT64" | "INT128" | "INT256" | "UINT8" | "UINT16" | "UINT32"
+            | "UINT64" | "UINT128" | "UINT256" | "HUGEINT" | "UTINYINT" | "USMALLINT" | "UINT"
+            | "UBIGINT" | "OID" | "TINY" | "SHORT" | "LONG" | "LONGLONG" | "INT24" | "YEAR" => {
+                Self::Integer
+            }
+            // SQL dialects, protocol enums, Arrow, and Oracle decimals.
+            "DECIMAL" | "NUMERIC" | "FLOAT" | "DOUBLE" | "REAL" | "DOUBLE PRECISION" | "MONEY"
+            | "FLOAT4" | "FLOAT8" | "FLOAT16" | "FLOAT32" | "FLOAT64" | "FLOATN" | "DECIMALN"
+            | "NUMERICN" | "MONEY4" | "NEWDECIMAL" | "NUMBER" | "BINARY_FLOAT"
+            | "BINARY_DOUBLE" | "DECIMAL32" | "DECIMAL64" | "DECIMAL128" | "DECIMAL256" => {
                 Self::Decimal
             }
-            // Boolean
-            "BOOL" | "BOOLEAN" | "BIT" => Self::Boolean,
-            // Date/Time
-            "DATE" => Self::Date,
-            "TIME" => Self::Time,
-            "DATETIME" | "TIMESTAMP" | "TIMESTAMPTZ" => Self::DateTime,
-            // Text types
-            "CHAR" | "VARCHAR" | "NCHAR" | "NVARCHAR" | "CHARACTER VARYING" | "CHARACTER" => {
-                Self::Text
+            // BIT remains Boolean for MSSQL and one-bit MySQL columns. A
+            // length-aware metadata model is needed to classify multi-bit
+            // protocol values more precisely.
+            "BOOL" | "BOOLEAN" | "BIT" | "BITN" => Self::Boolean,
+            "DATE" | "DATE32" | "DATE64" | "DATEN" | "NEWDATE" => Self::Date,
+            "TIME" | "TIME32" | "TIME64" | "TIMEN" => Self::Time,
+            "CHAR" | "VARCHAR" | "NCHAR" | "NVARCHAR" | "VARCHAR2" | "NVARCHAR2" | "BPCHAR"
+            | "NAME" | "STRING" | "FIXEDSTRING" | "CHARACTER VARYING" | "CHARACTER"
+            | "BIGVARCHAR" | "BIGCHAR" | "GUID" | "UUID" | "XML" | "ENUM" | "SET"
+            | "VAR_STRING" => Self::Text,
+            "TEXT" | "LONGTEXT" | "MEDIUMTEXT" | "TINYTEXT" | "CLOB" | "NCLOB" | "NTEXT" => {
+                Self::LongText
             }
-            "TEXT" | "LONGTEXT" | "MEDIUMTEXT" | "TINYTEXT" | "CLOB" | "NTEXT" => Self::LongText,
-            // Binary
-            "BLOB" | "LONGBLOB" | "MEDIUMBLOB" | "TINYBLOB" | "BINARY" | "VARBINARY" | "BYTEA"
-            | "IMAGE" => Self::Binary,
-            // JSON
-            "JSON" | "JSONB" => Self::Json,
-            _ => Self::Text,
+            "BLOB" | "LONGBLOB" | "LONG_BLOB" | "MEDIUMBLOB" | "MEDIUM_BLOB" | "TINYBLOB"
+            | "TINY_BLOB" | "BINARY" | "VARBINARY" | "BYTEA" | "IMAGE" | "RAW" | "LONG RAW"
+            | "BFILE" | "BIGVARBIN" | "BIGBINARY" | "LARGEBINARY" | "GEOMETRY" | "VECTOR" => {
+                Self::Binary
+            }
+            "JSON" | "JSONB" | "ARRAY" | "MAP" | "TUPLE" | "LIST" | "STRUCT" => Self::Json,
+            _ if base_type.starts_with("ARRAY")
+                || base_type.starts_with("MAP")
+                || base_type.starts_with("TUPLE")
+                || base_type.starts_with("LIST")
+                || base_type.starts_with("STRUCT") =>
+            {
+                Self::Json
+            }
+            _ if base_type.starts_with("UTF8") || base_type.starts_with("LARGEUTF8") => Self::Text,
+            _ if base_type.starts_with("BINARY") || base_type.starts_with("LARGEBINARY") => {
+                Self::Binary
+            }
+            _ => Self::Unknown,
         }
     }
 }
@@ -666,13 +751,21 @@ pub struct TableColumnMeta {
 pub enum TableCellValue {
     Null,
     Text(String),
+    Binary(Vec<u8>),
 }
 
 impl TableCellValue {
     pub fn as_text(&self) -> Option<&str> {
         match self {
-            Self::Null => None,
+            Self::Null | Self::Binary(_) => None,
             Self::Text(value) => Some(value),
+        }
+    }
+
+    pub fn as_binary(&self) -> Option<&[u8]> {
+        match self {
+            Self::Binary(bytes) => Some(bytes),
+            Self::Null | Self::Text(_) => None,
         }
     }
 }
@@ -745,9 +838,9 @@ pub struct CopySqlRequest {
     /// Column information
     pub columns: Vec<ColumnInfo>,
     /// Row data to generate SQL for
-    pub rows: Vec<Vec<Option<String>>>,
+    pub rows: Vec<Vec<TableCellValue>>,
     /// Original row data (for UPDATE statements, used to generate WHERE clause)
-    pub original_rows: Option<Vec<Vec<Option<String>>>>,
+    pub original_rows: Option<Vec<Vec<TableCellValue>>>,
     /// Column names
     pub column_names: Vec<String>,
 }
@@ -771,11 +864,29 @@ impl CopySqlRequest {
     }
 
     pub fn with_rows(mut self, rows: Vec<Vec<Option<String>>>) -> Self {
-        self.rows = rows;
+        self.rows = rows
+            .into_iter()
+            .map(|row| row.into_iter().map(TableCellValue::from).collect())
+            .collect();
         self
     }
 
     pub fn with_original_rows(mut self, original_rows: Vec<Vec<Option<String>>>) -> Self {
+        self.original_rows = Some(
+            original_rows
+                .into_iter()
+                .map(|row| row.into_iter().map(TableCellValue::from).collect())
+                .collect(),
+        );
+        self
+    }
+
+    pub fn with_typed_rows(mut self, rows: Vec<Vec<TableCellValue>>) -> Self {
+        self.rows = rows;
+        self
+    }
+
+    pub fn with_typed_original_rows(mut self, original_rows: Vec<Vec<TableCellValue>>) -> Self {
         self.original_rows = Some(original_rows);
         self
     }
@@ -819,6 +930,16 @@ pub struct TableDataRequest {
     pub page: usize,
     /// Page size
     pub page_size: usize,
+    /// Explicit row offset. When absent, it is derived from `page` and `page_size`.
+    ///
+    /// Callers that vary `page_size` between requests must set this field to
+    /// avoid overlapping or skipping rows.
+    pub offset: Option<usize>,
+    /// Previously observed total row count for the same filtered query.
+    ///
+    /// Compare pagination can reuse this after the first page so later pages
+    /// do not repeat an expensive `COUNT(*)`.
+    pub known_total_count: Option<usize>,
     /// Raw WHERE clause (e.g., "id > 10 AND name LIKE '%test%'")
     pub where_clause: Option<String>,
     /// Raw ORDER BY clause (e.g., "id DESC, name ASC")
@@ -833,6 +954,8 @@ impl TableDataRequest {
             table: table.into(),
             page: 1,
             page_size: 100,
+            offset: None,
+            known_total_count: None,
             where_clause: None,
             order_by_clause: None,
         }
@@ -847,6 +970,21 @@ impl TableDataRequest {
         self.page = page;
         self.page_size = page_size;
         self
+    }
+
+    pub fn with_offset(mut self, offset: usize) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+
+    pub fn with_known_total_count(mut self, total_count: usize) -> Self {
+        self.known_total_count = Some(total_count);
+        self
+    }
+
+    pub fn effective_offset(&self) -> usize {
+        self.offset
+            .unwrap_or_else(|| self.page.saturating_sub(1).saturating_mul(self.page_size))
     }
 
     pub fn with_where_clause(mut self, clause: impl Into<String>) -> Self {
@@ -999,6 +1137,9 @@ pub struct ForeignKeyDefinition {
     pub name: String,
     pub columns: Vec<String>,
     pub ref_table: String,
+    /// Schema containing the referenced table. `None` means the target schema/default namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_schema: Option<String>,
     pub ref_columns: Vec<String>,
     pub on_delete: String,
     pub on_update: String,
@@ -1149,5 +1290,91 @@ mod tests {
 
         assert_eq!(response.total_count, 1);
         assert_eq!(response.query_result.columns, vec!["_id"]);
+    }
+
+    #[test]
+    fn field_type_normalizes_driver_specific_type_tokens() {
+        assert_eq!(
+            FieldType::from_db_type("MYSQL_TYPE_LONG"),
+            FieldType::Integer
+        );
+        assert_eq!(
+            FieldType::from_db_type("MYSQL_TYPE_NEWDECIMAL"),
+            FieldType::Decimal
+        );
+        assert_eq!(
+            FieldType::from_db_type("MYSQL_TYPE_LONG_BLOB"),
+            FieldType::Binary
+        );
+        assert_eq!(
+            FieldType::from_db_type("MYSQL_TYPE_MEDIUM_BLOB"),
+            FieldType::Binary
+        );
+        assert_eq!(
+            FieldType::from_db_type("MYSQL_TYPE_TINY_BLOB"),
+            FieldType::Binary
+        );
+        for data_type in [
+            "CHAR(10)",
+            "BPCHAR",
+            "NCHAR(10)",
+            "BIGCHAR",
+            "MYSQL_TYPE_STRING",
+            "FixedString(10)",
+            "Nullable(FixedString(10))",
+        ] {
+            assert_eq!(
+                FieldType::from_db_type(data_type),
+                FieldType::Text,
+                "{data_type}"
+            );
+        }
+        assert_eq!(FieldType::from_db_type("int4"), FieldType::Integer);
+        assert_eq!(FieldType::from_db_type("float8"), FieldType::Decimal);
+        assert_eq!(FieldType::from_db_type("Int4"), FieldType::Integer);
+        assert_eq!(
+            FieldType::from_db_type("DatetimeOffsetn"),
+            FieldType::DateTime
+        );
+        assert_eq!(FieldType::from_db_type("NUMBER(10, 2)"), FieldType::Decimal);
+        assert_eq!(
+            FieldType::from_db_type("Nullable(UInt64)"),
+            FieldType::Integer
+        );
+        assert_eq!(
+            FieldType::from_db_type("LowCardinality(String)"),
+            FieldType::Text
+        );
+        assert_eq!(
+            FieldType::from_db_type("DateTime64(3)"),
+            FieldType::DateTime
+        );
+        assert_eq!(
+            FieldType::from_db_type("vendor_custom_type"),
+            FieldType::Unknown
+        );
+    }
+
+    #[test]
+    fn table_data_request_explicit_offset_overrides_page_derived_offset() {
+        let request = TableDataRequest::new("app", "users")
+            .with_page(2, 5_000)
+            .with_offset(10_000);
+
+        assert_eq!(request.effective_offset(), 10_000);
+    }
+
+    #[test]
+    fn table_data_request_falls_back_to_page_derived_offset() {
+        let request = TableDataRequest::new("app", "users").with_page(3, 250);
+
+        assert_eq!(request.effective_offset(), 500);
+    }
+
+    #[test]
+    fn table_data_request_keeps_known_total_count() {
+        let request = TableDataRequest::new("app", "users").with_known_total_count(42);
+
+        assert_eq!(request.known_total_count, Some(42));
     }
 }

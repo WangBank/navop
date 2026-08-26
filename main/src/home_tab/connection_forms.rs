@@ -1,5 +1,7 @@
 use super::*;
 
+const ORACLE_GO_DRIVER_ID: &str = "oracle-go";
+
 impl HomePage {
     pub(super) fn external_driver_name_for_title(
         driver_id: Option<&str>,
@@ -59,10 +61,14 @@ impl HomePage {
         let editing_conn = self
             .editing_connection_id
             .and_then(|id| self.connections.iter().find(|c| c.id == Some(id)).cloned());
-        if let Some(driver_id) =
-            external_driver_id_for_connection_form(&db_type, editing_conn.as_ref())
-        {
-            if self.external_driver_registry.find(&driver_id).is_none() {
+        let external_driver_id =
+            external_driver_id_for_connection_form(&db_type, editing_conn.as_ref());
+        let is_oracle_form = db_type == DatabaseType::Oracle
+            || external_driver_id.as_deref() == Some(ORACLE_GO_DRIVER_ID);
+        if let Some(driver_id) = external_driver_id.clone() {
+            if driver_id != ORACLE_GO_DRIVER_ID
+                && self.external_driver_registry.find(&driver_id).is_none()
+            {
                 let connection_name = editing_conn
                     .as_ref()
                     .map(|connection| connection.name.clone())
@@ -96,10 +102,6 @@ impl HomePage {
         };
 
         self.editing_connection_id = None;
-        let external_driver_id = external_driver_id_for_connection_form(
-            &config.db_type,
-            config.editing_connection.as_ref(),
-        );
         let external_driver_name = Self::external_driver_name_for_title(
             external_driver_id.as_deref(),
             &config.external_driver_registry,
@@ -114,9 +116,15 @@ impl HomePage {
                 .map(|connection| connection.name.as_str()),
             external_driver_name.as_deref(),
         );
+        let popup_height = if is_oracle_form && config.editing_connection.is_some() {
+            720.0
+        } else {
+            650.0
+        };
         open_popup_window(
-            PopupWindowOptions::new(title).size(700.0, 650.0),
+            PopupWindowOptions::new(title).size(700.0, popup_height),
             move |window, cx| cx.new(|cx| ConnectionFormWindow::new(config, window, cx)),
+            Some(window),
             cx,
         );
     }
@@ -155,6 +163,7 @@ impl HomePage {
         open_popup_window(
             PopupWindowOptions::new(title).size(700.0, 650.0),
             move |window, cx| cx.new(|cx| SshFormWindow::new(config, window, cx)),
+            Some(_window),
             cx,
         );
     }
@@ -196,6 +205,7 @@ impl HomePage {
         open_popup_window(
             PopupWindowOptions::new(title).size(700.0, 650.0),
             move |window, cx| cx.new(|cx| RedisFormWindow::new(config, window, cx)),
+            Some(_window),
             cx,
         );
     }
@@ -232,6 +242,7 @@ impl HomePage {
         open_popup_window(
             PopupWindowOptions::new(title).size(700.0, 650.0),
             move |window, cx| cx.new(|cx| MongoFormWindow::new(config, window, cx)),
+            Some(_window),
             cx,
         );
     }
@@ -268,6 +279,44 @@ impl HomePage {
         open_popup_window(
             PopupWindowOptions::new(title).size(700.0, 600.0),
             move |window, cx| cx.new(|cx| SerialFormWindow::new(config, window, cx)),
+            Some(_window),
+            cx,
+        );
+    }
+
+    pub(crate) fn show_telnet_form(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing_connection_id.is_none() && !self.is_master_key_ready_for_new_connection() {
+            return;
+        }
+
+        let editing_conn = self.editing_connection_id.and_then(|id| {
+            self.connections
+                .iter()
+                .find(|c| c.id == Some(id) && c.connection_type == ConnectionType::Telnet)
+                .cloned()
+        });
+
+        let config = TelnetFormWindowConfig {
+            editing_connection: editing_conn,
+            workspaces: self.workspaces.clone(),
+            teams: get_cached_team_options(cx),
+        };
+
+        self.editing_connection_id = None;
+
+        let title = Self::editing_title_or_default(
+            rust_i18n::locale().as_ref(),
+            config.editing_connection.as_ref(),
+            if config.editing_connection.is_some() {
+                t!("Telnet.edit").to_string()
+            } else {
+                t!("Telnet.new").to_string()
+            },
+        );
+        open_popup_window(
+            PopupWindowOptions::new(title).size(700.0, 600.0),
+            move |window, cx| cx.new(|cx| TelnetFormWindow::new(config, window, cx)),
+            Some(_window),
             cx,
         );
     }

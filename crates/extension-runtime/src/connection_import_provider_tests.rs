@@ -4,7 +4,7 @@ use connection_import_protocol::{CandidateFile, HostAccessError, ImportRecordKin
 use extension_component::ExtensionConnectionImportHost;
 
 use crate::connection_import_provider::{
-    ManifestConnectionImportHost, ManualConnectionImportFile,
+    ManifestConnectionImportHost, ManualConnectionImportFile, candidates_for_platform,
     preview_manifest_connection_importers, scan_manifest_connection_importers,
 };
 
@@ -18,37 +18,39 @@ use fixtures::{
 #[test]
 fn connection_import_provider_lists_manifest_importers_with_scoped_ids() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let extension_dir = tmp.path().join("navicat");
+    let extension_dir = tmp.path().join("securecrt");
     fs::create_dir_all(&extension_dir).unwrap();
     fs::write(
         extension_dir.join("extension.json"),
         r#"{
             "schema_version": 1,
-            "id": "com.onetcli.importer.navicat",
-            "name": "Navicat Importer",
+            "id": "com.onetcli.importer.securecrt",
+            "name": "SecureCRT Importer",
             "version": "0.1.0",
             "engines": { "onetcli": ">=0.7.0" },
             "runtime": {
                 "wasm": [{
-                    "id": "navicat-importer",
-                    "module": "wasm/navicat_importer.wasm",
+                    "id": "securecrt-importer",
+                    "module": "wasm/securecrt_importer.wasm",
                     "kind": "component"
                 }]
             },
             "contributes": {
                 "connectionImporters": [{
-                    "id": "navicat",
-                    "runtimeId": "navicat-importer",
-                    "displayName": "Navicat",
-                    "outputKinds": ["database"],
+                    "id": "securecrt",
+                    "runtimeId": "securecrt-importer",
+                    "displayName": "SecureCRT",
+                    "outputKinds": ["ssh", "quick-command"],
                     "platforms": ["macos"],
                     "manualFilePick": {
-                        "prompt": "选择 Navicat 导出的 connection.ncx 文件"
+                        "prompt": "选择 SecureCRT XML/INI 文件",
+                        "supportsDirectories": true,
+                        "directoryPrompt": "选择 SecureCRT Config 配置根目录"
                     },
                     "candidateFiles": [{
-                        "id": "navicat-conn",
+                        "id": "securecrt-config",
                         "platform": "macos",
-                        "path": "~/Library/Navicat/conn.plist"
+                        "path": "~/Library/Application Support/VanDyke/SecureCRT/Config"
                     }]
                 }]
             }
@@ -61,11 +63,11 @@ fn connection_import_provider_lists_manifest_importers_with_scoped_ids() {
 
     assert_eq!(1, importers.len());
     assert_eq!(
-        "com.onetcli.importer.navicat/navicat",
+        "com.onetcli.importer.securecrt/securecrt",
         importers[0].descriptor.id
     );
-    assert_eq!("Navicat", importers[0].descriptor.display_name);
-    assert_eq!("navicat-importer", importers[0].runtime_id);
+    assert_eq!("SecureCRT", importers[0].descriptor.display_name);
+    assert_eq!("securecrt-importer", importers[0].runtime_id);
     assert_eq!(extension_dir, importers[0].extension_dir);
     assert!(
         importers[0]
@@ -73,12 +75,26 @@ fn connection_import_provider_lists_manifest_importers_with_scoped_ids() {
             .capabilities
             .supports_manual_file_pick
     );
+    assert!(
+        importers[0]
+            .descriptor
+            .capabilities
+            .supports_manual_directory_pick
+    );
     assert_eq!(
-        Some("选择 Navicat 导出的 connection.ncx 文件"),
+        Some("选择 SecureCRT XML/INI 文件"),
         importers[0]
             .descriptor
             .capabilities
             .manual_file_pick_prompt
+            .as_deref()
+    );
+    assert_eq!(
+        Some("选择 SecureCRT Config 配置根目录"),
+        importers[0]
+            .descriptor
+            .capabilities
+            .manual_directory_pick_prompt
             .as_deref()
     );
 }
@@ -113,7 +129,7 @@ fn connection_import_provider_previews_dbeaver_and_termius_wasm_fixtures() {
         },
     );
 
-    let records = futures::executor::block_on(preview_manifest_connection_importers(
+    let report = futures::executor::block_on(preview_manifest_connection_importers(
         tmp.path(),
         &[
             "com.onetcli.importer.dbeaver/dbeaver".to_string(),
@@ -123,12 +139,14 @@ fn connection_import_provider_previews_dbeaver_and_termius_wasm_fixtures() {
     ))
     .unwrap();
 
-    assert_eq!(2, records.len());
-    assert!(records.iter().any(|record| {
+    assert_eq!(2, report.records.len());
+    assert!(report.errors.is_empty());
+    assert!(report.records.iter().any(|record| {
         record.kind == ImportRecordKind::Database && record.display_name == "prod-mysql"
     }));
     assert!(
-        records
+        report
+            .records
             .iter()
             .any(|record| record.kind == ImportRecordKind::Ssh && record.display_name == "prod-ssh")
     );
@@ -152,7 +170,7 @@ fn connection_import_provider_keeps_preview_records_when_one_importer_fails() {
     );
     write_broken_wasm_importer_extension(tmp.path());
 
-    let records = futures::executor::block_on(preview_manifest_connection_importers(
+    let report = futures::executor::block_on(preview_manifest_connection_importers(
         tmp.path(),
         &[
             "com.onetcli.importer.dbeaver/dbeaver".to_string(),
@@ -162,12 +180,18 @@ fn connection_import_provider_keeps_preview_records_when_one_importer_fails() {
     ))
     .unwrap();
 
-    assert_eq!(1, records.len());
+    assert_eq!(1, report.records.len());
     assert_eq!(
         "com.onetcli.importer.dbeaver/dbeaver",
-        records[0].importer_id
+        report.records[0].importer_id
     );
-    assert_eq!("prod-mysql", records[0].display_name);
+    assert_eq!("prod-mysql", report.records[0].display_name);
+    assert_eq!(1, report.errors.len());
+    assert_eq!(
+        "com.onetcli.importer.broken/broken",
+        report.errors[0].importer_id
+    );
+    assert!(!report.errors[0].message.is_empty());
 }
 
 #[test]
@@ -226,6 +250,126 @@ fn manifest_connection_import_host_requires_manifest_fs_read_permission() {
 
     assert_eq!(
         HostAccessError::PermissionDenied(candidate_path.to_string_lossy().to_string()),
+        error
+    );
+}
+
+#[test]
+fn manifest_connection_import_host_filters_candidates_by_platform() {
+    let candidates = vec![
+        CandidateFile {
+            id: "macos".to_string(),
+            platform: Some(Platform::Macos),
+            path: "/tmp/macos".to_string(),
+        },
+        CandidateFile {
+            id: "windows".to_string(),
+            platform: Some(Platform::Windows),
+            path: "C:\\Users\\me\\securecrt".to_string(),
+        },
+        CandidateFile {
+            id: "manual".to_string(),
+            platform: None,
+            path: "/tmp/manual".to_string(),
+        },
+    ];
+
+    let visible = candidates_for_platform(&candidates, Platform::Macos);
+
+    assert_eq!(
+        vec!["macos", "manual"],
+        visible
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn manifest_connection_import_host_rejects_reads_for_other_platform_candidates() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("windows-only.ini");
+    fs::write(&path, "session").unwrap();
+    let path = path.to_string_lossy().to_string();
+    let host = ManifestConnectionImportHost::new(
+        vec![CandidateFile {
+            id: "windows-only".to_string(),
+            platform: Some(Platform::Windows),
+            path: path.clone(),
+        }],
+        [format!("fs:read:{path}")],
+    );
+
+    assert_eq!(
+        HostAccessError::UndeclaredCandidate("windows-only".to_string()),
+        host.read_file("windows-only")
+            .expect_err("a hidden candidate must not be readable")
+    );
+    assert_eq!(
+        HostAccessError::UndeclaredCandidate("windows-only".to_string()),
+        host.read_directory("windows-only")
+            .expect_err("a hidden candidate directory must not be readable")
+    );
+    assert_eq!(
+        HostAccessError::UndeclaredCandidate("windows-only".to_string()),
+        host.read_candidate_directory("windows-only", "Sessions")
+            .expect_err("a hidden candidate child directory must not be readable")
+    );
+    assert_eq!(
+        HostAccessError::UndeclaredCandidate("windows-only".to_string()),
+        host.read_candidate_child_file("windows-only", "Sessions/test.ini")
+            .expect_err("a hidden candidate child file must not be readable")
+    );
+}
+
+#[test]
+fn manifest_connection_import_host_reads_nested_directory_entries() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config = tmp.path().join("Config");
+    let production = config.join("Sessions/Production");
+    fs::create_dir_all(production.join("Database")).unwrap();
+    fs::write(production.join("API.ini"), "session").unwrap();
+    let config_path = config.to_string_lossy().to_string();
+    let host = ManifestConnectionImportHost::new(
+        vec![CandidateFile {
+            id: "securecrt-config".to_string(),
+            platform: Some(Platform::Macos),
+            path: config_path.clone(),
+        }],
+        [format!("fs:read:{config_path}")],
+    );
+
+    let mut entries = host
+        .read_candidate_directory("securecrt-config", "Sessions/Production")
+        .unwrap();
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+
+    assert_eq!(2, entries.len());
+    assert_eq!("API.ini", entries[0].name);
+    assert!(!entries[0].is_dir);
+    assert_eq!("Database", entries[1].name);
+    assert!(entries[1].is_dir);
+}
+
+#[test]
+fn manifest_connection_import_host_rejects_nested_directory_parent_escape() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_path = tmp.path().to_string_lossy().to_string();
+    let host = ManifestConnectionImportHost::new(
+        vec![CandidateFile {
+            id: "securecrt-config".to_string(),
+            platform: Some(Platform::Macos),
+            path: config_path.clone(),
+        }],
+        [format!("fs:read:{config_path}")],
+    );
+
+    let error = host
+        .read_candidate_directory("securecrt-config", "../Secrets")
+        .expect_err("parent escape must be rejected");
+
+    assert_eq!(
+        HostAccessError::PermissionDenied("../Secrets".to_string()),
         error
     );
 }

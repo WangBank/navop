@@ -36,7 +36,7 @@ fn repository() -> Arc<ConnectionRepository> {
 }
 
 fn insert_username_credential(repo: &ConnectionRepository, username: &str) -> i64 {
-    let mut credential = CredentialEntry::new("shared database account", "username_password");
+    let mut credential = CredentialEntry::new("shared database account");
     credential.username = Some(username.to_string());
     repo.credential_repository()
         .insert(&mut credential)
@@ -46,6 +46,7 @@ fn insert_username_credential(repo: &ConnectionRepository, username: &str) -> i6
 fn username_reference(credential_id: i64) -> CredentialReference {
     CredentialReference {
         credential_id,
+        credential_cloud_id: None,
         username: true,
         password: false,
         private_key: false,

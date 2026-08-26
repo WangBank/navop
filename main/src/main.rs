@@ -1,4 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Apple ld emits an advisory when the very large test binary exceeds its compact
+// unwind encoding limit. Keep normal linker diagnostics but silence this known
+// test-only advisory.
+#![cfg_attr(test, allow(linker_messages))]
 
 rust_i18n::i18n!("locales", fallback = "en");
 
@@ -6,15 +10,18 @@ mod auth;
 
 mod ai_chat_acp;
 mod app_init;
+mod connection_sort;
 mod connection_visuals;
 mod credential_vault;
 mod env_file;
+mod extension_update;
 mod file_association;
 mod file_open;
 mod home;
 mod home_tab;
 mod license;
 mod local_terminal_profiles;
+mod navigation_quick_open;
 pub mod new_connection;
 mod onetcli_app;
 mod persistent_connection_sidebar;
@@ -25,6 +32,7 @@ mod personal_sync_runtime_tests;
 mod personal_sync_status;
 mod public_mcp_approval;
 mod public_mcp_runtime;
+mod session_logs;
 mod setting_tab;
 mod settings;
 mod sync_conflict_dialog;
@@ -34,12 +42,12 @@ mod user_avatar;
 #[cfg(any(target_os = "windows", test))]
 mod windows_single_instance;
 
-use crate::onetcli_app::OnetCliApp;
+use crate::onetcli_app::{GlobalTabContainer, OnetCliApp};
 use gpui::*;
 
-use gpui_component::Root;
+use gpui_component::{DialogStateChanged, Root};
 use gpui_component_assets::Assets;
-use one_core::settings::{AppSettings, MainWindowSize};
+use one_core::settings::{AppSettings, MainWindowSize, MainWindowState};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -62,34 +70,115 @@ enum AppOpenRequest {
     Open(file_open::FileOpenInput),
 }
 
-fn initial_main_window_size(
-    saved: Option<MainWindowSize>,
-    display_size: Option<Size<Pixels>>,
-) -> Size<Pixels> {
-    let mut result = saved
-        .and_then(|saved| MainWindowSize::new(saved.width, saved.height))
-        .map(|saved| size(px(saved.width), px(saved.height)))
+fn default_main_window_size(display_size: Option<Size<Pixels>>) -> Size<Pixels> {
+    display_size
+        .map(|display_size| {
+            size(
+                px(f32::from(display_size.width) * MAIN_WINDOW_DISPLAY_RATIO),
+                px(f32::from(display_size.height) * MAIN_WINDOW_DISPLAY_RATIO),
+            )
+        })
         .unwrap_or_else(|| {
             size(
                 px(DEFAULT_MAIN_WINDOW_WIDTH),
                 px(DEFAULT_MAIN_WINDOW_HEIGHT),
             )
-        });
-    if let Some(display_size) = display_size {
-        let maximum = size(
-            px(f32::from(display_size.width) * MAIN_WINDOW_DISPLAY_RATIO),
-            px(f32::from(display_size.height) * MAIN_WINDOW_DISPLAY_RATIO),
-        );
-        if saved.is_none() {
-            result = maximum;
-        }
-        result.width = result.width.min(maximum.width);
-        result.height = result.height.min(maximum.height);
-    }
-    result
+        })
 }
 
-fn main_window_options(window_bounds: Bounds<Pixels>) -> WindowOptions {
+fn initial_main_window_size(
+    saved_state: Option<&MainWindowState>,
+    legacy_saved_size: Option<MainWindowSize>,
+    display_size: Option<Size<Pixels>>,
+) -> Size<Pixels> {
+    let Some(display_size) = display_size else {
+        return saved_state
+            .and_then(|saved| MainWindowSize::new(saved.width, saved.height))
+            .or_else(|| {
+                legacy_saved_size.and_then(|saved| MainWindowSize::new(saved.width, saved.height))
+            })
+            .map(|saved| size(px(saved.width), px(saved.height)))
+            .unwrap_or_else(|| default_main_window_size(None));
+    };
+
+    let default_size = default_main_window_size(Some(display_size));
+    let saved_size = saved_state
+        .and_then(|saved| MainWindowSize::new(saved.width, saved.height))
+        .or_else(|| {
+            legacy_saved_size.and_then(|saved| MainWindowSize::new(saved.width, saved.height))
+        });
+    let Some(saved_size) = saved_size else {
+        return default_size;
+    };
+
+    let saved_size = size(px(saved_size.width), px(saved_size.height));
+    if saved_size.width <= display_size.width && saved_size.height <= display_size.height {
+        saved_size
+    } else {
+        default_size
+    }
+}
+
+fn bounds_fit_display(window_bounds: Bounds<Pixels>, display_bounds: Bounds<Pixels>) -> bool {
+    window_bounds.origin.x >= display_bounds.origin.x
+        && window_bounds.origin.y >= display_bounds.origin.y
+        && window_bounds.right() <= display_bounds.right()
+        && window_bounds.bottom() <= display_bounds.bottom()
+}
+
+fn initial_main_window_bounds(
+    saved_state: Option<&MainWindowState>,
+    legacy_saved_size: Option<MainWindowSize>,
+    display: Option<&dyn PlatformDisplay>,
+) -> Bounds<Pixels> {
+    initial_main_window_bounds_for_display(
+        saved_state,
+        legacy_saved_size,
+        display.map(|display| display.visible_bounds()),
+    )
+}
+
+fn initial_main_window_bounds_for_display(
+    saved_state: Option<&MainWindowState>,
+    legacy_saved_size: Option<MainWindowSize>,
+    display_bounds: Option<Bounds<Pixels>>,
+) -> Bounds<Pixels> {
+    let Some(display_bounds) = display_bounds else {
+        return Bounds::new(
+            point(px(0.0), px(0.0)),
+            initial_main_window_size(saved_state, legacy_saved_size, None),
+        );
+    };
+
+    let window_size =
+        initial_main_window_size(saved_state, legacy_saved_size, Some(display_bounds.size));
+    if let Some(saved_state) = saved_state
+        && let Some(saved_bounds) = MainWindowState::new(
+            saved_state.x,
+            saved_state.y,
+            saved_state.width,
+            saved_state.height,
+            saved_state.display_uuid.clone(),
+        )
+        .map(|saved| {
+            Bounds::new(
+                point(px(saved.x), px(saved.y)),
+                size(px(saved.width), px(saved.height)),
+            )
+        })
+        && saved_bounds.size == window_size
+        && bounds_fit_display(saved_bounds, display_bounds)
+    {
+        return saved_bounds;
+    }
+
+    Bounds::centered_at(display_bounds.center(), window_size)
+}
+
+fn main_window_options(
+    window_bounds: Bounds<Pixels>,
+    display_id: Option<DisplayId>,
+) -> WindowOptions {
     let mut titlebar = gpui_component::TitleBar::title_bar_options();
     titlebar.title = Some(NAVOP_WINDOW_TITLE.into());
 
@@ -98,6 +187,7 @@ fn main_window_options(window_bounds: Bounds<Pixels>) -> WindowOptions {
         titlebar: Some(titlebar),
         window_min_size: Some(size(px(640.0), px(480.0))),
         window_background: WindowBackgroundAppearance::Transparent,
+        display_id,
         #[cfg(target_os = "linux")]
         window_decorations: Some(WindowDecorations::Client),
         kind: WindowKind::Normal,
@@ -172,6 +262,21 @@ impl AssetSource for AppAssets {
 
 fn main() {
     env_file::load_env_files();
+
+    // GPUI 的 Windows 平台默认通过 DirectComposition visual 呈现窗口内容，
+    // 该 visual 会盖住传统 child HWND（例如 RDP ActiveX 控件），即使连接
+    // 成功、child 可见，远端桌面区域也表现为白屏。原生 RDP 后端必须在
+    // platform 单例构造之前让 GPUI 走经典 HWND swap-chain 路径，与
+    // `tools/gpui-rdp-smoke` 保持一致；该环境变量只在构造时读取一次。
+    // 使用共享编译期标记（`remote_desktop_view/windows-native-rdp` 也会
+    // 启用它），而不是 main 自身的 feature，保证两种 feature 写法都生效。
+    if remote_desktop::windows_native_rdp_compiled() {
+        // SAFETY: 进程尚未创建 GPUI platform，也没有任何线程会读取该
+        // 环境变量；与 smoke 工具在进程首部执行相同操作。
+        unsafe {
+            std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "1");
+        }
+    }
 
     if update::handle_update_command() {
         return;
@@ -280,23 +385,69 @@ fn main() {
             file_association::schedule_registration(cx);
         }
         notes::init(cx);
+        #[cfg(feature = "api-testing")]
+        api_tools::init(cx);
         extension_runtime::init(cx);
 
-        let saved_size = AppSettings::current(cx).main_window_size;
-        let display_size = cx.primary_display().map(|display| display.bounds().size);
-        let window_size = initial_main_window_size(saved_size, display_size);
-
-        let window_bounds = Bounds::centered(None, window_size, cx);
-        let options = main_window_options(window_bounds);
+        let settings = AppSettings::current(cx);
+        let saved_state = settings.main_window_state.as_ref();
+        let saved_display = saved_state.and_then(|saved_state| {
+            saved_state.display_uuid.as_deref().and_then(|saved_uuid| {
+                cx.displays().into_iter().find(|display| {
+                    display
+                        .uuid()
+                        .ok()
+                        .is_some_and(|uuid| uuid.to_string() == saved_uuid)
+                })
+            })
+        });
+        let display = saved_display.clone().or_else(|| cx.primary_display());
+        let state_to_restore = if saved_display.is_some()
+            || saved_state.is_some_and(|state| state.display_uuid.is_none())
+        {
+            saved_state
+        } else {
+            None
+        };
+        let legacy_saved_size = saved_state
+            .is_none()
+            .then_some(settings.main_window_size)
+            .flatten();
+        let window_bounds =
+            initial_main_window_bounds(state_to_restore, legacy_saved_size, display.as_deref());
+        let options =
+            main_window_options(window_bounds, display.as_ref().map(|display| display.id()));
 
         cx.spawn(async move |cx| {
-            let main_window = cx.open_window(options, |window, cx| {
+            let main_window = match cx.open_window(options, |window, cx| {
                 window.activate_window();
                 app_init::init_window_systems(window, cx);
                 update::schedule_update_check(window, cx);
+                extension_update::schedule_plugin_update_check(window, cx);
                 let view = cx.new(|cx| OnetCliApp::new(window, cx));
-                cx.new(|cx| Root::new(view, window, cx))
-            })?;
+                let root = cx.new(|cx| Root::new(view, window, cx));
+                let tab_container = cx.global::<GlobalTabContainer>().tab_container.clone();
+                cx.subscribe(&root, move |_, event: &DialogStateChanged, cx| {
+                    tab_container.update(cx, |tabs, cx| {
+                        tabs.set_active_presentation_obscured_by_dialog(event.active_count > 0, cx);
+                    });
+                })
+                .detach();
+                root
+            }) {
+                Ok(window) => window,
+                Err(error) => {
+                    tracing::error!(error = %error, "failed to open the Navop main window");
+                    eprintln!("Failed to open the Navop main window: {error:#}");
+                    let _ = cx.update(|cx| {
+                        onetcli_app::shutdown_application_resources_and_quit(
+                            cx,
+                            "main window initialization failed",
+                        );
+                    });
+                    return Ok::<_, anyhow::Error>(());
+                }
+            };
             let main_window = main_window.into();
 
             while let Ok(request) = startup_request_rx.recv().await {
@@ -330,7 +481,7 @@ fn main() {
 #[cfg(test)]
 mod embedded_cli_removal_tests {
     use gpui::{px, size};
-    use one_core::settings::MainWindowSize;
+    use one_core::settings::{MainWindowSize, MainWindowState};
 
     #[test]
     fn main_does_not_route_business_cli() {
@@ -390,6 +541,24 @@ mod embedded_cli_removal_tests {
     }
 
     #[test]
+    fn windows_native_rdp_disables_direct_composition_before_application_creation() {
+        let source = include_str!("main.rs");
+        let marker = source
+            .find("remote_desktop::windows_native_rdp_compiled()")
+            .expect("windows-native-rdp capability marker");
+        let setter = source
+            .find("GPUI_DISABLE_DIRECT_COMPOSITION")
+            .expect("windows-native-rdp must disable GPUI DirectComposition");
+        let application = source
+            .find("gpui_platform::application()")
+            .expect("GPUI application creation");
+
+        assert!(marker < setter);
+        assert!(setter < application);
+        assert!(source.contains("std::env::set_var(\"GPUI_DISABLE_DIRECT_COMPOSITION\", \"1\")"));
+    }
+
+    #[test]
     fn forwarded_startup_request_activates_existing_window_before_opening_files() {
         let source = include_str!("main.rs");
         let receiver = source
@@ -403,6 +572,21 @@ mod embedded_cli_removal_tests {
             .expect("forwarded file open");
 
         assert!(activation < open);
+    }
+
+    #[test]
+    fn main_window_dialog_state_obscures_active_native_presentation() {
+        let source = include_str!("main.rs").replace("\r\n", "\n");
+        let root_export = include_str!("../../crates/ui/src/lib.rs");
+
+        assert!(root_export.contains("DialogStateChanged"));
+        assert!(source.contains("use gpui_component::{DialogStateChanged, Root};"));
+        assert!(source.contains("let root = cx.new(|cx| Root::new(view, window, cx));"));
+        assert!(source.contains("cx.subscribe(&root,"));
+        assert!(source.contains("event: &DialogStateChanged"));
+        assert!(source.contains("event.active_count > 0"));
+        assert!(source.contains("set_active_presentation_obscured_by_dialog"));
+        assert!(source.contains(".detach();\n                root"));
     }
 
     #[test]
@@ -442,18 +626,123 @@ mod embedded_cli_removal_tests {
     }
 
     #[test]
+    fn main_window_open_failure_is_reported_and_quits() {
+        let source = include_str!("main.rs");
+        let open = source
+            .find("let main_window = match cx.open_window")
+            .expect("main window open error handling");
+        let request_loop = source[open..]
+            .find("while let Ok(request)")
+            .expect("startup request loop");
+        let error_path = &source[open..open + request_loop];
+
+        assert!(error_path.contains("failed to open the Navop main window"));
+        assert!(error_path.contains("Failed to open the Navop main window: {error:#}"));
+        assert!(error_path.contains("shutdown_application_resources_and_quit"));
+    }
+
+    #[test]
     fn first_launch_uses_ninety_percent_of_display() {
-        let actual = super::initial_main_window_size(None, Some(size(px(2000.0), px(1000.0))));
+        let actual =
+            super::initial_main_window_size(None, None, Some(size(px(2000.0), px(1000.0))));
 
         assert_eq!(size(px(1800.0), px(900.0)), actual);
     }
 
     #[test]
-    fn saved_window_size_is_restored_and_capped_to_display() {
-        let saved = MainWindowSize::new(1600.0, 1200.0);
-        let actual = super::initial_main_window_size(saved, Some(size(px(1200.0), px(800.0))));
+    fn saved_window_size_falls_back_to_default_when_it_does_not_fit() {
+        let saved = MainWindowState::new(0.0, 0.0, 1600.0, 1200.0, None);
+        let actual = super::initial_main_window_size(
+            saved.as_ref(),
+            None,
+            Some(size(px(1200.0), px(800.0))),
+        );
 
         assert_eq!(size(px(1080.0), px(720.0)), actual);
+    }
+
+    #[test]
+    fn saved_window_size_is_restored_when_it_fits_display() {
+        let saved = MainWindowState::new(100.0, 120.0, 1000.0, 700.0, None);
+        let actual = super::initial_main_window_size(
+            saved.as_ref(),
+            None,
+            Some(size(px(1200.0), px(800.0))),
+        );
+
+        assert_eq!(size(px(1000.0), px(700.0)), actual);
+    }
+
+    #[test]
+    fn legacy_saved_window_size_is_restored() {
+        let saved = MainWindowSize::new(1000.0, 700.0);
+        let actual =
+            super::initial_main_window_size(None, saved, Some(size(px(1200.0), px(800.0))));
+
+        assert_eq!(size(px(1000.0), px(700.0)), actual);
+    }
+
+    #[test]
+    fn bounds_fit_display_requires_the_entire_window_to_be_visible() {
+        let display = gpui::Bounds::new(
+            gpui::point(px(-1920.0), px(0.0)),
+            size(px(1920.0), px(1080.0)),
+        );
+
+        assert!(super::bounds_fit_display(
+            gpui::Bounds::new(
+                gpui::point(px(-1800.0), px(100.0)),
+                size(px(1200.0), px(800.0)),
+            ),
+            display,
+        ));
+        assert!(!super::bounds_fit_display(
+            gpui::Bounds::new(
+                gpui::point(px(-1800.0), px(100.0)),
+                size(px(1800.0), px(1000.0)),
+            ),
+            display,
+        ));
+    }
+
+    #[test]
+    fn saved_window_bounds_restore_position_on_the_target_display() {
+        let display = gpui::Bounds::new(
+            gpui::point(px(-1920.0), px(0.0)),
+            size(px(1920.0), px(1080.0)),
+        );
+        let saved = MainWindowState::new(-1800.0, 100.0, 1200.0, 800.0, Some("display-2".into()));
+
+        let actual =
+            super::initial_main_window_bounds_for_display(saved.as_ref(), None, Some(display));
+
+        assert_eq!(
+            gpui::Bounds::new(
+                gpui::point(px(-1800.0), px(100.0)),
+                size(px(1200.0), px(800.0)),
+            ),
+            actual,
+        );
+    }
+
+    #[test]
+    fn saved_window_bounds_center_when_the_saved_position_is_not_visible() {
+        let display = gpui::Bounds::new(
+            gpui::point(px(-1920.0), px(0.0)),
+            size(px(1920.0), px(1080.0)),
+        );
+        let saved = MainWindowState::new(100.0, 100.0, 1200.0, 800.0, Some("display-2".into()));
+
+        let actual =
+            super::initial_main_window_bounds_for_display(saved.as_ref(), None, Some(display));
+
+        assert_eq!(
+            gpui::Bounds::new(
+                gpui::point(px(-1560.0), px(140.0)),
+                size(px(1200.0), px(800.0)),
+            ),
+            actual,
+        );
     }
 
     #[test]
@@ -470,7 +759,7 @@ mod embedded_cli_removal_tests {
             origin: gpui::point(px(0.0), px(0.0)),
             size: size(px(800.0), px(600.0)),
         };
-        let options = super::main_window_options(bounds);
+        let options = super::main_window_options(bounds, None);
 
         assert_eq!(Some("navop"), options.app_id.as_deref());
         assert_eq!(
@@ -515,6 +804,47 @@ mod native_driver_feature_contract_tests {
         assert!(features.contains("builtin-mongodb ="));
         assert!(!default_line.contains("builtin-redis"));
         assert!(!default_line.contains("builtin-mongodb"));
+    }
+
+    #[test]
+    fn windows_native_rdp_feature_is_declared_and_enabled_by_default() {
+        let main_manifest = include_str!("../Cargo.toml");
+        let remote_desktop_view_manifest =
+            include_str!("../../crates/remote_desktop_view/Cargo.toml");
+        let main_features = feature_block(main_manifest);
+        let remote_desktop_view_features = feature_block(remote_desktop_view_manifest);
+        let main_default = main_features
+            .lines()
+            .find(|line| line.trim_start().starts_with("default ="))
+            .expect("main must declare default features");
+        let remote_desktop_view_default = remote_desktop_view_features
+            .lines()
+            .find(|line| line.trim_start().starts_with("default ="))
+            .expect("remote_desktop_view must declare default features");
+
+        assert!(
+            main_features
+                .contains("windows-native-rdp = [\"remote_desktop_view/windows-native-rdp\"]")
+        );
+        assert!(
+            main_default.contains("windows-native-rdp"),
+            "the Windows native RDP backend must be part of the default build"
+        );
+        assert!(
+            remote_desktop_view_features.contains(
+                "windows-native-rdp = [\"dep:raw-window-handle\", \"dep:windows_rdp_host\"]"
+            ),
+            "the feature must enable only the optional native presentation dependencies"
+        );
+        assert_eq!("default = []", remote_desktop_view_default.trim());
+        assert!(dependency_is_optional_or_absent(
+            remote_desktop_view_manifest,
+            "raw-window-handle"
+        ));
+        assert!(dependency_is_optional_or_absent(
+            remote_desktop_view_manifest,
+            "windows_rdp_host"
+        ));
     }
 
     #[test]

@@ -12,6 +12,7 @@ use super::with_master_key;
 fn password_reference(id: i64) -> CredentialReference {
     CredentialReference {
         credential_id: id,
+        credential_cloud_id: None,
         username: true,
         password: true,
         private_key: false,
@@ -21,7 +22,7 @@ fn password_reference(id: i64) -> CredentialReference {
 
 fn insert_vault_ssh(repository: &ConnectionRepository) -> i64 {
     let credentials = repository.credential_repository();
-    let mut credential = CredentialEntry::new("Bastion login", "username_password");
+    let mut credential = CredentialEntry::new("Bastion login");
     credential.username = Some("vault-bastion-user".to_string());
     credential.password = Some("vault-bastion-password".to_string());
     let credential_id = credentials
@@ -31,6 +32,7 @@ fn insert_vault_ssh(repository: &ConnectionRepository) -> i64 {
     let mut ssh = StoredConnection::new_ssh(
         "Shared bastion".to_string(),
         SshParams {
+            sftp_account: None,
             host: "bastion.example.com".to_string(),
             port: 2222,
             username: "manual-user".to_string(),
@@ -55,6 +57,7 @@ fn insert_vault_ssh(repository: &ConnectionRepository) -> i64 {
             proxy: None,
             os_id: None,
             icon: None,
+            account_expect: Default::default(),
         },
         None,
     );

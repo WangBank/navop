@@ -1,4 +1,3 @@
-use connection_form::credential::CredentialField;
 use connection_form::team::{
     connection_sync_controls_visible_in, refresh_teams_tooltip, team_label, team_management_enabled,
 };
@@ -7,6 +6,8 @@ use gpui::{
     App, Context, FocusHandle, Focusable, IntoElement, ParentElement, Render, Styled, Window, div,
     px,
 };
+#[cfg(windows)]
+use gpui_component::radio::RadioGroup;
 use gpui_component::{
     ActiveTheme, IconName,
     button::{Button, ButtonVariants as _},
@@ -21,7 +22,7 @@ use gpui_component::{
 use rust_i18n::t;
 
 use super::RemoteDesktopFormWindow;
-use one_core::storage::RemoteDesktopProtocol;
+use one_core::storage::{RdpAudioMode, RemoteDesktopProtocol};
 
 impl RemoteDesktopFormWindow {
     fn render_form_row(&self, label: String, child: impl IntoElement) -> impl IntoElement {
@@ -33,9 +34,11 @@ impl RemoteDesktopFormWindow {
     }
 
     fn render_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let credential_picker = self.credential_picker.read(cx);
-        let username_referenced = credential_picker.field_referenced(CredentialField::Username);
-        let password_referenced = credential_picker.field_referenced(CredentialField::Password);
+        let credential_is_manual = self
+            .credential_picker
+            .read(cx)
+            .selected_reference()
+            .is_none();
 
         v_flex()
             .gap_2()
@@ -51,19 +54,17 @@ impl RemoteDesktopFormWindow {
                 t!("RemoteDesktopForm.label_port").to_string(),
                 Input::new(&self.port_input),
             ))
-            .child(self.render_form_row(
-                t!("RemoteDesktopForm.label_username").to_string(),
-                Input::new(&self.username_input).disabled(username_referenced),
-            ))
             .child(self.render_form_row("钥匙串".to_string(), self.credential_picker.clone()))
-            .child(
-                self.render_form_row(
+            .when(credential_is_manual, |form| {
+                form.child(self.render_form_row(
+                    t!("RemoteDesktopForm.label_username").to_string(),
+                    Input::new(&self.username_input),
+                ))
+                .child(self.render_form_row(
                     t!("RemoteDesktopForm.label_password").to_string(),
-                    Input::new(&self.password_input)
-                        .mask_toggle()
-                        .disabled(password_referenced),
-                ),
-            )
+                    Input::new(&self.password_input).mask_toggle(),
+                ))
+            })
             .child(self.render_form_row(
                 t!("RemoteDesktopForm.label_domain").to_string(),
                 Input::new(&self.domain_input),
@@ -97,7 +98,10 @@ impl RemoteDesktopFormWindow {
             )
             .child(self.render_read_only_row(cx))
             .when(self.protocol == RemoteDesktopProtocol::Rdp, |form| {
-                form.child(self.render_audio_playback_row(cx))
+                let form = form.child(self.render_audio_playback_row(cx));
+                #[cfg(windows)]
+                let form = form.child(self.render_backend_preference_row(cx));
+                form
             })
             .when(connection_sync_controls_visible_in(cx), |form| {
                 form.child(self.render_sync_row(cx))
@@ -105,11 +109,11 @@ impl RemoteDesktopFormWindow {
     }
 
     fn render_proxy_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let proxy_credential_picker = self.proxy_credential_picker.read(cx);
-        let username_referenced =
-            proxy_credential_picker.field_referenced(CredentialField::Username);
-        let password_referenced =
-            proxy_credential_picker.field_referenced(CredentialField::Password);
+        let proxy_credential_is_manual = self
+            .proxy_credential_picker
+            .read(cx)
+            .selected_reference()
+            .is_none();
 
         v_flex()
             .gap_2()
@@ -135,21 +139,19 @@ impl RemoteDesktopFormWindow {
                         Input::new(&self.proxy_port_input),
                     ))
                     .child(self.render_form_row(
-                        t!("RemoteDesktopForm.label_proxy_username").to_string(),
-                        Input::new(&self.proxy_username_input).disabled(username_referenced),
-                    ))
-                    .child(self.render_form_row(
                         "钥匙串".to_string(),
                         self.proxy_credential_picker.clone(),
                     ))
-                    .child(
-                        self.render_form_row(
+                    .when(proxy_credential_is_manual, |form| {
+                        form.child(self.render_form_row(
+                            t!("RemoteDesktopForm.label_proxy_username").to_string(),
+                            Input::new(&self.proxy_username_input),
+                        ))
+                        .child(self.render_form_row(
                             t!("RemoteDesktopForm.label_proxy_password").to_string(),
-                            Input::new(&self.proxy_password_input)
-                                .mask_toggle()
-                                .disabled(password_referenced),
-                        ),
-                    )
+                            Input::new(&self.proxy_password_input).mask_toggle(),
+                        ))
+                    })
             })
     }
 
@@ -197,9 +199,69 @@ impl RemoteDesktopFormWindow {
             Checkbox::new("remote-desktop-audio-playback")
                 .checked(self.audio_playback)
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.audio_playback = !this.audio_playback;
+                    let enabled = !this.audio_playback;
+                    this.audio_playback = enabled;
+                    if this.protocol == RemoteDesktopProtocol::Rdp
+                        && let Some(settings) = this.rdp_settings.as_mut()
+                    {
+                        settings.audio.mode = if enabled {
+                            RdpAudioMode::Local
+                        } else {
+                            RdpAudioMode::Disabled
+                        };
+                    }
                     cx.notify();
                 })),
+        )
+    }
+
+    #[cfg(windows)]
+    fn render_backend_preference_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let native_available = super::backend_preference::windows_native_rdp_available();
+        // Auto is no longer offered in the form. Legacy connections that
+        // stored Auto map to the effective backend for display: Windows
+        // native when available, otherwise IronRDP (Canvas).
+        let effective_preference =
+            if self.backend_preference == one_core::storage::RemoteDesktopBackendPreference::Auto {
+                if native_available {
+                    one_core::storage::RemoteDesktopBackendPreference::WindowsNative
+                } else {
+                    one_core::storage::RemoteDesktopBackendPreference::Canvas
+                }
+            } else {
+                self.backend_preference
+            };
+        let selected_index = super::backend_preference::backend_preferences()
+            .iter()
+            .position(|preference| *preference == effective_preference);
+
+        self.render_form_row(
+            t!("RemoteDesktopForm.label_backend_preference").to_string(),
+            RadioGroup::horizontal("remote-desktop-backend-preference")
+                .selected_index(selected_index)
+                .on_click(cx.listener(|this, index, _, cx| {
+                    if let Some(preference) =
+                        super::backend_preference::backend_preferences().get(*index)
+                    {
+                        this.backend_preference = *preference;
+                        cx.notify();
+                    }
+                }))
+                .children([
+                    Radio::new("remote-desktop-backend-windows-native")
+                        .label(if native_available {
+                            t!("RemoteDesktopForm.backend_windows_native").to_string()
+                        } else {
+                            format!(
+                                "{} ({})",
+                                t!("RemoteDesktopForm.backend_windows_native"),
+                                t!("RemoteDesktopForm.backend_windows_native_status")
+                            )
+                        })
+                        .disabled(!native_available),
+                    Radio::new("remote-desktop-backend-ironrdp")
+                        .label(t!("RemoteDesktopForm.backend_ironrdp").to_string()),
+                ]),
         )
     }
 
@@ -289,12 +351,25 @@ mod tests {
     }
 
     #[test]
-    fn audio_playback_checkbox_is_only_rendered_for_rdp() {
-        let source = include_str!("view.rs");
+    fn rdp_specific_controls_are_only_rendered_for_rdp() {
+        let source = include_str!("view.rs").replace("\r\n", "\n");
+        let render_source = source.split("#[cfg(test)]").next().unwrap();
 
-        assert!(source.contains("self.protocol == RemoteDesktopProtocol::Rdp"));
-        assert!(source.contains("self.render_audio_playback_row(cx)"));
-        assert!(source.contains("remote-desktop-audio-playback"));
-        assert!(source.contains("RemoteDesktopForm.label_audio_playback"));
+        assert!(render_source.contains("self.protocol == RemoteDesktopProtocol::Rdp"));
+        assert!(render_source.contains("self.render_audio_playback_row(cx)"));
+        assert!(render_source.contains("remote-desktop-audio-playback"));
+        assert!(render_source.contains("RemoteDesktopForm.label_audio_playback"));
+        assert!(render_source.contains("self.render_backend_preference_row(cx)"));
+        assert!(render_source.contains(
+            "#[cfg(windows)]\n                let form = form.child(self.render_backend_preference_row(cx));"
+        ));
+        assert!(render_source.contains("RemoteDesktopForm.label_backend_preference"));
+        assert!(render_source.contains("RadioGroup::horizontal"));
+        assert!(render_source.contains("remote-desktop-backend-windows-native"));
+        assert!(render_source.contains(".disabled(!native_available)"));
+        assert!(render_source.contains("windows_native_rdp_available"));
+        assert!(render_source.contains("RemoteDesktopForm.backend_windows_native_status"));
+        assert!(render_source.contains("remote-desktop-backend-ironrdp"));
+        assert!(!render_source.contains("Select::new(&self.backend_preference_select)"));
     }
 }

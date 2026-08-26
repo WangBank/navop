@@ -151,6 +151,149 @@ fn playback_key_handler_retains_copy_before_rejecting_input() {
 }
 
 #[test]
+fn quick_command_shortcuts_run_after_terminal_handlers_but_before_raw_input() {
+    let source = include_str!("../text_input.rs");
+    let key_event = source
+        .split("pub(super) fn handle_key_event")
+        .nth(1)
+        .expect("key event handler should exist");
+    let history = key_event
+        .find("self.history_prompt.mode()")
+        .expect("history prompt handling should remain available");
+    let built_in = key_event
+        .find("is_terminal_action_shortcut")
+        .expect("built-in terminal shortcuts should be checked");
+    let quick_command = key_event
+        .find("command_for_shortcut")
+        .expect("quick-command shortcuts should be dispatched");
+    let raw_input = key_event
+        .find("crate::keys::to_esc_str")
+        .expect("ordinary terminal input should remain available");
+
+    assert!(
+        history < built_in && built_in < quick_command && quick_command < raw_input,
+        "history and built-in terminal handling must take priority over quick commands, while \
+         quick commands must run before ordinary terminal input"
+    );
+}
+
+#[test]
+fn quick_command_shortcuts_do_not_override_any_terminal_action_shortcut() {
+    let source = include_str!("../keybindings.rs");
+    let guard = function_region(source, "pub(super) fn is_terminal_action_shortcut", "\n}");
+
+    for action_id in [
+        "action_id::TERMINAL_SEND_TAB",
+        "action_id::TERMINAL_SEND_SHIFT_TAB",
+        "action_id::TERMINAL_COPY",
+        "action_id::TERMINAL_PASTE",
+        "action_id::TERMINAL_SELECT_ALL",
+        "action_id::TERMINAL_CLEAR_SCREEN",
+        "action_id::TERMINAL_CLEAR_SELECTION",
+        "action_id::TERMINAL_SEARCH_FORWARD",
+        "action_id::TERMINAL_SEARCH_BACKWARD",
+        "action_id::TERMINAL_TOGGLE_VI_MODE",
+        "action_id::TERMINAL_INCREASE_FONT",
+        "action_id::TERMINAL_DECREASE_FONT",
+        "action_id::TERMINAL_RESET_FONT",
+    ] {
+        assert!(
+            guard.contains(action_id),
+            "{action_id} must remain protected from quick-command shortcut overrides"
+        );
+    }
+    assert!(
+        guard.contains("shortcuts_for(cx, action_id, &defaults)"),
+        "the protection catalog must honor user-customized terminal shortcuts"
+    );
+}
+
+#[test]
+fn quick_command_changes_refresh_the_command_bar_cache() {
+    let source = include_str!("../sidebar_events.rs");
+    let handler = function_region(
+        source,
+        "pub(super) fn handle_sidebar_event",
+        "pub(super) fn invalidate_terminal_searches",
+    );
+    let event = handler
+        .find("TerminalSidebarEvent::QuickCommandsChanged")
+        .expect("sidebar should forward quick-command changes");
+    let update = handler[event..]
+        .find("self.command_bar.update")
+        .expect("quick-command changes should update the command bar");
+    let load = handler[event..]
+        .find("load_quick_commands")
+        .expect("quick-command changes should reload the cache");
+    let refresh = handler[event..]
+        .find("refresh_suggestions")
+        .expect("quick-command changes should refresh active suggestions");
+
+    assert!(update < load && load < refresh);
+}
+
+#[test]
+fn quick_command_click_with_explicit_enter_submits_instead_of_pasting() {
+    let source = include_str!("../sidebar_events.rs");
+    let handler = function_region(
+        source,
+        "pub(super) fn handle_sidebar_event",
+        "pub(super) fn invalidate_terminal_searches",
+    );
+    let event = handler
+        .find("TerminalSidebarEvent::ExecuteCommand")
+        .expect("sidebar should forward quick-command clicks");
+    let marker = handler[event..]
+        .find("quick_command_executes_on_click(command)")
+        .expect("click behavior should be gated by the explicit trailing-enter marker");
+    let submit = handler[marker..]
+        .find("TerminalCommandBarEvent::Submit(command.clone())")
+        .expect("commands with trailing Enter should submit");
+    let paste = handler[marker..]
+        .find("self.paste_text(command, window, cx)")
+        .expect("commands without trailing Enter should retain paste/fill behavior");
+
+    assert!(submit < paste);
+}
+
+#[test]
+fn quick_command_sync_refreshes_open_terminal_views_globally() {
+    let initialization = include_str!("../initialization.rs");
+    assert!(
+        initialization.contains("quick_command_sync_notifier(cx)"),
+        "every terminal view must subscribe to the app-wide quick-command notifier"
+    );
+    assert!(
+        initialization.contains("Self::handle_quick_command_sync_event"),
+        "terminal views must retain the app-wide quick-command subscription"
+    );
+
+    let source = include_str!("../sidebar_events.rs");
+    let sync_handler = function_region(
+        source,
+        "pub(super) fn handle_quick_command_sync_event",
+        "pub(super) fn handle_sidebar_event",
+    );
+    let command_bar = sync_handler
+        .find("self.command_bar.update")
+        .expect("sync should refresh the command-bar cache");
+    let load = command_bar
+        + sync_handler[command_bar..]
+            .find("load_quick_commands")
+            .expect("sync should reload quick commands");
+    let sidebar = command_bar
+        + sync_handler[command_bar..]
+            .find("self.sidebar.update")
+            .expect("sync should refresh the sidebar panel");
+    let panel_refresh = sidebar
+        + sync_handler[sidebar..]
+            .find("refresh_quick_commands")
+            .expect("sync should reload sidebar quick commands");
+
+    assert!(command_bar < load && load < sidebar && sidebar < panel_refresh);
+}
+
+#[test]
 fn playback_paste_is_rejected_before_clipboard_or_prompt_side_effects() {
     let source = include_str!("../clipboard.rs");
 
@@ -585,5 +728,45 @@ fn assert_guard_precedes(source: &str, guard: &str, side_effect: &str, capabilit
     assert!(
         guard_position < side_effect_position,
         "{capability} must reject playback before `{side_effect}`"
+    );
+}
+
+#[test]
+fn status_badge_sync_emits_state_changed_only_on_transition() {
+    let source = include_str!("../terminal_events.rs");
+    let sync = function_region(
+        source,
+        "fn sync_connection_status_badge",
+        "fn sync_credential_inputs",
+    );
+    assert!(sync.contains("self.last_connection_status = current"));
+    assert_guard_precedes(
+        sync,
+        "if current == self.last_connection_status",
+        "cx.emit(TabContentEvent::StateChanged)",
+        "status badge sync must skip unchanged connection states",
+    );
+}
+
+#[test]
+fn workspace_connection_status_delegates_to_the_active_pane() {
+    let source = include_str!("../../workspace/tab_content.rs");
+    let region = function_region(source, "fn connection_status", "fn lock_session");
+    assert!(
+        region.contains("terminal_connection_status(cx)"),
+        "workspace badge must delegate to the active pane terminal"
+    );
+}
+
+#[test]
+fn sftp_status_badge_emits_state_changed_on_transition() {
+    let source = include_str!("../../../../sftp_view/src/lib.rs");
+    let helper = function_region(source, "fn set_connection_state", "fn reconnect");
+    assert!(helper.contains("cx.emit(TabContentEvent::StateChanged)"));
+    assert_guard_precedes(
+        helper,
+        "if self.connection_state == state",
+        "cx.emit(TabContentEvent::StateChanged)",
+        "SFTP badge must only notify on a real state transition",
     );
 }

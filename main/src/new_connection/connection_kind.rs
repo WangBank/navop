@@ -8,7 +8,7 @@ use one_core::storage::{ConnectionType, DatabaseType};
 use rust_i18n::t;
 use std::path::PathBuf;
 
-const BUILTIN_EXTERNAL_DRIVER_IDS: &[&str] = &["duckdb"];
+const BUILTIN_EXTERNAL_DRIVER_IDS: &[&str] = &["duckdb", "oracle-go"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum NewConnectionCategory {
@@ -58,6 +58,7 @@ pub(super) enum NewConnectionKind {
     Redis,
     MongoDB,
     Serial,
+    Telnet,
     PortForwarding,
     MoreConnections,
     Database(DatabaseType),
@@ -80,6 +81,7 @@ impl NewConnectionKind {
             Self::Redis,
             Self::MongoDB,
             Self::Serial,
+            Self::Telnet,
             Self::PortForwarding,
         ];
         items.extend(
@@ -101,6 +103,7 @@ impl NewConnectionKind {
             Self::Redis => "Redis".to_string(),
             Self::MongoDB => "MongoDB".to_string(),
             Self::Serial => "Serial".to_string(),
+            Self::Telnet => "Telnet".to_string(),
             Self::PortForwarding => t!("PortForwarding.new").to_string(),
             Self::MoreConnections => t!("NewConnection.more_connections").to_string(),
             Self::Database(db_type) => db_type.as_str().to_string(),
@@ -116,6 +119,7 @@ impl NewConnectionKind {
             Self::Redis => t!("NewConnection.description_redis").to_string(),
             Self::MongoDB => t!("NewConnection.description_mongodb").to_string(),
             Self::Serial => t!("NewConnection.description_serial").to_string(),
+            Self::Telnet => t!("NewConnection.description_telnet").to_string(),
             Self::PortForwarding => t!("NewConnection.description_port_forwarding").to_string(),
             Self::MoreConnections => t!("NewConnection.description_more_connections").to_string(),
             Self::Database(_) => t!("NewConnection.description_database").to_string(),
@@ -125,9 +129,12 @@ impl NewConnectionKind {
 
     pub(super) fn category(&self) -> NewConnectionCategory {
         match self {
-            Self::Ssh | Self::Rdp | Self::Vnc | Self::Serial | Self::PortForwarding => {
-                NewConnectionCategory::Terminal
-            }
+            Self::Ssh
+            | Self::Rdp
+            | Self::Vnc
+            | Self::Serial
+            | Self::Telnet
+            | Self::PortForwarding => NewConnectionCategory::Terminal,
             Self::MoreConnections => NewConnectionCategory::All,
             Self::Redis | Self::MongoDB => NewConnectionCategory::NoSql,
             Self::Database(_) => NewConnectionCategory::Database,
@@ -152,6 +159,9 @@ impl NewConnectionKind {
             }
             Self::Serial => {
                 connection_type_icon(ConnectionType::Serial, ConnectionVisualSize::Hero)
+            }
+            Self::Telnet => {
+                connection_type_icon(ConnectionType::Telnet, ConnectionVisualSize::Hero)
             }
             Self::PortForwarding => {
                 connection_type_icon(ConnectionType::PortForwarding, ConnectionVisualSize::Hero)
@@ -212,9 +222,10 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn external_database_kinds_skip_builtin_duckdb_external_driver() {
+    fn external_database_kinds_skip_builtin_external_drivers() {
         let registry = IpcDriverRegistry::from_drivers(vec![
             manifest("duckdb", "DuckDB"),
+            manifest("oracle-go", "Oracle Go"),
             manifest("custom", "Custom"),
         ]);
 

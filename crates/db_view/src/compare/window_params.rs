@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::compare::{DataCompareParams, DataCompareTablePair, SchemaCompareParams};
+use crate::compare::{
+    DataCompareLimits, DataCompareParams, DataCompareTablePair, SchemaCompareParams,
+};
+use db::compare::TypeMappingOverrides;
 
 #[derive(Debug, Clone)]
 pub(super) struct DataCompareSelection {
@@ -8,6 +11,20 @@ pub(super) struct DataCompareSelection {
     pub database: String,
     pub schema: String,
     pub tables: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DataCompareSettings {
+    pub key_columns: String,
+    pub case_sensitive_identifiers: bool,
+    pub limits: DataCompareLimits,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DataCompareTableMapping {
+    pub source_table: String,
+    pub target_table: String,
+    pub matched: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -21,6 +38,9 @@ pub(super) struct SchemaCompareSelection {
 #[derive(Debug, Clone)]
 pub(super) struct SchemaCompareSettings {
     pub case_sensitive_identifiers: bool,
+    pub compare_views: bool,
+    pub compare_routines: bool,
+    pub compare_triggers: bool,
     pub compare_indexes: bool,
     pub compare_foreign_keys: bool,
     pub ignore_comments: bool,
@@ -28,12 +48,16 @@ pub(super) struct SchemaCompareSettings {
     pub ignore_charset_collation: bool,
     pub ignore_table_options: bool,
     pub compare_column_order: bool,
+    pub type_mapping_overrides: TypeMappingOverrides,
 }
 
 impl Default for SchemaCompareSettings {
     fn default() -> Self {
         Self {
             case_sensitive_identifiers: false,
+            compare_views: false,
+            compare_routines: false,
+            compare_triggers: false,
             compare_indexes: true,
             compare_foreign_keys: true,
             ignore_comments: false,
@@ -41,6 +65,7 @@ impl Default for SchemaCompareSettings {
             ignore_charset_collation: false,
             ignore_table_options: false,
             compare_column_order: false,
+            type_mapping_overrides: TypeMappingOverrides::default(),
         }
     }
 }
@@ -48,8 +73,7 @@ impl Default for SchemaCompareSettings {
 pub(super) fn data_compare_params(
     source: DataCompareSelection,
     target: DataCompareSelection,
-    key_columns: String,
-    case_sensitive_identifiers: bool,
+    settings: DataCompareSettings,
 ) -> Result<DataCompareParams, &'static str> {
     if source.connection_id.trim().is_empty() || source.database.trim().is_empty() {
         return Err("Source connection and database are required");
@@ -57,8 +81,11 @@ pub(super) fn data_compare_params(
     if target.connection_id.trim().is_empty() || target.database.trim().is_empty() {
         return Err("Target connection and database are required");
     }
-    let table_pairs =
-        data_compare_table_pairs(&source.tables, &target.tables, case_sensitive_identifiers)?;
+    let table_pairs = data_compare_table_pairs(
+        &source.tables,
+        &target.tables,
+        settings.case_sensitive_identifiers,
+    )?;
 
     Ok(DataCompareParams {
         source_connection_id: source.connection_id,
@@ -68,9 +95,24 @@ pub(super) fn data_compare_params(
         target_database: target.database,
         target_schema: empty_to_none(target.schema),
         table_pairs,
-        key_columns: split_columns(key_columns),
-        case_sensitive_identifiers,
+        key_columns: split_columns(settings.key_columns),
+        case_sensitive_identifiers: settings.case_sensitive_identifiers,
+        limits: settings.limits,
     })
+}
+
+pub(super) fn parse_optional_positive_limit(value: &str) -> Result<Option<usize>, &'static str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| "Compare limits must be positive whole numbers")?;
+    if limit == 0 {
+        return Err("Compare limits must be greater than zero");
+    }
+    Ok(Some(limit))
 }
 
 fn data_compare_table_pairs(
@@ -114,6 +156,51 @@ fn data_compare_table_pairs(
             }
         })
         .collect())
+}
+
+pub(super) fn data_compare_target_tables_for_selection(
+    source_tables: &[String],
+    available_target_tables: &[String],
+    selected_target_table: &str,
+) -> Vec<String> {
+    if source_tables.len() == 1 {
+        let selected_target_table = selected_target_table.trim();
+        return available_target_tables
+            .iter()
+            .any(|table| table == selected_target_table)
+            .then(|| vec![selected_target_table.to_string()])
+            .unwrap_or_default();
+    }
+    available_target_tables.to_vec()
+}
+
+pub(super) fn data_compare_same_name_mappings(
+    source_tables: &[String],
+    available_target_tables: &[String],
+    case_sensitive_identifiers: bool,
+) -> Vec<DataCompareTableMapping> {
+    let target_by_normalized = available_target_tables
+        .iter()
+        .map(|target| {
+            (
+                identifier_key(target, case_sensitive_identifiers),
+                target.clone(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    source_tables
+        .iter()
+        .map(|source| {
+            let target =
+                target_by_normalized.get(&identifier_key(source, case_sensitive_identifiers));
+            DataCompareTableMapping {
+                source_table: source.clone(),
+                target_table: target.cloned().unwrap_or_else(|| source.clone()),
+                matched: target.is_some(),
+            }
+        })
+        .collect()
 }
 
 fn normalized_table_list(
@@ -165,15 +252,8 @@ pub(super) fn schema_compare_params(
     if target.connection_id.trim().is_empty() || target.database.trim().is_empty() {
         return Err("Target connection and database are required");
     }
-    let mut source_tables =
-        normalized_table_list(&source.tables, settings.case_sensitive_identifiers)?;
-    let mut target_tables =
-        normalized_table_list(&target.tables, settings.case_sensitive_identifiers)?;
-    if source_tables.is_empty() && !target_tables.is_empty() {
-        source_tables = target_tables.clone();
-    } else if target_tables.is_empty() && !source_tables.is_empty() {
-        target_tables = source_tables.clone();
-    }
+    let source_tables = normalized_table_list(&source.tables, settings.case_sensitive_identifiers)?;
+    let target_tables = source_tables.clone();
 
     Ok(SchemaCompareParams {
         source_connection_id: source.connection_id,
@@ -185,6 +265,9 @@ pub(super) fn schema_compare_params(
         target_schema: empty_to_none(target.schema),
         target_tables,
         case_sensitive_identifiers: settings.case_sensitive_identifiers,
+        compare_views: settings.compare_views,
+        compare_routines: settings.compare_routines,
+        compare_triggers: settings.compare_triggers,
         compare_indexes: settings.compare_indexes,
         compare_foreign_keys: settings.compare_foreign_keys,
         ignore_comments: settings.ignore_comments,
@@ -192,6 +275,7 @@ pub(super) fn schema_compare_params(
         ignore_charset_collation: settings.ignore_charset_collation,
         ignore_table_options: settings.ignore_table_options,
         compare_column_order: settings.compare_column_order,
+        type_mapping_overrides: settings.type_mapping_overrides,
     })
 }
 
@@ -218,5 +302,25 @@ fn identifier_key(value: &str, case_sensitive_identifiers: bool) -> String {
         value.trim().to_string()
     } else {
         value.trim().to_lowercase()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_optional_positive_limit;
+
+    #[test]
+    fn optional_positive_limit_accepts_empty_and_positive_values() {
+        assert_eq!(Ok(None), parse_optional_positive_limit(""));
+        assert_eq!(Ok(None), parse_optional_positive_limit("  "));
+        assert_eq!(Ok(Some(42)), parse_optional_positive_limit(" 42 "));
+    }
+
+    #[test]
+    fn optional_positive_limit_rejects_zero_invalid_and_overflow_values() {
+        assert!(parse_optional_positive_limit("0").is_err());
+        assert!(parse_optional_positive_limit("-1").is_err());
+        assert!(parse_optional_positive_limit("abc").is_err());
+        assert!(parse_optional_positive_limit(&format!("{}0", usize::MAX)).is_err());
     }
 }

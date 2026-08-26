@@ -125,10 +125,14 @@ pub enum SettingsPanelEvent {
     ConfirmMultilinePasteChanged(bool),
     /// 高危命令确认开关
     ConfirmHighRiskCommandChanged(bool),
+    /// 自动会话日志开关
+    AutoSessionLoggingChanged(bool),
     /// 选中自动复制开关
     AutoCopyChanged(bool),
     /// 自动补全开关
     AutocompleteChanged(bool),
+    /// 弹框候选词开关
+    SuggestionPopupChanged(bool),
     /// 中键粘贴开关
     MiddleClickPasteChanged(bool),
     /// 右键快速粘贴开关
@@ -171,10 +175,14 @@ pub struct SettingsPanel {
     confirm_multiline_paste: bool,
     /// 高危命令确认
     confirm_high_risk_command: bool,
+    /// 自动保存终端、SSH、串口会话日志
+    auto_session_logging: bool,
     /// 选中自动复制
     auto_copy: bool,
     /// 自动补全
     autocomplete_enabled: bool,
+    /// 弹框候选词
+    suggestion_popup_enabled: bool,
     /// 中键粘贴
     middle_click_paste: bool,
     /// 右键快速粘贴
@@ -203,6 +211,7 @@ impl SettingsPanel {
         has_file_manager: bool,
         auto_copy: bool,
         autocomplete_enabled: bool,
+        suggestion_popup_enabled: bool,
         middle_click_paste: bool,
         right_click_paste: bool,
         paste_image_upload: bool,
@@ -222,6 +231,7 @@ impl SettingsPanel {
         });
 
         let scrollback_lines = AppSettings::global(cx).terminal_scrollback_lines;
+        let auto_session_logging = AppSettings::global(cx).terminal_auto_session_logging;
         let scrollback_lines_input_state = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(AppSettings::DEFAULT_TERMINAL_SCROLLBACK_LINES.to_string())
@@ -382,8 +392,10 @@ impl SettingsPanel {
             cursor_blink: false,
             confirm_multiline_paste: true,
             confirm_high_risk_command: true,
+            auto_session_logging,
             auto_copy,
             autocomplete_enabled,
+            suggestion_popup_enabled,
             middle_click_paste,
             right_click_paste,
             paste_image_upload,
@@ -459,6 +471,11 @@ impl SettingsPanel {
 
     pub fn set_autocomplete_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.autocomplete_enabled = enabled;
+        cx.notify();
+    }
+
+    pub fn set_suggestion_popup_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.suggestion_popup_enabled = enabled;
         cx.notify();
     }
 
@@ -1064,6 +1081,7 @@ impl SettingsPanel {
         let confirm_high_risk = self.confirm_high_risk_command;
         let auto_copy = self.auto_copy;
         let autocomplete_enabled = self.autocomplete_enabled;
+        let suggestion_popup_enabled = self.suggestion_popup_enabled;
         let middle_click_paste = self.middle_click_paste;
         let right_click_paste = self.right_click_paste;
         let paste_image_upload = self.paste_image_upload;
@@ -1194,6 +1212,23 @@ impl SettingsPanel {
                         h_flex()
                             .items_center()
                             .justify_between()
+                            .child(div().text_sm().child(t!("Settings.suggestion_popup")))
+                            .child(
+                                Switch::new("terminal-suggestion-popup-switch")
+                                    .checked(suggestion_popup_enabled)
+                                    .small()
+                                    .on_click(cx.listener(|this, checked: &bool, _window, cx| {
+                                        this.suggestion_popup_enabled = *checked;
+                                        cx.emit(SettingsPanelEvent::SuggestionPopupChanged(
+                                            *checked,
+                                        ));
+                                    })),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
                             .child(div().text_sm().child(t!("Settings.middle_click_paste")))
                             .child(
                                 Switch::new("middle-click-paste-switch")
@@ -1227,6 +1262,57 @@ impl SettingsPanel {
                                         ));
                                     })),
                             ),
+                    ),
+            )
+    }
+
+    fn render_session_logging_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.colors();
+        let border = colors.border;
+        let muted_fg = colors.muted_foreground;
+        let auto_session_logging = self.auto_session_logging;
+
+        v_flex()
+            .gap_3()
+            .p_3()
+            .border_t_1()
+            .border_color(border)
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(muted_fg)
+                            .child(t!("Settings.session_logging").to_uppercase()),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .child(t!("Settings.automatic_session_logging")),
+                            )
+                            .child(
+                                Switch::new("automatic-session-logging-switch")
+                                    .checked(auto_session_logging)
+                                    .small()
+                                    .on_click(cx.listener(|this, checked: &bool, _window, cx| {
+                                        this.auto_session_logging = *checked;
+                                        cx.emit(SettingsPanelEvent::AutoSessionLoggingChanged(
+                                            *checked,
+                                        ));
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .child(t!("Settings.automatic_session_logging_help")),
                     ),
             )
     }
@@ -1772,6 +1858,7 @@ impl Render for SettingsPanel {
                                 .child(self.render_scrollback_section(cx))
                                 .child(self.render_cursor_section(cx))
                                 .child(self.render_safety_section(cx))
+                                .child(self.render_session_logging_section(cx))
                                 .when(has_file_manager, |el| {
                                     el.child(self.render_file_manager_section(cx))
                                 })

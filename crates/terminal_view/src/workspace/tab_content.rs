@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use gpui::{
-    App, AppContext as _, Context, EventEmitter, FocusHandle, Focusable, SharedString, Task, Window,
+    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, SharedString,
+    Task, Window,
 };
 use gpui_component::{Icon, IconName};
 use one_core::sidebar_contribution::SidebarContribution;
@@ -29,10 +30,10 @@ impl TabContent for TerminalWorkspace {
     }
 
     fn icon(&self, cx: &App) -> Option<Icon> {
-        if self.connection_kind(cx) == TerminalConnectionKind::Serial {
-            Some(IconName::SerialPort.color())
-        } else {
-            Some(IconName::TerminalColor.color())
+        match self.connection_kind(cx) {
+            TerminalConnectionKind::Serial => Some(IconName::SerialPort.color()),
+            TerminalConnectionKind::Telnet => Some(IconName::SquareTerminalColor.color()),
+            _ => Some(IconName::TerminalColor.color()),
         }
     }
 
@@ -43,6 +44,9 @@ impl TabContent for TerminalWorkspace {
     fn on_activate(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.set_tab_metric_state(true, cx);
         self.set_active_pane_metric_state(cx);
+        self.active_pane().update(cx, |pane, cx| {
+            pane.on_host_activated(cx);
+        });
     }
 
     fn on_deactivate(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -84,7 +88,62 @@ impl TabContent for TerminalWorkspace {
         }
     }
 
+    fn apply_title(&mut self, title: &str, _window: &mut Window, cx: &mut Context<Self>) {
+        self.active_pane().update(cx, |pane, cx| {
+            pane.sync_broadcast_label(title, cx);
+        });
+    }
+
     fn sidebar_contributions(&self, _cx: &App) -> Vec<SidebarContribution> {
         Vec::new()
+    }
+
+    fn lockable(&self, cx: &App) -> bool {
+        self.active_pane().read(cx).session_lock_capable(cx)
+    }
+
+    fn is_locked(&self, cx: &App) -> bool {
+        self.panes
+            .values()
+            .any(|pane| pane.read(cx).is_session_locked(cx))
+    }
+
+    fn is_disconnected(&self, cx: &App) -> bool {
+        !self.panes.is_empty()
+            && self
+                .panes
+                .values()
+                .all(|pane| pane.read(cx).terminal_is_disconnected(cx))
+    }
+
+    fn connection_status(&self, cx: &App) -> Option<one_core::tab_container::TabConnectionStatus> {
+        self.active_pane().read(cx).terminal_connection_status(cx)
+    }
+
+    fn lock_session(
+        &mut self,
+        password_hash: &str,
+        hide_output: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let panes: Vec<Entity<TerminalView>> = self.panes.values().cloned().collect();
+        for pane in panes {
+            pane.update(cx, |pane, cx| {
+                pane.lock_pane_session(password_hash, hide_output, cx);
+            });
+        }
+        true
+    }
+
+    fn unlock_session(&mut self, password_hash: &str, cx: &mut Context<Self>) -> bool {
+        let panes: Vec<Entity<TerminalView>> = self.panes.values().cloned().collect();
+        let mut unlocked = false;
+        for pane in panes {
+            if pane.update(cx, |pane, cx| pane.unlock_pane_session(password_hash, cx)) {
+                unlocked = true;
+            }
+        }
+        unlocked
     }
 }

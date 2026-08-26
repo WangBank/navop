@@ -2,8 +2,9 @@ rust_i18n::i18n!("locales", fallback = "en");
 
 use anyhow::Context as _;
 use gpui::{
-    AnyWindowHandle, App, AsyncApp, ClipboardEntry, ClipboardItem, Context, Image, ImageFormat,
-    IntoElement, ObjectFit, ParentElement, Render, Styled, Window, div, img, prelude::*,
+    AnyWindowHandle, App, AsyncApp, ClipboardEntry, ClipboardItem, ColorExt, Context, Image,
+    ImageFormat, IntoElement, ObjectFit, ParentElement, Render, Styled, Window, div, img,
+    prelude::*,
 };
 use gpui_component::{ActiveTheme, WindowExt, notification::Notification};
 use one_core::gpui_tokio::Tokio;
@@ -220,6 +221,7 @@ fn open_remote_image_preview_window(
             .min_width(480.0)
             .min_height(360.0),
         move |_window, cx| cx.new(|_| RemoteImagePreview::new(image)),
+        None,
         cx,
     );
 }

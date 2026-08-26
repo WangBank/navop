@@ -5,9 +5,16 @@ use db::{DbNode, DbNodeType};
 use one_core::storage::DatabaseType;
 use rust_i18n::t;
 
-use crate::compare::sync_statement_picker::selected_sync_sql_text_for_ids;
+use crate::compare::compare_result_feedback::{
+    compare_issue_copy_text, data_compare_failure_issues, hide_data_compare_failure_warnings,
+    hide_schema_compare_failure_warnings, schema_compare_failure_issues,
+};
+use crate::compare::sync_statement_picker::{
+    selected_sync_execution_snapshot, selected_sync_sql_text_for_ids,
+};
 use crate::compare::window_params::{
-    DataCompareSelection, SchemaCompareSelection, SchemaCompareSettings, data_compare_params,
+    DataCompareSelection, DataCompareSettings, SchemaCompareSelection, SchemaCompareSettings,
+    data_compare_params, data_compare_same_name_mappings, data_compare_target_tables_for_selection,
     schema_compare_params, split_columns,
 };
 use crate::compare::window_ui::{
@@ -15,6 +22,131 @@ use crate::compare::window_ui::{
     sync_sql_execution_success_log_entry,
 };
 use crate::compare::{DataCompareWindow, SchemaCompareWindow};
+
+#[test]
+fn data_compare_failure_issues_preserve_table_error_and_order() {
+    let issues = data_compare_failure_issues(&[
+        db::compare::DataCompareTableFailure {
+            table: "users".to_string(),
+            error: "permission denied".to_string(),
+        },
+        db::compare::DataCompareTableFailure {
+            table: "orders".to_string(),
+            error: "timeout".to_string(),
+        },
+    ]);
+
+    assert_eq!(2, issues.len());
+    assert_eq!("users", issues[0].title);
+    assert_eq!("permission denied", issues[0].detail);
+    assert_eq!(None, issues[0].badge);
+    assert_eq!("orders", issues[1].title);
+    assert_eq!("timeout", issues[1].detail);
+}
+
+#[test]
+fn schema_compare_failure_issues_include_localized_side() {
+    let issues = schema_compare_failure_issues(&[
+        db::compare::SchemaCompareTableFailure {
+            side: db::compare::CompareSchemaSide::Source,
+            table: "users".to_string(),
+            error: "source unavailable".to_string(),
+        },
+        db::compare::SchemaCompareTableFailure {
+            side: db::compare::CompareSchemaSide::Target,
+            table: "orders".to_string(),
+            error: "target unavailable".to_string(),
+        },
+    ]);
+
+    assert_eq!(2, issues.len());
+    assert_eq!(Some(t!("Compare.source").to_string()), issues[0].badge);
+    assert_eq!("users", issues[0].title);
+    assert_eq!("source unavailable", issues[0].detail);
+    assert_eq!(Some(t!("Compare.target").to_string()), issues[1].badge);
+    assert_eq!("orders", issues[1].title);
+    assert_eq!("target unavailable", issues[1].detail);
+}
+
+#[test]
+fn compare_issue_copy_text_includes_badge_title_and_detail() {
+    let data_issue = data_compare_failure_issues(&[db::compare::DataCompareTableFailure {
+        table: "users".to_string(),
+        error: "permission denied".to_string(),
+    }])
+    .remove(0);
+    let schema_issue = schema_compare_failure_issues(&[db::compare::SchemaCompareTableFailure {
+        side: db::compare::CompareSchemaSide::Source,
+        table: "orders".to_string(),
+        error: "source unavailable".to_string(),
+    }])
+    .remove(0);
+
+    assert_eq!(
+        "users\npermission denied",
+        compare_issue_copy_text(&data_issue)
+    );
+    assert_eq!(
+        format!("{} orders\nsource unavailable", t!("Compare.source")),
+        compare_issue_copy_text(&schema_issue)
+    );
+}
+
+#[test]
+fn compare_failure_warnings_move_out_of_sync_plan_without_hiding_other_warnings() {
+    let data_failure = db::compare::DataCompareTableFailure {
+        table: "users".to_string(),
+        error: "permission denied".to_string(),
+    };
+    let schema_failure = db::compare::SchemaCompareTableFailure {
+        side: db::compare::CompareSchemaSide::Target,
+        table: "orders".to_string(),
+        error: "timeout".to_string(),
+    };
+    let retained_warning = "Destructive statement requires confirmation.".to_string();
+    let mut data_plan = sync_plan_with_warnings(vec![
+        db::compare::data_compare_table_failure_warning(&data_failure),
+        retained_warning.clone(),
+    ]);
+    let mut schema_plan = sync_plan_with_warnings(vec![
+        retained_warning.clone(),
+        db::compare::schema_compare_table_failure_warning(&schema_failure),
+    ]);
+
+    hide_data_compare_failure_warnings(&mut data_plan, &[data_failure]);
+    hide_schema_compare_failure_warnings(&mut schema_plan, &[schema_failure]);
+
+    assert_eq!(vec![retained_warning.clone()], data_plan.warnings);
+    assert_eq!(vec![retained_warning], schema_plan.warnings);
+}
+
+fn sync_plan_with_warnings(warnings: Vec<String>) -> SyncPlan {
+    SyncPlan {
+        id: "plan".to_string(),
+        target_table: "target".to_string(),
+        statements: Vec::new(),
+        summary: SyncPlanSummary {
+            insert_count: 0,
+            update_count: 0,
+            delete_count: 0,
+            ddl_count: 0,
+            total_count: 0,
+        },
+        warnings,
+        sql_text: String::new(),
+    }
+}
+
+fn data_compare_settings(
+    key_columns: &str,
+    case_sensitive_identifiers: bool,
+) -> DataCompareSettings {
+    DataCompareSettings {
+        key_columns: key_columns.to_string(),
+        case_sensitive_identifiers,
+        limits: Default::default(),
+    }
+}
 
 #[test]
 fn data_compare_popup_title_uses_source_table() {
@@ -151,6 +283,9 @@ fn schema_compare_params_include_object_and_rule_settings() {
             tables: vec![],
         },
         SchemaCompareSettings {
+            compare_views: true,
+            compare_routines: true,
+            compare_triggers: true,
             compare_indexes: false,
             compare_foreign_keys: false,
             ignore_comments: true,
@@ -165,6 +300,9 @@ fn schema_compare_params_include_object_and_rule_settings() {
 
     assert!(!params.compare_indexes);
     assert!(!params.compare_foreign_keys);
+    assert!(params.compare_views);
+    assert!(params.compare_routines);
+    assert!(params.compare_triggers);
     assert!(params.ignore_comments);
     assert!(params.ignore_auto_increment);
     assert!(params.ignore_charset_collation);
@@ -173,7 +311,34 @@ fn schema_compare_params_include_object_and_rule_settings() {
 }
 
 #[test]
-fn schema_compare_params_include_selected_tables() {
+fn schema_compare_params_include_routine_and_trigger_selection() {
+    let params = schema_compare_params(
+        SchemaCompareSelection {
+            connection_id: "source-1".to_string(),
+            database: "source_db".to_string(),
+            schema: String::new(),
+            tables: vec![],
+        },
+        SchemaCompareSelection {
+            connection_id: "target-1".to_string(),
+            database: "target_db".to_string(),
+            schema: String::new(),
+            tables: vec![],
+        },
+        SchemaCompareSettings {
+            compare_routines: true,
+            compare_triggers: true,
+            ..SchemaCompareSettings::default()
+        },
+    )
+    .unwrap();
+
+    assert!(params.compare_routines);
+    assert!(params.compare_triggers);
+}
+
+#[test]
+fn schema_compare_params_maps_source_tables_to_same_named_target_tables() {
     let params = schema_compare_params(
         SchemaCompareSelection {
             connection_id: "source-1".to_string(),
@@ -185,14 +350,37 @@ fn schema_compare_params_include_selected_tables() {
             connection_id: "target-1".to_string(),
             database: "target_db".to_string(),
             schema: String::new(),
-            tables: vec!["users".to_string(), " Orders ".to_string()],
+            tables: vec!["stale_target".to_string()],
         },
         SchemaCompareSettings::default(),
     )
     .unwrap();
 
     assert_eq!(params.source_tables, vec!["Users", "orders"]);
-    assert_eq!(params.target_tables, vec!["users", "Orders"]);
+    assert_eq!(params.target_tables, vec!["Users", "orders"]);
+}
+
+#[test]
+fn schema_compare_params_ignores_target_tables_when_source_selection_is_empty() {
+    let params = schema_compare_params(
+        SchemaCompareSelection {
+            connection_id: "source-1".to_string(),
+            database: "source_db".to_string(),
+            schema: String::new(),
+            tables: vec![],
+        },
+        SchemaCompareSelection {
+            connection_id: "target-1".to_string(),
+            database: "target_db".to_string(),
+            schema: String::new(),
+            tables: vec!["stale_target".to_string()],
+        },
+        SchemaCompareSettings::default(),
+    )
+    .unwrap();
+
+    assert!(params.source_tables.is_empty());
+    assert!(params.target_tables.is_empty());
 }
 
 #[test]
@@ -231,8 +419,7 @@ fn data_compare_params_use_editable_source_selection() {
             schema: "target_schema".to_string(),
             tables: vec!["target_table".to_string()],
         },
-        "id, tenant_id".to_string(),
-        false,
+        data_compare_settings("id, tenant_id", false),
     )
     .unwrap();
 
@@ -242,6 +429,71 @@ fn data_compare_params_use_editable_source_selection() {
     assert_eq!(params.table_pairs[0].source_table, "source_table");
     assert_eq!(params.table_pairs[0].target_table, "target_table");
     assert_eq!(params.key_columns, vec!["id", "tenant_id"]);
+}
+
+#[test]
+fn data_compare_single_source_uses_selected_different_target_table() {
+    assert_eq!(
+        data_compare_target_tables_for_selection(
+            &["users".to_string()],
+            &["users".to_string(), "archived_users".to_string()],
+            "archived_users",
+        ),
+        vec!["archived_users".to_string()]
+    );
+}
+
+#[test]
+fn data_compare_single_source_ignores_stale_target_table_selection() {
+    assert!(
+        data_compare_target_tables_for_selection(
+            &["users".to_string()],
+            &["users".to_string(), "archived_users".to_string()],
+            "deleted_table",
+        )
+        .is_empty()
+    );
+    assert!(
+        data_compare_target_tables_for_selection(&["users".to_string()], &[], "archived_users",)
+            .is_empty()
+    );
+}
+
+#[test]
+fn data_compare_multiple_sources_use_available_targets_for_same_name_matching() {
+    assert_eq!(
+        data_compare_target_tables_for_selection(
+            &["users".to_string(), "orders".to_string()],
+            &[
+                "users".to_string(),
+                "purchase_orders".to_string(),
+                "audit_log".to_string(),
+            ],
+            "purchase_orders",
+        ),
+        vec![
+            "users".to_string(),
+            "purchase_orders".to_string(),
+            "audit_log".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn data_compare_same_name_mappings_report_missing_targets() {
+    let mappings = data_compare_same_name_mappings(
+        &["Users".to_string(), "orders".to_string()],
+        &["users".to_string(), "purchase_orders".to_string()],
+        false,
+    );
+
+    assert_eq!(mappings.len(), 2);
+    assert_eq!(mappings[0].source_table, "Users");
+    assert_eq!(mappings[0].target_table, "users");
+    assert!(mappings[0].matched);
+    assert_eq!(mappings[1].source_table, "orders");
+    assert_eq!(mappings[1].target_table, "orders");
+    assert!(!mappings[1].matched);
 }
 
 #[test]
@@ -259,8 +511,7 @@ fn data_compare_params_build_multiple_case_insensitive_table_pairs() {
             schema: String::new(),
             tables: vec!["order_items".to_string(), "users".to_string()],
         },
-        "id".to_string(),
-        false,
+        data_compare_settings("id", false),
     )
     .unwrap();
 
@@ -291,8 +542,7 @@ fn data_compare_params_pairs_unmatched_source_tables_to_same_target_name() {
             schema: String::new(),
             tables: vec!["users".to_string()],
         },
-        "id".to_string(),
-        false,
+        data_compare_settings("id", false),
     )
     .unwrap();
 
@@ -320,8 +570,7 @@ fn data_compare_params_allows_empty_target_table_selection() {
             schema: String::new(),
             tables: vec![],
         },
-        "id".to_string(),
-        false,
+        data_compare_settings("id", false),
     )
     .unwrap();
 
@@ -349,8 +598,7 @@ fn data_compare_params_pairs_case_sensitive_misses_to_same_target_name() {
             schema: String::new(),
             tables: vec!["users".to_string(), "Orders".to_string()],
         },
-        "id".to_string(),
-        true,
+        data_compare_settings("id", true),
     )
     .unwrap();
 
@@ -361,6 +609,36 @@ fn data_compare_params_pairs_case_sensitive_misses_to_same_target_name() {
         .collect::<Vec<_>>();
 
     assert_eq!(pairs, vec![("Users", "Users"), ("Orders", "Orders")]);
+}
+
+#[test]
+fn data_compare_params_preserve_explicit_limits() {
+    let params = data_compare_params(
+        DataCompareSelection {
+            connection_id: "source-1".to_string(),
+            database: "source_db".to_string(),
+            schema: String::new(),
+            tables: vec!["users".to_string()],
+        },
+        DataCompareSelection {
+            connection_id: "target-1".to_string(),
+            database: "target_db".to_string(),
+            schema: String::new(),
+            tables: vec!["users".to_string()],
+        },
+        DataCompareSettings {
+            key_columns: "id".to_string(),
+            case_sensitive_identifiers: false,
+            limits: db::compare::DataCompareLimits {
+                max_rows_per_table: Some(100),
+                max_pages_per_table: Some(3),
+            },
+        },
+    )
+    .unwrap();
+
+    assert_eq!(Some(100), params.limits.max_rows_per_table);
+    assert_eq!(Some(3), params.limits.max_pages_per_table);
 }
 
 #[test]
@@ -431,6 +709,91 @@ fn selected_sync_sql_text_skips_unselected_destructive_statements() {
         selected_sync_sql_text_for_ids(&plan, &selected_ids),
         "INSERT INTO users (id) VALUES (1);"
     );
+}
+
+#[test]
+fn sync_execution_snapshot_uses_selected_statements_in_plan_order() {
+    let mut plan = SyncPlan {
+        id: "plan-1".to_string(),
+        target_table: "users".to_string(),
+        statements: vec![
+            statement("insert-2", "INSERT INTO users VALUES (2);", true, false),
+            statement("delete-1", "DELETE FROM users WHERE id = 1;", false, true),
+            statement("insert-1", "INSERT INTO users VALUES (1);", true, false),
+        ],
+        summary: SyncPlanSummary {
+            insert_count: 2,
+            update_count: 0,
+            delete_count: 1,
+            ddl_count: 0,
+            total_count: 3,
+        },
+        warnings: vec![],
+        sql_text: String::new(),
+    };
+    let mut selected_ids = HashSet::from([
+        "insert-1".to_string(),
+        "missing".to_string(),
+        "insert-2".to_string(),
+    ]);
+
+    let snapshot = selected_sync_execution_snapshot(&plan, &selected_ids);
+    selected_ids.clear();
+    plan.statements.clear();
+
+    assert_eq!("plan-1", snapshot.plan_id);
+    assert_eq!(
+        snapshot
+            .statements
+            .iter()
+            .map(|statement| statement.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["insert-2", "insert-1"]
+    );
+    assert_eq!(
+        snapshot.sql,
+        "INSERT INTO users VALUES (2);\nINSERT INTO users VALUES (1);"
+    );
+    assert!(!snapshot.is_empty());
+    assert!(!snapshot.is_destructive());
+}
+
+#[test]
+fn sync_execution_snapshot_destructive_semantics_use_structured_flags() {
+    let plan = SyncPlan {
+        id: "plan-1".to_string(),
+        target_table: "users".to_string(),
+        statements: vec![
+            statement(
+                "text-danger",
+                "DELETE FROM users WHERE id = 1;",
+                true,
+                false,
+            ),
+            statement("flag-danger", "SELECT 1;", false, true),
+        ],
+        summary: SyncPlanSummary {
+            insert_count: 0,
+            update_count: 0,
+            delete_count: 1,
+            ddl_count: 0,
+            total_count: 2,
+        },
+        warnings: vec![],
+        sql_text: String::new(),
+    };
+
+    let text_only =
+        selected_sync_execution_snapshot(&plan, &HashSet::from(["text-danger".to_string()]));
+    assert!(!text_only.is_destructive());
+
+    let flagged =
+        selected_sync_execution_snapshot(&plan, &HashSet::from(["flag-danger".to_string()]));
+    assert!(flagged.is_destructive());
+
+    let empty = selected_sync_execution_snapshot(&plan, &HashSet::new());
+    assert!(empty.is_empty());
+    assert!(!empty.is_destructive());
 }
 
 fn statement(id: &str, sql: &str, selected: bool, destructive: bool) -> SyncStatement {

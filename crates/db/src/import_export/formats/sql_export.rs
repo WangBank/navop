@@ -1,10 +1,13 @@
 use anyhow::Result;
-use std::collections::HashMap;
 
-use crate::DatabasePlugin;
 use crate::connection::DbConnection;
-use crate::executor::{QueryResult, SqlResult};
+use crate::executor::{QueryCellRef, QueryResult, QueryResultView, SqlResult};
 use crate::import_export::{ExportConfig, ExportProgressEvent};
+use crate::{
+    ColumnInfo, DatabasePlugin, PaginatedQuery,
+    query_result_normalization::normalize_query_result_binary_semantics,
+};
+use one_core::storage::DatabaseType;
 
 const SQL_EXPORT_PAGE_SIZE: usize = 1000;
 
@@ -23,13 +26,28 @@ pub(super) async fn export_table_data_in_pages(
     let mut total_rows = 0u64;
     let mut remaining = config.limit;
     let mut wrote_header = false;
+    let mut schema_columns: Option<Vec<ColumnInfo>> = None;
 
     loop {
         let Some(page_limit) = next_export_page_limit(remaining) else {
             break;
         };
-        let select_sql = export_page_select_sql(plugin, config, table, page_limit, offset);
-        let query_result = query_export_page(connection, &select_sql).await?;
+        let paginated_query = export_page_select_sql(plugin, config, table, page_limit, offset);
+        let mut query_result = query_export_page(connection, &paginated_query).await?;
+        if plugin.name() == DatabaseType::MySQL {
+            if schema_columns.is_none() {
+                schema_columns = Some(
+                    plugin
+                        .list_columns(connection, &config.database, config.schema.clone(), table)
+                        .await?,
+                );
+            }
+            normalize_query_result_binary_semantics(
+                &mut query_result,
+                &DatabaseType::MySQL,
+                schema_columns.as_deref().unwrap_or_default(),
+            )?;
+        }
         let rows_count = query_result.rows.len() as u64;
         let data_output = sql_dump_page(
             plugin,
@@ -37,7 +55,7 @@ pub(super) async fn export_table_data_in_pages(
             table,
             &query_result,
             &mut wrote_header,
-        );
+        )?;
 
         append_or_send_export_page(
             output,
@@ -72,28 +90,45 @@ fn export_page_select_sql(
     table: &str,
     page_limit: usize,
     offset: usize,
-) -> String {
+) -> PaginatedQuery {
     let table_ref =
         plugin.format_table_reference(&config.database, config.schema.as_deref(), table);
-    let mut select_sql = format!("SELECT * FROM {}", table_ref);
+    let columns = config
+        .columns
+        .as_ref()
+        .map(|columns| {
+            columns
+                .iter()
+                .map(|column| plugin.quote_identifier(column))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|| "*".to_string());
+    let mut select_sql = format!("SELECT {columns} FROM {table_ref}");
     if let Some(where_c) = &config.where_clause {
         select_sql.push_str(" WHERE ");
         select_sql.push_str(where_c);
     }
-    select_sql.push_str(&plugin.format_pagination(page_limit, offset, ""));
-    select_sql
+    plugin.build_paginated_query(&select_sql, page_limit, offset, "")
 }
 
-async fn query_export_page(connection: &dyn DbConnection, select_sql: &str) -> Result<QueryResult> {
-    match connection
-        .query(select_sql)
+async fn query_export_page(
+    connection: &dyn DbConnection,
+    paginated_query: &PaginatedQuery,
+) -> Result<QueryResult> {
+    let mut query_result = match connection
+        .query(&paginated_query.sql)
         .await
         .map_err(|e| anyhow::anyhow!("Query failed: {}", e))?
     {
-        SqlResult::Query(query_result) => Ok(query_result),
-        SqlResult::Exec(_) => Err(anyhow::anyhow!("Expected query result for SQL export")),
-        SqlResult::Error(error) => Err(anyhow::anyhow!(error.message)),
-    }
+        SqlResult::Query(query_result) => query_result,
+        SqlResult::Exec(_) => {
+            return Err(anyhow::anyhow!("Expected query result for SQL export"));
+        }
+        SqlResult::Error(error) => return Err(anyhow::anyhow!(error.message)),
+    };
+    paginated_query.strip_hidden_result_columns(&mut query_result)?;
+    Ok(query_result)
 }
 
 fn sql_dump_page(
@@ -102,9 +137,12 @@ fn sql_dump_page(
     table: &str,
     query_result: &QueryResult,
     wrote_header: &mut bool,
-) -> String {
+) -> Result<String> {
     if query_result.rows.is_empty() {
-        return String::new();
+        query_result
+            .typed_view()
+            .map_err(|error| anyhow::anyhow!("Invalid query result for SQL export: {error}"))?;
+        return Ok(String::new());
     }
 
     let mut output = String::new();
@@ -114,66 +152,92 @@ fn sql_dump_page(
         output.push('\n');
         *wrote_header = true;
     }
-    let binary_cells = query_result
-        .binary_cells
-        .iter()
-        .map(|cell| ((cell.row_index, cell.column_index), cell.bytes.as_slice()))
-        .collect::<HashMap<_, _>>();
-    for (row_index, row) in query_result.rows.iter().enumerate() {
-        push_insert_statement(
-            plugin,
-            &mut output,
-            table_ident,
-            &query_result.columns,
-            row_index,
-            row,
-            &binary_cells,
-        );
-    }
-    output
+    output.push_str(&render_insert_statements(
+        plugin,
+        table_ident,
+        query_result,
+    )?);
+    Ok(output)
 }
 
-fn push_insert_statement(
-    plugin: &dyn DatabasePlugin,
-    output: &mut String,
+pub(crate) fn render_insert_statements<P>(
+    plugin: &P,
     table_ident: &str,
-    columns: &[String],
+    query_result: &QueryResult,
+) -> Result<String>
+where
+    P: DatabasePlugin + ?Sized,
+{
+    let view = query_result
+        .typed_view()
+        .map_err(|error| anyhow::anyhow!("Invalid query result for SQL export: {error}"))?;
+    let context = InsertRenderContext {
+        plugin,
+        table_ident,
+        columns: &query_result.columns,
+        column_meta: &query_result.column_meta,
+        view: &view,
+    };
+    let mut output = String::new();
+    for row_index in 0..query_result.rows.len() {
+        push_insert_statement(&mut output, &context, row_index);
+    }
+    Ok(output)
+}
+
+struct InsertRenderContext<'a, P: DatabasePlugin + ?Sized> {
+    plugin: &'a P,
+    table_ident: &'a str,
+    columns: &'a [String],
+    column_meta: &'a [crate::executor::QueryColumnMeta],
+    view: &'a QueryResultView<'a>,
+}
+
+fn push_insert_statement<P>(
+    output: &mut String,
+    context: &InsertRenderContext<'_, P>,
     row_index: usize,
-    row: &[Option<String>],
-    binary_cells: &HashMap<(usize, usize), &[u8]>,
-) {
+) where
+    P: DatabasePlugin + ?Sized,
+{
     output.push_str("INSERT INTO ");
-    output.push_str(table_ident);
+    output.push_str(context.table_ident);
     output.push_str(" (");
     output.push_str(
-        &columns
+        &context
+            .columns
             .iter()
-            .map(|column| plugin.quote_identifier(column))
+            .map(|column| context.plugin.quote_identifier(column))
             .collect::<Vec<_>>()
             .join(", "),
     );
     output.push_str(") VALUES (");
-    for (index, value) in row.iter().enumerate() {
-        if index > 0 {
+    for column_index in 0..context.columns.len() {
+        if column_index > 0 {
             output.push_str(", ");
         }
-        if let Some(bytes) = binary_cells.get(&(row_index, index)) {
-            output.push_str(&plugin.format_binary_literal(bytes));
-        } else {
-            push_sql_value(output, value.as_deref());
-        }
+        output.push_str(&format_export_value(context, row_index, column_index));
     }
     output.push_str(");\n");
 }
 
-fn push_sql_value(output: &mut String, value: Option<&str>) {
-    match value {
-        Some(value) => {
-            output.push('\'');
-            output.push_str(&value.replace('\'', "''"));
-            output.push('\'');
-        }
-        None => output.push_str("NULL"),
+fn format_export_value<P>(
+    context: &InsertRenderContext<'_, P>,
+    row_index: usize,
+    column_index: usize,
+) -> String
+where
+    P: DatabasePlugin + ?Sized,
+{
+    match context.view.cell(row_index, column_index) {
+        Some(QueryCellRef::Null) => "NULL".to_string(),
+        Some(QueryCellRef::Binary(bytes)) => context.plugin.format_binary_literal(bytes),
+        Some(QueryCellRef::Text(value)) => crate::sql_literal::format_query_text_value(
+            context.plugin,
+            Some(value),
+            context.column_meta.get(column_index),
+        ),
+        None => unreachable!("typed view validated row and column bounds"),
     }
 }
 

@@ -4,17 +4,85 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::Value;
 
-use super::format_import_table_reference;
-use super::import_execution::{ImportStatement, execute_import_statements};
 use crate::DatabasePlugin;
 use crate::connection::DbConnection;
-use crate::executor::SqlResult;
+use crate::executor::{QueryCellRef, QueryResult, SqlResult};
 use crate::import_export::{
     ExportConfig, ExportProgressEvent, ExportProgressSender, ExportResult, FormatHandler,
     ImportConfig, ImportResult,
 };
 
 pub struct JsonFormatHandler;
+
+fn query_result_to_json_rows(query_result: &QueryResult) -> Result<Vec<Value>> {
+    let view = query_result
+        .typed_view()
+        .map_err(|error| anyhow!("Invalid query result for JSON export: {error}"))?;
+    let mut rows = Vec::with_capacity(query_result.rows.len());
+
+    for row_index in 0..query_result.rows.len() {
+        let mut object = serde_json::Map::new();
+        for (column_index, column_name) in query_result.columns.iter().enumerate() {
+            let value = match view.cell(row_index, column_index) {
+                Some(QueryCellRef::Null) => Value::Null,
+                Some(QueryCellRef::Text(value)) => Value::String(value.to_string()),
+                Some(QueryCellRef::Binary(_)) => {
+                    return Err(anyhow!(
+                        "JSON export does not support binary cell at row {}, column {} ({column_name:?}) without an explicit binary encoding",
+                        row_index + 1,
+                        column_index + 1,
+                    ));
+                }
+                None => unreachable!("typed view validated row and column bounds"),
+            };
+            object.insert(column_name.clone(), value);
+        }
+        rows.push(Value::Object(object));
+    }
+
+    Ok(rows)
+}
+
+fn render_streaming_json_chunk(
+    rows: &[Value],
+    is_last_table: bool,
+    stream_started: &mut bool,
+    wrote_row: &mut bool,
+) -> Result<String> {
+    let mut output = String::new();
+
+    if !*stream_started {
+        output.push('[');
+        *stream_started = true;
+    }
+
+    for row in rows {
+        if *wrote_row {
+            output.push_str(",\n");
+        } else {
+            output.push('\n');
+        }
+
+        let rendered = serde_json::to_string_pretty(row)?;
+        for (line_index, line) in rendered.lines().enumerate() {
+            if line_index > 0 {
+                output.push('\n');
+            }
+            output.push_str("  ");
+            output.push_str(line);
+        }
+        *wrote_row = true;
+    }
+
+    if is_last_table {
+        if *wrote_row {
+            output.push('\n');
+        }
+        output.push(']');
+    }
+
+    Ok(output)
+}
 
 #[async_trait]
 impl FormatHandler for JsonFormatHandler {
@@ -25,105 +93,13 @@ impl FormatHandler for JsonFormatHandler {
         config: &ImportConfig,
         data: &str,
     ) -> Result<ImportResult> {
-        let start = Instant::now();
-        let mut errors = Vec::new();
-
-        let table = config
-            .table
-            .as_ref()
-            .ok_or_else(|| anyhow!("Table name required for JSON import"))?;
-        let table_ref = format_import_table_reference(plugin, config, table);
-
-        // 解析JSON
-        let json_value: Value = serde_json::from_str(data)?;
-        let rows = match json_value {
-            Value::Array(arr) => arr,
-            Value::Object(_) => vec![json_value],
-            _ => return Err(anyhow!("JSON must be array or object")),
-        };
-
-        if rows.is_empty() {
-            return Ok(ImportResult {
-                success: true,
-                rows_imported: 0,
-                errors,
-                elapsed_ms: start.elapsed().as_millis(),
-            });
-        }
-
-        let mut statements = Vec::new();
-        if config.truncate_before_import {
-            statements.push(ImportStatement::truncate(format!(
-                "TRUNCATE TABLE {table_ref}"
-            )));
-        }
-
-        // 获取第一行的字段
-        let first_obj = rows[0]
-            .as_object()
-            .ok_or_else(|| anyhow!("JSON array must contain objects"))?;
-        let columns: Vec<String> = first_obj.keys().cloned().collect();
-
-        // 批量插入
-        for row_obj in rows {
-            let obj = match row_obj.as_object() {
-                Some(o) => o,
-                None => {
-                    errors.push("Row is not an object".to_string());
-                    if config.stop_on_error {
-                        break;
-                    }
-                    continue;
-                }
-            };
-
-            let mut insert_sql = format!("INSERT INTO {} (", table_ref);
-            for (i, col) in columns.iter().enumerate() {
-                if i > 0 {
-                    insert_sql.push_str(", ");
-                }
-                insert_sql.push_str(&plugin.quote_identifier(col));
-            }
-            insert_sql.push_str(") VALUES (");
-
-            for (i, col) in columns.iter().enumerate() {
-                if i > 0 {
-                    insert_sql.push_str(", ");
-                }
-                match obj.get(col) {
-                    Some(Value::Null) | None => insert_sql.push_str("NULL"),
-                    Some(Value::String(s)) => {
-                        insert_sql.push_str(&plugin.escape_sql_value(s));
-                    }
-                    Some(Value::Number(n)) => insert_sql.push_str(&n.to_string()),
-                    Some(Value::Bool(b)) => insert_sql.push_str(if *b { "1" } else { "0" }),
-                    Some(v) => {
-                        insert_sql.push_str(&plugin.escape_sql_value(&v.to_string()));
-                    }
-                }
-            }
-            insert_sql.push(')');
-            statements.push(ImportStatement::row(insert_sql, "Insert failed"));
-        }
-
-        if config.use_transaction && !errors.is_empty() {
-            return Ok(ImportResult {
-                success: false,
-                rows_imported: 0,
-                errors,
-                elapsed_ms: start.elapsed().as_millis(),
-            });
-        }
-        let (total_rows, execution_errors) =
-            execute_import_statements(plugin, connection, config, statements).await;
-        errors.extend(execution_errors);
-
-        Ok(ImportResult {
-            success: errors.is_empty(),
-            rows_imported: total_rows,
-            errors,
-            elapsed_ms: start.elapsed().as_millis(),
+        super::json_import::import_json(super::json_import::JsonImportRequest {
+            plugin,
+            connection,
+            config,
+            data,
         })
+        .await
     }
 
     async fn export(
@@ -148,6 +124,8 @@ impl FormatHandler for JsonFormatHandler {
         let mut total_rows = 0u64;
         let total_tables = config.tables.len();
         let is_streaming = progress_tx.is_some();
+        let mut json_stream_started = false;
+        let mut wrote_json_row = false;
 
         let send_progress = |event: ExportProgressEvent| {
             if let Some(tx) = &progress_tx {
@@ -166,7 +144,8 @@ impl FormatHandler for JsonFormatHandler {
                 table: table.clone(),
             });
 
-            let table_ref = plugin.format_table_reference(&config.database, None, table);
+            let table_ref =
+                plugin.format_table_reference(&config.database, config.schema.as_deref(), table);
             let columns_str = if let Some(cols) = &config.columns {
                 cols.iter()
                     .map(|c| plugin.quote_identifier(c))
@@ -176,62 +155,49 @@ impl FormatHandler for JsonFormatHandler {
                 "*".to_string()
             };
 
-            let mut select_sql = format!("SELECT {} FROM {}", columns_str, table_ref);
+            let mut base_sql = format!("SELECT {} FROM {}", columns_str, table_ref);
             if let Some(where_clause) = &config.where_clause {
-                select_sql.push_str(" WHERE ");
-                select_sql.push_str(where_clause);
+                base_sql.push_str(" WHERE ");
+                base_sql.push_str(where_clause);
             }
-            if let Some(limit) = config.limit {
-                let pagination = plugin.format_pagination(limit, 0, "");
-                select_sql.push_str(&pagination);
-            }
+            let paginated_query = config
+                .limit
+                .map(|limit| plugin.build_paginated_query(&base_sql, limit, 0, ""));
+            let select_sql = paginated_query
+                .as_ref()
+                .map(|query| query.sql.as_str())
+                .unwrap_or(base_sql.as_str());
 
             let result = connection
-                .query(&select_sql)
+                .query(select_sql)
                 .await
                 .map_err(|e| anyhow!("Query failed: {}", e))?;
 
-            if let SqlResult::Query(query_result) = result {
-                let mut table_data = Vec::new();
-                let rows_count = query_result.rows.len() as u64;
-
-                for row in &query_result.rows {
-                    let mut obj = serde_json::Map::new();
-                    for (i, col_name) in query_result.columns.iter().enumerate() {
-                        let value = match &row[i] {
-                            Some(v) => Value::String(v.clone()),
-                            None => Value::Null,
-                        };
-                        obj.insert(col_name.clone(), value);
-                    }
-                    table_data.push(Value::Object(obj));
+            if let SqlResult::Query(mut query_result) = result {
+                if let Some(paginated_query) = &paginated_query {
+                    paginated_query.strip_hidden_result_columns(&mut query_result)?;
                 }
+                crate::query_result_normalization::normalize_table_query_result(
+                    plugin,
+                    connection,
+                    &config.database,
+                    config.schema.as_deref(),
+                    table,
+                    &mut query_result,
+                )
+                .await?;
+                let rows_count = query_result.rows.len() as u64;
+                let table_data = query_result_to_json_rows(&query_result)?;
 
                 total_rows += rows_count;
 
                 let table_output = if is_streaming {
-                    if index == 0 {
-                        format!(
-                            "[\n{}",
-                            serde_json::to_string_pretty(&table_data)?
-                                .trim_start_matches('[')
-                                .trim_end_matches(']')
-                        )
-                    } else if index == total_tables - 1 {
-                        format!(
-                            ",\n{}\n]",
-                            serde_json::to_string_pretty(&table_data)?
-                                .trim_start_matches('[')
-                                .trim_end_matches(']')
-                        )
-                    } else {
-                        format!(
-                            ",\n{}",
-                            serde_json::to_string_pretty(&table_data)?
-                                .trim_start_matches('[')
-                                .trim_end_matches(']')
-                        )
-                    }
+                    render_streaming_json_chunk(
+                        &table_data,
+                        index == total_tables - 1,
+                        &mut json_stream_started,
+                        &mut wrote_json_row,
+                    )?
                 } else {
                     String::new()
                 };
@@ -270,5 +236,134 @@ impl FormatHandler for JsonFormatHandler {
             rows_exported: total_rows,
             elapsed_ms,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{query_result_to_json_rows, render_streaming_json_chunk};
+    use crate::executor::{BinaryCell, QueryColumnMeta, QueryResult};
+    use serde_json::{Value, json};
+
+    fn render_tables(tables: Vec<Vec<Value>>) -> String {
+        let total_tables = tables.len();
+        let mut stream_started = false;
+        let mut wrote_row = false;
+        let mut output = String::new();
+
+        for (index, rows) in tables.iter().enumerate() {
+            output.push_str(
+                &render_streaming_json_chunk(
+                    rows,
+                    index == total_tables - 1,
+                    &mut stream_started,
+                    &mut wrote_row,
+                )
+                .unwrap(),
+            );
+        }
+
+        output
+    }
+
+    #[test]
+    fn streaming_json_closes_a_single_empty_table() {
+        let output = render_tables(vec![vec![]]);
+
+        assert_eq!(output, "[]");
+        assert_eq!(serde_json::from_str::<Value>(&output).unwrap(), json!([]));
+    }
+
+    #[test]
+    fn streaming_json_ignores_empty_tables_when_placing_separators() {
+        let output = render_tables(vec![
+            vec![],
+            vec![json!({ "id": "1" })],
+            vec![],
+            vec![json!({ "id": "2" })],
+            vec![],
+        ]);
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&output).unwrap(),
+            json!([{ "id": "1" }, { "id": "2" }])
+        );
+        assert_eq!(output.matches(',').count(), 1);
+    }
+
+    #[test]
+    fn streaming_json_closes_multiple_empty_tables() {
+        let output = render_tables(vec![vec![], vec![], vec![]]);
+
+        assert_eq!(output, "[]");
+        assert_eq!(serde_json::from_str::<Value>(&output).unwrap(), json!([]));
+    }
+
+    #[test]
+    fn json_rows_preserve_null_and_empty_text() {
+        let result = QueryResult {
+            sql: String::new(),
+            columns: vec!["nullable".to_string(), "empty".to_string()],
+            column_meta: vec![
+                QueryColumnMeta::new("nullable", "TEXT"),
+                QueryColumnMeta::new("empty", "TEXT"),
+            ],
+            rows: vec![vec![None, Some(String::new())]],
+            binary_cells: vec![],
+            elapsed_ms: 0,
+        };
+
+        let rows = query_result_to_json_rows(&result).expect("text-only JSON should render");
+
+        assert_eq!(rows, vec![json!({ "nullable": null, "empty": "" })]);
+    }
+
+    #[test]
+    fn json_rows_reject_binary_sidecar_even_with_display_text() {
+        let result = QueryResult {
+            sql: String::new(),
+            columns: vec!["payload".to_string()],
+            column_meta: vec![QueryColumnMeta::new("payload", "BLOB")],
+            rows: vec![vec![Some("true".to_string())]],
+            binary_cells: vec![BinaryCell {
+                row_index: 0,
+                column_index: 0,
+                bytes: b"true".to_vec(),
+            }],
+            elapsed_ms: 0,
+        };
+
+        let error =
+            query_result_to_json_rows(&result).expect_err("JSON has no binary wire encoding");
+
+        assert!(
+            error
+                .to_string()
+                .contains("JSON export does not support binary cell at row 1, column 1")
+        );
+    }
+
+    #[test]
+    fn json_rows_reject_short_rows_without_panicking() {
+        let result = QueryResult {
+            sql: String::new(),
+            columns: vec!["a".to_string(), "b".to_string()],
+            column_meta: vec![
+                QueryColumnMeta::new("a", "TEXT"),
+                QueryColumnMeta::new("b", "TEXT"),
+            ],
+            rows: vec![vec![Some("only one".to_string())]],
+            binary_cells: vec![],
+            elapsed_ms: 0,
+        };
+
+        let error = query_result_to_json_rows(&result)
+            .expect_err("short rows must fail instead of indexing past the row");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Invalid query result for JSON export")
+        );
     }
 }

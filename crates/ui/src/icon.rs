@@ -4,6 +4,7 @@ use gpui::{
     Radians, Render, RenderOnce, SharedString, StyleRefinement, Styled, Svg, Transformation,
     Window, div, img, prelude::FluentBuilder as _, svg,
 };
+use palette::IntoColor;
 // use gpui_component_macros::icon_named;
 use std::path::PathBuf;
 
@@ -90,6 +91,7 @@ pub enum IconName {
     Eye,
     EyeOff,
     File,
+    Json,
     MarkdownColor,
     RichTextColor,
     Unarchive,
@@ -152,6 +154,9 @@ pub enum IconName {
     Star,
     StarFill,
     StarOff,
+    StatusConnected,
+    StatusConnectedLocked,
+    StatusDisconnected,
     Sun,
     ThumbsDown,
     ThumbsUp,
@@ -315,6 +320,7 @@ impl IconName {
         Self::Eye,
         Self::EyeOff,
         Self::File,
+        Self::Json,
         Self::MarkdownColor,
         Self::RichTextColor,
         Self::Unarchive,
@@ -377,6 +383,9 @@ impl IconName {
         Self::Star,
         Self::StarFill,
         Self::StarOff,
+        Self::StatusConnected,
+        Self::StatusConnectedLocked,
+        Self::StatusDisconnected,
         Self::Sun,
         Self::ThumbsDown,
         Self::ThumbsUp,
@@ -556,6 +565,7 @@ impl IconNamed for IconName {
             Self::Eye => "icons/eye.svg",
             Self::EyeOff => "icons/eye-off.svg",
             Self::File => "icons/file.svg",
+            Self::Json => "icons/json.svg",
             Self::MarkdownColor => "icons/markdown_color.svg",
             Self::RichTextColor => "icons/rich_text_color.svg",
             Self::Unarchive => "icons/unarchive.svg",
@@ -618,6 +628,9 @@ impl IconNamed for IconName {
             Self::Star => "icons/star.svg",
             Self::StarFill => "icons/star-fill.svg",
             Self::StarOff => "icons/star-off.svg",
+            Self::StatusConnected => "icons/status-connected.svg",
+            Self::StatusConnectedLocked => "icons/status-connected-locked.svg",
+            Self::StatusDisconnected => "icons/status-disconnected.svg",
             Self::Sun => "icons/sun.svg",
             Self::ThumbsDown => "icons/thumbs-down.svg",
             Self::ThumbsUp => "icons/thumbs-up.svg",
@@ -862,8 +875,8 @@ impl Styled for Icon {
         &mut self.style
     }
 
-    fn text_color(mut self, color: impl Into<Hsla>) -> Self {
-        self.text_color = Some(color.into());
+    fn text_color(mut self, color: impl IntoColor<Hsla>) -> Self {
+        self.text_color = Some(color.into_color());
         self
     }
 }

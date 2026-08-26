@@ -20,7 +20,8 @@ use gpui::{
 use gpui_component::list::{List, ListState};
 use gpui_component::scroll::ScrollbarHandle;
 use gpui_component::{
-    ActiveTheme, Icon, IconName, StyleSized as _, StyledExt, VirtualListScrollHandle, h_flex,
+    ActiveTheme, Colorize as _, Icon, IconName, StyleSized as _, StyledExt,
+    VirtualListScrollHandle, h_flex,
     input::{IndentInline, OutdentInline},
     menu::{ContextMenuExt, PopupMenu},
     scroll::{ScrollableMask, Scrollbar},
@@ -1708,6 +1709,14 @@ where
 
     /// 获取选中区域的列名（供业务层使用）
     pub fn get_selection_columns(&self, cx: &Context<Self>) -> Vec<SharedString> {
+        self.get_selection_column_indices(cx)
+            .into_iter()
+            .map(|delegate_col| self.delegate.get_column_name(delegate_col, cx))
+            .collect()
+    }
+
+    /// 获取选中区域的 delegate 列索引（不包含行号列）。
+    pub fn get_selection_column_indices(&self, cx: &Context<Self>) -> Vec<usize> {
         let Some(range) = self.selection.first_range() else {
             return Vec::new();
         };
@@ -1722,7 +1731,6 @@ where
         selected_delegate_column_range(min_col, max_col, row_number_offset)
             .into_iter()
             .flatten()
-            .map(|delegate_col| self.delegate.get_column_name(delegate_col, cx))
             .collect()
     }
 
@@ -3228,7 +3236,7 @@ where
                     this.child(
                         h_flex()
                             .id("table-body")
-                            .flex_grow()
+                            .flex_grow_1()
                             .size_full()
                             .when(self.options.scrollbar_visible.bottom, |this| {
                                 this.pb(SCROLLBAR_WIDTH)
@@ -3294,7 +3302,7 @@ where
                                         },
                                     ),
                                 )
-                                .flex_grow()
+                                .flex_grow_1()
                                 .size_full()
                                 .with_sizing_behavior(ListSizingBehavior::Auto)
                                 .track_scroll(&self.vertical_scroll_handle)

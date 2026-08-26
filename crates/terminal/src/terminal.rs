@@ -13,15 +13,17 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::tty::{self, Options as PtyOptions};
-use alacritty_terminal::vte::ansi::Color;
+use alacritty_terminal::vte::ansi::{Color, Processor, StdSyncHandler};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use futures::StreamExt;
 use gpui::*;
+use one_core::app_dirs;
 use one_core::gpui_tokio::Tokio;
 use one_core::settings::AppSettings;
 use one_core::storage::models::{
-    ActiveConnections, ProxyType as StorageProxyType, SerialParams, SshAuthMethod, StoredConnection,
+    ActiveConnections, ProxyType as StorageProxyType, SerialParams, SshAccountExpect,
+    SshAuthMethod, StoredConnection, TelnetParams,
 };
 use one_core::storage::{
     GlobalStorageState, TerminalCommandHistoryRepository, TerminalCommandHistorySort,
@@ -39,8 +41,6 @@ use tokio::time::interval;
 use uuid::Uuid;
 
 #[cfg(any(test, target_os = "windows"))]
-use std::env;
-#[cfg(any(test, target_os = "windows"))]
 use std::ffi::OsStr;
 #[cfg(any(test, target_os = "windows"))]
 use std::path::Path;
@@ -53,11 +53,18 @@ use crate::history::{
 };
 use crate::pty_backend::{GpuiEventProxy, LocalPtyBackend};
 use crate::recording::{
-    RecordingBackend, RecordingCompleteness, RecordingConfig, RecordingMetadata, RecordingPlayback,
-    RecordingPlaybackError, RecordingPlaybackSearchIndexStatus, RecordingPlaybackSearchResults,
-    RecordingPlaybackState, RecordingPlaybackTransition, RecordingRuntime, RecordingRuntimeConfig,
-    RecordingRuntimeError, RecordingSnapshot, RecordingStartRequest, RecordingTap,
-    RecordingTransition, TerminalPlaybackRuntime,
+    RecordingArtifactKind, RecordingBackend, RecordingCompleteness, RecordingMetadata,
+    RecordingPlayback, RecordingPlaybackError, RecordingPlaybackSearchIndexStatus,
+    RecordingPlaybackSearchResults, RecordingPlaybackState, RecordingPlaybackTransition,
+    RecordingRuntime, RecordingRuntimeConfig, RecordingRuntimeError, RecordingSessionMetadata,
+    RecordingSnapshot, RecordingStartRequest, RecordingTap, RecordingTransition,
+    TerminalPlaybackRuntime,
+};
+use crate::session_logging::{
+    AutomaticSessionLogRequestInput, application_version, build_automatic_session_log_request,
+    local_recording_session_metadata, output_only_recording_config,
+    serial_recording_session_metadata, ssh_recording_session_metadata,
+    telnet_recording_session_metadata,
 };
 #[cfg(not(target_os = "windows"))]
 use crate::shell_integration::embedded_shell_integration_script;
@@ -69,8 +76,8 @@ use crate::windows_environment::{
 use crate::zmodem::{ZmodemPickerRequest, ZmodemPickerResponse, ZmodemResponder};
 
 use crate::{
-    LocalConfig, SerialBackend, SshBackend, TerminalBackend, TerminalControlHandle, TerminalEvent,
-    TerminalExecHandle, TerminalInputHandle, TerminalPerformanceMetrics,
+    LocalConfig, SerialBackend, SshBackend, TelnetBackend, TerminalBackend, TerminalControlHandle,
+    TerminalEvent, TerminalExecHandle, TerminalInputHandle, TerminalPerformanceMetrics,
     TerminalPerformanceSnapshot, TerminalPerformanceWindow, TerminalSize,
 };
 use ssh::{
@@ -91,6 +98,8 @@ pub enum TerminalModelEvent {
     HostKeyVerificationRequired,
     /// SSH 临时用户名/密码请求状态变化
     SshCredentialChanged,
+    /// Telnet 临时用户名/密码请求状态变化
+    TelnetCredentialChanged,
     /// SSH keyboard-interactive/MFA 请求状态变化
     SshMfaChanged,
     /// SSH ZMODEM 文件选择请求状态变化
@@ -113,6 +122,8 @@ pub enum TerminalModelEvent {
     ClipboardStore(String),
     /// 远程工作目录变更（OSC 7）
     WorkingDirChanged(String),
+    /// 会话锁定/解锁状态变化
+    LockStateChanged,
 }
 
 /// 终端连接状态
@@ -121,6 +132,17 @@ pub enum ConnectionState {
     Connected,
     Connecting,
     Disconnected { error: Option<String> },
+}
+
+fn should_install_connected_backend(state: &ConnectionState) -> bool {
+    !matches!(state, ConnectionState::Disconnected { .. })
+}
+
+/// 会话锁定状态（仅内存中，不持久化）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionLockState {
+    pub password_hash: String,
+    pub hide_output: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,16 +171,18 @@ pub enum TerminalConnectionKind {
     Local,
     Ssh,
     Serial,
+    Telnet,
 }
 
 /// Capability mode for a terminal surface.
 ///
-/// A recording may describe output originally produced by SSH, but replaying
-/// that output must never recreate the source session's live capabilities.
+/// A stored artifact may describe output originally produced by SSH, but
+/// rendering it must never recreate the source session's live capabilities.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TerminalSessionMode {
     Live,
     RecordingPlayback,
+    SessionLog,
 }
 
 const SSH_CLEAR_SCREEN_REDRAW_BYTES: &[u8] = b"\x0c";
@@ -166,7 +190,9 @@ const SSH_CLEAR_SCREEN_REDRAW_BYTES: &[u8] = b"\x0c";
 fn clear_screen_remote_redraw_bytes(kind: TerminalConnectionKind) -> Option<&'static [u8]> {
     match kind {
         TerminalConnectionKind::Ssh => Some(SSH_CLEAR_SCREEN_REDRAW_BYTES),
-        TerminalConnectionKind::Local | TerminalConnectionKind::Serial => None,
+        TerminalConnectionKind::Local
+        | TerminalConnectionKind::Serial
+        | TerminalConnectionKind::Telnet => None,
     }
 }
 
@@ -234,6 +260,7 @@ pub struct SshTerminalConfig {
     pub ssh_config: SshConnectConfig,
     pub pty_config: PtyConfig,
     pub terminal_encoding: TerminalEncoding,
+    pub account_expect: SshAccountExpect,
     /// 关闭 shell integration 注入:走裸 request_shell,失去 OSC 集成。
     pub disable_shell_integration: bool,
 }
@@ -271,6 +298,25 @@ impl TerminalSshCredentialRequest {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TerminalSshCredentials {
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalTelnetCredentialRequest {
+    generation: u64,
+    pub username: bool,
+    pub password: bool,
+}
+
+impl TerminalTelnetCredentialRequest {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TerminalTelnetCredentials {
     pub username: Option<String>,
     pub password: Option<String>,
 }
@@ -318,6 +364,7 @@ fn ssh_auth_from_storage(auth: SshAuthMethod) -> SshAuth {
             certificate_path: None,
         },
         SshAuthMethod::Agent => SshAuth::Agent,
+        SshAuthMethod::Pageant => SshAuth::Pageant,
         SshAuthMethod::AutoPublicKey => SshAuth::AutoPublicKey,
     }
 }
@@ -550,6 +597,7 @@ fn resolve_ssh_connection(
     };
     let keyboard_interactive_enabled = params.keyboard_interactive_enabled();
     let terminal_encoding = params.terminal_encoding.into();
+    let account_expect = params.account_expect.clone();
     let mut pty_config = PtyConfig::default();
     pty_config.term = params.terminal_type.as_str().to_string();
     let init_commands = build_ssh_init_commands(
@@ -592,6 +640,7 @@ fn resolve_ssh_connection(
             ssh_config,
             pty_config,
             terminal_encoding,
+            account_expect,
             disable_shell_integration: params.disable_shell_integration.unwrap_or(false),
         },
         credential_prompt_policy,
@@ -745,7 +794,7 @@ fn path_if_file(path: impl Into<PathBuf>) -> Option<String> {
 #[cfg(any(test, target_os = "windows"))]
 fn find_executable_in_path(path_env: Option<&OsStr>, program: &str) -> Option<String> {
     let path_env = path_env?;
-    env::split_paths(path_env)
+    std::env::split_paths(path_env)
         .map(|dir| dir.join(program))
         .find_map(path_if_file)
 }
@@ -1066,7 +1115,7 @@ pub struct Terminal {
     /// alacritty 终端状态
     term: Arc<FairMutex<Term<GpuiEventProxy>>>,
     /// Whether this surface owns a live connection or renders an untrusted,
-    /// read-only recording.
+    /// read-only artifact.
     session_mode: TerminalSessionMode,
     /// 当前终端实例的共享性能指标。
     performance_metrics: Arc<TerminalPerformanceMetrics>,
@@ -1074,11 +1123,16 @@ pub struct Terminal {
     backend: Option<Box<dyn TerminalBackend>>,
     /// 与终端实例同生命周期的录制运行时；重连只会克隆新的 tap，不会替换时间线。
     recording_runtime: std::result::Result<RecordingRuntime, RecordingRuntimeError>,
-    /// Playback owns a separate fail-closed parser and grid. Live terminals
-    /// never populate this field.
+    /// 自动会话日志使用独立运行时，与手工录制互不影响并跨重连保留时间线。
+    session_log_runtime: Option<RecordingRuntime>,
+    /// Read-only artifacts own a separate fail-closed parser and grid. Live
+    /// terminals never populate this field. Playback controls remain gated by
+    /// `TerminalSessionMode::RecordingPlayback`.
     playback_runtime: Option<TerminalPlaybackRuntime>,
     /// 只用于录制文件关联的随机逻辑会话 ID；不包含连接名称、地址或凭据。
     recording_session_id: String,
+    /// 允许持久化到录制 header 的安全会话字段快照。
+    recording_session_metadata: RecordingSessionMetadata,
 
     /// 终端标题
     title: String,
@@ -1088,6 +1142,8 @@ pub struct Terminal {
     child_exited: Option<i32>,
     /// 连接状态
     connection_state: ConnectionState,
+    /// 会话锁定状态；锁定后禁止输入，可选隐藏输出。
+    session_lock: Option<SessionLockState>,
 
     /// 终端尺寸
     cols: usize,
@@ -1116,6 +1172,12 @@ pub struct Terminal {
     pending_host_key_verification: Option<HostKeyVerificationRequest>,
     /// 串口参数（用于重连）
     serial_params: Option<SerialParams>,
+    /// Telnet 参数（用于重连）
+    telnet_params: Option<TelnetParams>,
+    /// 未注入本次临时用户名/密码的 Telnet 参数模板。
+    telnet_base_params: Option<TelnetParams>,
+    /// 等待用户输入的临时 Telnet 用户名/密码。
+    telnet_credential_request: Option<TerminalTelnetCredentialRequest>,
     /// 完整事件链路中是否已有尚未被 GPUI 消费的 Wakeup。
     wakeup_pending: Arc<AtomicBool>,
     /// 事件发送器（用于 SSH 重连）
@@ -1396,6 +1458,16 @@ struct PendingPlaybackEventLoop {
     wakeup_pending: Arc<AtomicBool>,
 }
 
+struct AutomaticSessionLogRuntimeInput {
+    enabled: bool,
+    event_tx: UnboundedSender<TerminalEvent>,
+    wakeup_pending: Arc<AtomicBool>,
+    backend: RecordingBackend,
+    session_id: String,
+    initial_size: TerminalSize,
+    session: RecordingSessionMetadata,
+}
+
 fn send_coalesced_wakeup(event_tx: &UnboundedSender<TerminalEvent>, wakeup_pending: &AtomicBool) {
     if wakeup_pending.swap(true, Ordering::AcqRel) {
         return;
@@ -1427,10 +1499,80 @@ impl Terminal {
         if self.is_read_only() {
             return None;
         }
-        self.recording_runtime
-            .as_ref()
-            .ok()
-            .map(RecordingRuntime::tap)
+        Self::recording_tap_for_runtimes(&self.recording_runtime, &self.session_log_runtime)
+    }
+
+    fn recording_tap_for_runtimes(
+        recording_runtime: &std::result::Result<RecordingRuntime, RecordingRuntimeError>,
+        session_log_runtime: &Option<RecordingRuntime>,
+    ) -> Option<RecordingTap> {
+        RecordingTap::fan_out(
+            [
+                recording_runtime.as_ref().ok().map(RecordingRuntime::tap),
+                session_log_runtime.as_ref().map(RecordingRuntime::tap),
+            ]
+            .into_iter()
+            .flatten(),
+        )
+    }
+
+    fn start_automatic_session_log(
+        input: AutomaticSessionLogRuntimeInput,
+    ) -> Option<RecordingRuntime> {
+        if !input.enabled {
+            return None;
+        }
+        let Some(data_directory) = app_dirs::data_dir() else {
+            tracing::warn!(
+                "automatic session logging disabled: application data directory missing"
+            );
+            return None;
+        };
+        let started_at_unix_ms = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => u64::try_from(duration.as_millis()).ok(),
+            Err(_) => None,
+        };
+        let Some(started_at_unix_ms) = started_at_unix_ms else {
+            tracing::warn!("automatic session logging disabled: invalid system clock");
+            return None;
+        };
+        let request = build_automatic_session_log_request(AutomaticSessionLogRequestInput {
+            data_directory,
+            backend: input.backend,
+            session_id: input.session_id,
+            initial_size: input.initial_size,
+            session: input.session,
+            started_at_unix_ms,
+            recording_id: Uuid::new_v4().to_string(),
+        });
+        Self::start_automatic_session_log_request(input.event_tx, input.wakeup_pending, request)
+    }
+
+    fn start_automatic_session_log_request(
+        event_tx: UnboundedSender<TerminalEvent>,
+        wakeup_pending: Arc<AtomicBool>,
+        request: std::result::Result<RecordingStartRequest, RecordingRuntimeError>,
+    ) -> Option<RecordingRuntime> {
+        let request = match request {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::warn!(%error, "failed to build automatic terminal session log request");
+                return None;
+            }
+        };
+        let runtime = match Self::create_recording_runtime(event_tx, wakeup_pending) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::warn!(%error, "failed to create automatic terminal session log runtime");
+                return None;
+            }
+        };
+        if let Err(error) = runtime.start(request) {
+            tracing::warn!(%error, "failed to start automatic terminal session log");
+            let _ = runtime.shutdown();
+            return None;
+        }
+        Some(runtime)
     }
 
     fn record_connection_generation_marker(&self, generation: u64) {
@@ -1470,12 +1612,15 @@ impl Terminal {
             performance_metrics,
             backend: None,
             recording_runtime,
+            session_log_runtime: None,
             playback_runtime: None,
             recording_session_id,
+            recording_session_metadata: local_recording_session_metadata(),
             title: String::new(),
             current_working_dir: None,
             child_exited: None,
             connection_state: ConnectionState::Disconnected { error: Some(error) },
+            session_lock: None,
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
             pixel_width: 0,
@@ -1490,6 +1635,9 @@ impl Terminal {
             zmodem_responder: None,
             pending_host_key_verification: None,
             serial_params: None,
+            telnet_params: None,
+            telnet_base_params: None,
+            telnet_credential_request: None,
             wakeup_pending,
             event_tx: Some(event_tx.clone()),
             event_proxy: None,
@@ -1526,7 +1674,9 @@ impl Terminal {
     /// 创建本地终端
     pub fn new_local(config: LocalConfig, cx: &mut Context<Self>) -> Result<Self> {
         let (event_tx, event_rx) = unbounded_channel::<TerminalEvent>();
-        let scrollback_lines = AppSettings::current(cx).terminal_scrollback_lines;
+        let app_settings = AppSettings::current(cx);
+        let scrollback_lines = app_settings.terminal_scrollback_lines;
+        let automatic_logging = app_settings.terminal_auto_session_logging;
         let (term, event_proxy, _colors, performance_metrics) = Self::create_term(
             DEFAULT_COLS,
             DEFAULT_ROWS,
@@ -1536,7 +1686,25 @@ impl Terminal {
         let wakeup_pending = event_proxy.wakeup_pending_handle();
         let recording_runtime =
             Self::create_recording_runtime(event_tx.clone(), wakeup_pending.clone());
-        let recording_tap = recording_runtime.as_ref().ok().map(RecordingRuntime::tap);
+        let recording_session_id = Self::new_recording_session_id();
+        let recording_session_metadata = local_recording_session_metadata();
+        let session_log_runtime =
+            Self::start_automatic_session_log(AutomaticSessionLogRuntimeInput {
+                enabled: automatic_logging,
+                event_tx: event_tx.clone(),
+                wakeup_pending: wakeup_pending.clone(),
+                backend: RecordingBackend::Local,
+                session_id: recording_session_id.clone(),
+                initial_size: TerminalSize {
+                    rows: DEFAULT_ROWS as u16,
+                    cols: DEFAULT_COLS as u16,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+                session: recording_session_metadata.clone(),
+            });
+        let recording_tap =
+            Self::recording_tap_for_runtimes(&recording_runtime, &session_log_runtime);
         let LocalConfig {
             shell,
             args,
@@ -1590,7 +1758,6 @@ impl Terminal {
         Self::spawn_event_loop(event_rx, wakeup_pending.clone(), cx);
         Self::spawn_local_history_loader(history_shell.as_deref(), cx);
         let history_repository = Self::history_repository(cx);
-        let recording_session_id = Self::new_recording_session_id();
 
         Ok(Self {
             term,
@@ -1598,12 +1765,15 @@ impl Terminal {
             performance_metrics,
             backend: Some(Box::new(local_backend)),
             recording_runtime,
+            session_log_runtime,
             playback_runtime: None,
             recording_session_id,
+            recording_session_metadata,
             title: String::new(),
             current_working_dir: None,
             child_exited: None,
             connection_state: ConnectionState::Connected,
+            session_lock: None,
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
             pixel_width: 0,
@@ -1618,6 +1788,9 @@ impl Terminal {
             zmodem_responder: None,
             pending_host_key_verification: None,
             serial_params: None,
+            telnet_params: None,
+            telnet_base_params: None,
+            telnet_credential_request: None,
             wakeup_pending,
             event_tx: Some(event_tx),
             event_proxy: None, // 本地终端的 event_proxy 已在 LocalPtyBackend 中设置
@@ -1688,12 +1861,21 @@ impl Terminal {
             event_tx.clone(),
         )
         .expect("StoredConnection should contain valid SSH params");
+        let recording_session_metadata = ssh_recording_session_metadata(
+            resolved.connection_id,
+            resolved.connection_name.clone(),
+            resolved.config.ssh_config.username.clone(),
+            resolved.config.ssh_config.host.clone(),
+            resolved.config.ssh_config.port,
+        );
         let base_config = resolved.config;
 
         let cols = base_config.pty_config.width as usize;
         let rows = base_config.pty_config.height as usize;
 
-        let scrollback_lines = AppSettings::current(cx).terminal_scrollback_lines;
+        let app_settings = AppSettings::current(cx);
+        let scrollback_lines = app_settings.terminal_scrollback_lines;
+        let automatic_logging = app_settings.terminal_auto_session_logging;
         let (term, event_proxy, _colors, performance_metrics) =
             Self::create_term(cols, rows, scrollback_lines, event_tx.clone());
         let wakeup_pending = event_proxy.wakeup_pending_handle();
@@ -1706,6 +1888,21 @@ impl Terminal {
         let history_repository = Self::history_repository(cx);
         let history_scope = resolved.connection_id.map(TerminalHistoryScope::ssh);
         let recording_session_id = Self::new_recording_session_id();
+        let session_log_runtime =
+            Self::start_automatic_session_log(AutomaticSessionLogRuntimeInput {
+                enabled: automatic_logging,
+                event_tx: event_tx.clone(),
+                wakeup_pending: wakeup_pending.clone(),
+                backend: RecordingBackend::Ssh,
+                session_id: recording_session_id.clone(),
+                initial_size: TerminalSize {
+                    rows: u16::try_from(base_config.pty_config.height).unwrap_or(u16::MAX),
+                    cols: u16::try_from(base_config.pty_config.width).unwrap_or(u16::MAX),
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+                session: recording_session_metadata.clone(),
+            });
 
         let mut terminal = Self {
             term,
@@ -1713,12 +1910,15 @@ impl Terminal {
             performance_metrics,
             backend: None,
             recording_runtime,
+            session_log_runtime,
             playback_runtime: None,
             recording_session_id,
+            recording_session_metadata,
             title: String::new(),
             current_working_dir: None,
             child_exited: None,
             connection_state: ConnectionState::Connecting,
+            session_lock: None,
             cols,
             rows,
             pixel_width: 0,
@@ -1733,6 +1933,9 @@ impl Terminal {
             zmodem_responder: Some(zmodem_responder),
             pending_host_key_verification: None,
             serial_params: None,
+            telnet_params: None,
+            telnet_base_params: None,
+            telnet_credential_request: None,
             wakeup_pending,
             event_tx: Some(event_tx.clone()),
             event_proxy: Some(event_proxy),
@@ -1782,9 +1985,16 @@ impl Terminal {
         let serial_params = conn
             .to_serial_params()
             .expect("StoredConnection 应包含有效的 SerialParams");
+        let recording_session_metadata = serial_recording_session_metadata(
+            conn.id,
+            conn.name.clone(),
+            serial_params.port_name.clone(),
+        );
 
         let (event_tx, event_rx) = unbounded_channel::<TerminalEvent>();
-        let scrollback_lines = AppSettings::current(cx).terminal_scrollback_lines;
+        let app_settings = AppSettings::current(cx);
+        let scrollback_lines = app_settings.terminal_scrollback_lines;
+        let automatic_logging = app_settings.terminal_auto_session_logging;
         let (term, event_proxy, _colors, performance_metrics) = Self::create_term(
             DEFAULT_COLS,
             DEFAULT_ROWS,
@@ -1794,7 +2004,24 @@ impl Terminal {
         let wakeup_pending = event_proxy.wakeup_pending_handle();
         let recording_runtime =
             Self::create_recording_runtime(event_tx.clone(), wakeup_pending.clone());
-        let recording_tap = recording_runtime.as_ref().ok().map(RecordingRuntime::tap);
+        let recording_session_id = Self::new_recording_session_id();
+        let session_log_runtime =
+            Self::start_automatic_session_log(AutomaticSessionLogRuntimeInput {
+                enabled: automatic_logging,
+                event_tx: event_tx.clone(),
+                wakeup_pending: wakeup_pending.clone(),
+                backend: RecordingBackend::Serial,
+                session_id: recording_session_id.clone(),
+                initial_size: TerminalSize {
+                    rows: DEFAULT_ROWS as u16,
+                    cols: DEFAULT_COLS as u16,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+                session: recording_session_metadata.clone(),
+            });
+        let recording_tap =
+            Self::recording_tap_for_runtimes(&recording_runtime, &session_log_runtime);
         let (disconnect_tx, disconnect_rx) = tokio::sync::oneshot::channel::<()>();
         let connection_generation = 1;
 
@@ -1810,7 +2037,6 @@ impl Terminal {
             connection_generation,
             cx,
         );
-        let recording_session_id = Self::new_recording_session_id();
 
         Self {
             term,
@@ -1818,12 +2044,15 @@ impl Terminal {
             performance_metrics,
             backend: None,
             recording_runtime,
+            session_log_runtime,
             playback_runtime: None,
             recording_session_id,
+            recording_session_metadata,
             title: String::new(),
             current_working_dir: None,
             child_exited: None,
             connection_state: ConnectionState::Connecting,
+            session_lock: None,
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
             pixel_width: 0,
@@ -1838,6 +2067,9 @@ impl Terminal {
             zmodem_responder: None,
             pending_host_key_verification: None,
             serial_params: Some(serial_params),
+            telnet_params: None,
+            telnet_base_params: None,
+            telnet_credential_request: None,
             wakeup_pending,
             event_tx: Some(event_tx),
             event_proxy: Some(event_proxy),
@@ -1855,11 +2087,147 @@ impl Terminal {
         }
     }
 
+    pub fn new_telnet(conn: StoredConnection, cx: &mut Context<Self>) -> Self {
+        let telnet_params = match parse_stored_telnet_params(&conn) {
+            Ok(params) => params,
+            Err(message) => {
+                let mut terminal = Self::new_local_disconnected(message, cx);
+                terminal.connection_kind = TerminalConnectionKind::Telnet;
+                terminal.connection_id = conn.id;
+                terminal.connection_name = Some(conn.name.clone());
+                terminal.title = conn.name;
+                return terminal;
+            }
+        };
+        let recording_session_metadata = telnet_recording_session_metadata(
+            conn.id,
+            conn.name.clone(),
+            telnet_params.host.clone(),
+            telnet_params.port,
+        );
+
+        let (event_tx, event_rx) = unbounded_channel::<TerminalEvent>();
+        let app_settings = AppSettings::current(cx);
+        let scrollback_lines = app_settings.terminal_scrollback_lines;
+        let automatic_logging = app_settings.terminal_auto_session_logging;
+        let (term, event_proxy, _colors, performance_metrics) = Self::create_term(
+            DEFAULT_COLS,
+            DEFAULT_ROWS,
+            scrollback_lines,
+            event_tx.clone(),
+        );
+        let wakeup_pending = event_proxy.wakeup_pending_handle();
+        let recording_runtime =
+            Self::create_recording_runtime(event_tx.clone(), wakeup_pending.clone());
+        let recording_session_id = Self::new_recording_session_id();
+        let session_log_runtime =
+            Self::start_automatic_session_log(AutomaticSessionLogRuntimeInput {
+                enabled: automatic_logging,
+                event_tx: event_tx.clone(),
+                wakeup_pending: wakeup_pending.clone(),
+                backend: RecordingBackend::Telnet,
+                session_id: recording_session_id.clone(),
+                initial_size: TerminalSize {
+                    rows: DEFAULT_ROWS as u16,
+                    cols: DEFAULT_COLS as u16,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+                session: recording_session_metadata.clone(),
+            });
+        let recording_tap =
+            Self::recording_tap_for_runtimes(&recording_runtime, &session_log_runtime);
+        let connection_generation = 1;
+        let prompt_username = telnet_params.prompts_for_username();
+        let prompt_password = telnet_params.prompts_for_password();
+        let requires_credentials = prompt_username || prompt_password;
+
+        Self::spawn_event_loop(event_rx, wakeup_pending.clone(), cx);
+        if !requires_credentials {
+            let (disconnect_tx, disconnect_rx) = tokio::sync::oneshot::channel::<Option<String>>();
+            Self::spawn_telnet_disconnect_handler(disconnect_rx, connection_generation, cx);
+            Self::spawn_telnet_connect(
+                telnet_params.clone(),
+                term.clone(),
+                event_proxy.clone(),
+                performance_metrics.clone(),
+                Some(disconnect_tx),
+                recording_tap,
+                connection_generation,
+                cx,
+            );
+        }
+
+        Self {
+            term,
+            session_mode: TerminalSessionMode::Live,
+            performance_metrics,
+            backend: None,
+            recording_runtime,
+            session_log_runtime,
+            playback_runtime: None,
+            recording_session_id,
+            recording_session_metadata,
+            title: String::new(),
+            current_working_dir: None,
+            child_exited: None,
+            connection_state: ConnectionState::Connecting,
+            session_lock: None,
+            cols: DEFAULT_COLS,
+            rows: DEFAULT_ROWS,
+            pixel_width: 0,
+            pixel_height: 0,
+            ssh_config: None,
+            ssh_base_config: None,
+            ssh_session_manager: None,
+            ssh_credential_prompt_policy: SshCredentialPromptPolicy::default(),
+            ssh_credential_request: None,
+            ssh_keyboard_interactive_enabled: false,
+            ssh_mfa_responder: None,
+            zmodem_responder: None,
+            pending_host_key_verification: None,
+            serial_params: None,
+            telnet_params: Some(telnet_params.clone()),
+            telnet_base_params: Some(telnet_params),
+            telnet_credential_request: requires_credentials.then_some(
+                TerminalTelnetCredentialRequest {
+                    generation: connection_generation,
+                    username: prompt_username,
+                    password: prompt_password,
+                },
+            ),
+            wakeup_pending,
+            event_tx: Some(event_tx),
+            event_proxy: Some(event_proxy),
+            connection_id: conn.id,
+            connection_name: Some(conn.name),
+            init_commands: None,
+            session_history: VecDeque::new(),
+            persisted_history: Vec::new(),
+            history_repository: None,
+            history_scope: None,
+            command_record_gate: CommandRecordGate::default(),
+            connection_generation,
+            connection_kind: TerminalConnectionKind::Telnet,
+            scrollback_lines,
+        }
+    }
+
     /// Creates a terminal surface that renders an untrusted recording without
     /// recreating any live PTY, SSH, serial, input, exec, or control capability.
     pub fn new_recording_playback(playback: RecordingPlayback, cx: &mut Context<Self>) -> Self {
         let scrollback_lines = AppSettings::current(cx).terminal_scrollback_lines;
         let (terminal, event_loop) = Self::build_recording_playback(playback, scrollback_lines);
+        Self::spawn_event_loop(event_loop.event_rx, event_loop.wakeup_pending, cx);
+        terminal
+    }
+
+    /// Creates a static, read-only terminal history from a session-log
+    /// artifact. The complete output stream is materialized once and no
+    /// playback timeline or live terminal capability is exposed.
+    pub fn new_session_log(playback: RecordingPlayback, cx: &mut Context<Self>) -> Self {
+        let scrollback_lines = AppSettings::current(cx).terminal_scrollback_lines;
+        let (terminal, event_loop) = Self::build_session_log(playback, scrollback_lines);
         Self::spawn_event_loop(event_loop.event_rx, event_loop.wakeup_pending, cx);
         terminal
     }
@@ -1872,42 +2240,85 @@ impl Terminal {
         playback: RecordingPlayback,
         scrollback_lines: usize,
     ) -> (Self, PendingPlaybackEventLoop) {
+        Self::build_read_only_recording_surface(
+            playback,
+            scrollback_lines,
+            TerminalSessionMode::RecordingPlayback,
+            false,
+        )
+    }
+
+    fn build_session_log(
+        playback: RecordingPlayback,
+        scrollback_lines: usize,
+    ) -> (Self, PendingPlaybackEventLoop) {
+        Self::build_read_only_recording_surface(
+            playback,
+            scrollback_lines,
+            TerminalSessionMode::SessionLog,
+            true,
+        )
+    }
+
+    fn build_read_only_recording_surface(
+        playback: RecordingPlayback,
+        scrollback_lines: usize,
+        session_mode: TerminalSessionMode,
+        materialize_all: bool,
+    ) -> (Self, PendingPlaybackEventLoop) {
+        debug_assert!(session_mode != TerminalSessionMode::Live);
         let source_backend = playback.recording().header.navop.backend;
         let connection_kind = match source_backend {
             RecordingBackend::Local => TerminalConnectionKind::Local,
             RecordingBackend::Ssh => TerminalConnectionKind::Ssh,
             RecordingBackend::Serial => TerminalConnectionKind::Serial,
+            RecordingBackend::Telnet => TerminalConnectionKind::Telnet,
         };
         let scrollback_lines = AppSettings::normalize_terminal_scrollback_lines(scrollback_lines);
         let (event_tx, event_rx) = unbounded_channel::<TerminalEvent>();
         let performance_metrics = Arc::new(TerminalPerformanceMetrics::default());
-        let playback_runtime = TerminalPlaybackRuntime::new(
+        let mut playback_runtime = TerminalPlaybackRuntime::new(
             playback,
             scrollback_lines,
             event_tx.clone(),
             performance_metrics.clone(),
         );
         let initial_size = playback_runtime.initial_size();
+        if materialize_all {
+            playback_runtime.materialize_all();
+        }
         let term = playback_runtime.term().clone();
+        let (cols, rows) = if materialize_all {
+            let term = term.lock();
+            (term.columns(), term.screen_lines())
+        } else {
+            (
+                usize::from(initial_size.cols),
+                usize::from(initial_size.rows),
+            )
+        };
         let wakeup_pending = playback_runtime.wakeup_pending_handle();
 
         (
             Self {
                 term,
-                session_mode: TerminalSessionMode::RecordingPlayback,
+                session_mode,
                 performance_metrics,
                 backend: None,
                 recording_runtime: Err(RecordingRuntimeError::ReadOnlyPlayback),
+                session_log_runtime: None,
                 playback_runtime: Some(playback_runtime),
                 recording_session_id: Self::new_recording_session_id(),
+                recording_session_metadata: RecordingSessionMetadata::default(),
                 title: String::new(),
                 current_working_dir: None,
                 child_exited: None,
                 // Connected suppresses the live reconnect overlay. Capability
                 // checks still fail closed through `session_mode`.
                 connection_state: ConnectionState::Connected,
-                cols: usize::from(initial_size.cols),
-                rows: usize::from(initial_size.rows),
+                session_lock: None,
+                cols,
+                rows,
                 pixel_width: 0,
                 pixel_height: 0,
                 ssh_config: None,
@@ -1920,6 +2331,9 @@ impl Terminal {
                 zmodem_responder: None,
                 pending_host_key_verification: None,
                 serial_params: None,
+                telnet_params: None,
+                telnet_base_params: None,
+                telnet_credential_request: None,
                 wakeup_pending: wakeup_pending.clone(),
                 event_tx: Some(event_tx),
                 event_proxy: None,
@@ -2144,6 +2558,31 @@ impl Terminal {
         .detach();
     }
 
+    fn spawn_telnet_disconnect_handler(
+        disconnect_rx: tokio::sync::oneshot::Receiver<Option<String>>,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let Ok(error) = disconnect_rx.await else {
+                // Backend creation failed before the worker was installed.
+                // handle_telnet_result owns that error and must not be overwritten.
+                return;
+            };
+            let _ = entity.update(cx, |this, cx| {
+                if !this.is_current_connection_generation(generation) {
+                    return;
+                }
+                this.connection_state = ConnectionState::Disconnected { error };
+                this.backend = None;
+                this.set_connection_active(false, cx);
+                cx.emit(TerminalModelEvent::Wakeup);
+            });
+        })
+        .detach();
+    }
+
     fn spawn_ssh_disconnect_handler(
         disconnect_rx: tokio::sync::oneshot::Receiver<Option<String>>,
         generation: u64,
@@ -2184,6 +2623,8 @@ impl Terminal {
             generation,
         } = task;
         let task = Tokio::spawn(cx, async move {
+            let expect_username = config.ssh_config.username.clone();
+            let expect_password = password_from_ssh_auth(&config.ssh_config.auth);
             let disconnect_tx = on_disconnect.map(|tx| {
                 let (sender, mut receiver) = unbounded_channel::<Option<String>>();
                 tokio::spawn(async move {
@@ -2204,6 +2645,9 @@ impl Terminal {
                     event_tx,
                     on_disconnect: disconnect_tx,
                     init_commands,
+                    account_expect: config.account_expect,
+                    expect_username,
+                    expect_password,
                     disable_shell_integration: config.disable_shell_integration,
                 },
                 recording_tap,
@@ -2229,6 +2673,56 @@ impl Terminal {
         });
         cx.emit(TerminalModelEvent::SshCredentialChanged);
         cx.emit(TerminalModelEvent::Wakeup);
+    }
+
+    fn queue_telnet_credential_request(&mut self, generation: u64, cx: &mut Context<Self>) -> bool {
+        let Some(params) = self.telnet_base_params.as_ref() else {
+            return false;
+        };
+        let username = params.prompts_for_username();
+        let password = params.prompts_for_password();
+        if !username && !password {
+            return false;
+        }
+
+        self.telnet_credential_request = Some(TerminalTelnetCredentialRequest {
+            generation,
+            username,
+            password,
+        });
+        cx.emit(TerminalModelEvent::TelnetCredentialChanged);
+        cx.emit(TerminalModelEvent::Wakeup);
+        true
+    }
+
+    fn start_telnet_connection_attempt(
+        &mut self,
+        params: TelnetParams,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(event_proxy) = self.event_proxy.clone() else {
+            return false;
+        };
+
+        let (disconnect_tx, disconnect_rx) = tokio::sync::oneshot::channel::<Option<String>>();
+        Self::spawn_telnet_disconnect_handler(disconnect_rx, generation, cx);
+        Self::spawn_telnet_connect(
+            params.clone(),
+            self.term.clone(),
+            event_proxy,
+            self.performance_metrics.clone(),
+            Some(disconnect_tx),
+            self.recording_tap(),
+            generation,
+            cx,
+        );
+
+        self.telnet_params = Some(params);
+        self.telnet_credential_request = None;
+        cx.emit(TerminalModelEvent::TelnetCredentialChanged);
+        cx.emit(TerminalModelEvent::Wakeup);
+        true
     }
 
     fn start_ssh_connection_attempt(
@@ -2297,6 +2791,11 @@ impl Terminal {
 
         match result {
             Ok(Ok(backend)) => {
+                if !should_install_connected_backend(&self.connection_state) {
+                    // worker 已在 backend 安装前上报断开：不得把状态覆盖回 Connected。
+                    backend.shutdown();
+                    return;
+                }
                 self.pending_host_key_verification = None;
                 self.connection_state = ConnectionState::Connected;
                 self.performance_metrics
@@ -2435,6 +2934,113 @@ impl Terminal {
         cx.emit(TerminalModelEvent::Wakeup);
     }
 
+    fn spawn_telnet_connect(
+        params: TelnetParams,
+        term: Arc<FairMutex<Term<GpuiEventProxy>>>,
+        event_proxy: GpuiEventProxy,
+        performance_metrics: Arc<TerminalPerformanceMetrics>,
+        on_disconnect: Option<tokio::sync::oneshot::Sender<Option<String>>>,
+        recording_tap: Option<RecordingTap>,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let disconnect_tx = on_disconnect.map(|tx| {
+            let (sender, mut receiver) = unbounded_channel::<Option<String>>();
+            Tokio::spawn(cx, async move {
+                if let Some(error) = receiver.recv().await {
+                    let _ = tx.send(error);
+                }
+            })
+            .detach();
+            sender
+        });
+
+        // 与 SSH 一致：TCP 连接在后台完成，成功后 Terminal 才进入
+        // Connected 状态，避免“先显示已连接、随后又变成断开”。
+        let task = Tokio::spawn(cx, async move {
+            TelnetBackend::connect_with_metrics_and_recording(
+                params,
+                term,
+                event_proxy,
+                disconnect_tx,
+                performance_metrics,
+                recording_tap,
+            )
+            .await
+        });
+
+        cx.spawn(async move |this: WeakEntity<Self>, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.handle_telnet_result(result, generation, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn handle_telnet_result(
+        &mut self,
+        result: Result<Result<TelnetBackend, anyhow::Error>, tokio::task::JoinError>,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_current_connection_generation(generation) {
+            if let Ok(Ok(backend)) = result {
+                backend.shutdown();
+            }
+            return;
+        }
+
+        match result {
+            Ok(Ok(backend)) => {
+                if !should_install_connected_backend(&self.connection_state) {
+                    // worker 已在 backend 安装前上报断开：不得把状态覆盖回 Connected。
+                    backend.shutdown();
+                    return;
+                }
+                self.connection_state = ConnectionState::Connected;
+                self.set_connection_active(true, cx);
+                // 连接过程是异步的，连接完成时终端尺寸可能已经变化；
+                // 与 SSH 一样把当前尺寸同步到新后端。
+                self.term.lock().resize(TermDimensions {
+                    cols: self.cols,
+                    rows: self.rows,
+                });
+                backend.resize(TerminalSize {
+                    rows: self.rows as u16,
+                    cols: self.cols as u16,
+                    pixel_width: self.pixel_width,
+                    pixel_height: self.pixel_height,
+                });
+                self.backend = Some(Box::new(backend));
+                tracing::info!("Telnet 连接成功");
+            }
+            Ok(Err(error)) => {
+                tracing::error!(
+                    target: "terminal.telnet.connect",
+                    error = %error,
+                    "Telnet connection failed"
+                );
+                self.connection_state = ConnectionState::Disconnected {
+                    error: Some(error.to_string()),
+                };
+                self.set_connection_active(false, cx);
+            }
+            Err(error) => {
+                tracing::error!(
+                    target: "terminal.telnet.connect",
+                    error = %error,
+                    "Telnet connect task failed"
+                );
+                self.connection_state = ConnectionState::Disconnected {
+                    error: Some(error.to_string()),
+                };
+                self.set_connection_active(false, cx);
+            }
+        }
+        cx.emit(TerminalModelEvent::Wakeup);
+    }
+
     fn set_connection_active(&self, active: bool, cx: &mut Context<Self>) {
         let Some(connection_id) = self.connection_id else {
             return;
@@ -2489,7 +3095,7 @@ impl Terminal {
                 .as_ref()
                 .map(|config| config.ssh_config.username.clone()),
             TerminalConnectionKind::Local => std::env::var("USER").ok(),
-            TerminalConnectionKind::Serial => None,
+            TerminalConnectionKind::Serial | TerminalConnectionKind::Telnet => None,
         }
     }
 
@@ -2797,6 +3403,71 @@ impl Terminal {
         self.start_ssh_connection_attempt(runtime_config, responder, generation, cx)
     }
 
+    pub fn telnet_credential_request(&self) -> Option<TerminalTelnetCredentialRequest> {
+        self.telnet_credential_request.clone()
+    }
+
+    pub fn submit_telnet_credentials(
+        &mut self,
+        generation: u64,
+        credentials: TerminalTelnetCredentials,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(request) = self.telnet_credential_request.clone() else {
+            return false;
+        };
+        if generation != request.generation
+            || !self.is_current_connection_generation(request.generation)
+        {
+            return false;
+        }
+
+        let username = if request.username {
+            let Some(username) = credentials.username.as_deref().map(str::trim) else {
+                return false;
+            };
+            if username.is_empty() {
+                return false;
+            }
+            Some(username.to_string())
+        } else {
+            None
+        };
+        let password = if request.password {
+            let Some(password) = credentials.password else {
+                return false;
+            };
+            if password.is_empty() {
+                return false;
+            }
+            Some(password)
+        } else {
+            None
+        };
+
+        let Some(mut params) = self.telnet_base_params.clone() else {
+            return false;
+        };
+        params.apply_login_credentials(username.as_deref(), password.as_deref());
+        params.credential_reference = None;
+        params.prompt_username = None;
+        params.prompt_password = None;
+
+        self.connection_state = ConnectionState::Connecting;
+        self.set_connection_active(false, cx);
+        if self.start_telnet_connection_attempt(params, generation, cx) {
+            true
+        } else {
+            self.telnet_credential_request = None;
+            self.connection_state = ConnectionState::Disconnected {
+                error: Some("Telnet connection runtime is unavailable".to_string()),
+            };
+            cx.emit(TerminalModelEvent::TelnetCredentialChanged);
+            cx.emit(TerminalModelEvent::Wakeup);
+            false
+        }
+    }
+
     pub fn ssh_mfa_request(&self) -> Option<TerminalMfaRequest> {
         self.ssh_mfa_responder
             .as_ref()
@@ -2834,8 +3505,61 @@ impl Terminal {
         self.session_mode == TerminalSessionMode::RecordingPlayback
     }
 
+    pub fn is_session_log(&self) -> bool {
+        self.session_mode == TerminalSessionMode::SessionLog
+    }
+
     pub fn is_read_only(&self) -> bool {
-        self.is_recording_playback()
+        matches!(
+            self.session_mode,
+            TerminalSessionMode::RecordingPlayback | TerminalSessionMode::SessionLog
+        )
+    }
+
+    /// 会话是否处于锁定状态。
+    pub fn is_locked(&self) -> bool {
+        self.session_lock.is_some()
+    }
+
+    /// 锁定状态下是否隐藏输出。
+    pub fn hide_output(&self) -> bool {
+        self.session_lock
+            .as_ref()
+            .map(|lock| lock.hide_output)
+            .unwrap_or(false)
+    }
+
+    /// 锁定密码哈希是否匹配（用于解锁全部会话时校验）。
+    pub fn lock_password_matches(&self, password_hash: &str) -> bool {
+        self.session_lock
+            .as_ref()
+            .is_some_and(|lock| lock.password_hash == password_hash)
+    }
+
+    /// 锁定会话；密码仅保存在内存中。
+    pub fn lock_session(
+        &mut self,
+        password_hash: String,
+        hide_output: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.session_lock = Some(SessionLockState {
+            password_hash,
+            hide_output,
+        });
+        cx.emit(TerminalModelEvent::LockStateChanged);
+        cx.notify();
+    }
+
+    /// 密码哈希匹配时解锁会话。
+    pub fn unlock_session(&mut self, password_hash: &str, cx: &mut Context<Self>) -> bool {
+        let matches = self.lock_password_matches(password_hash);
+        if matches {
+            self.session_lock = None;
+            cx.emit(TerminalModelEvent::LockStateChanged);
+            cx.notify();
+        }
+        matches
     }
 
     /// Returns a connection kind only when the surface owns live connection
@@ -3028,6 +3752,7 @@ impl Terminal {
             TerminalConnectionKind::Local => RecordingBackend::Local,
             TerminalConnectionKind::Ssh => RecordingBackend::Ssh,
             TerminalConnectionKind::Serial => RecordingBackend::Serial,
+            TerminalConnectionKind::Telnet => RecordingBackend::Telnet,
         };
 
         Ok(RecordingStartRequest {
@@ -3036,11 +3761,11 @@ impl Terminal {
                 recording_id: Uuid::new_v4().to_string(),
                 session_id: self.recording_session_id.clone(),
                 backend,
-                application_version: option_env!("NAVOP_APPLICATION_VERSION")
-                    .unwrap_or(env!("CARGO_PKG_VERSION"))
-                    .to_string(),
+                artifact_kind: RecordingArtifactKind::Recording,
+                application_version: application_version(),
                 started_at_unix_ms,
                 capture_input: false,
+                session: Some(self.recording_session_metadata.clone()),
             },
             initial_size: TerminalSize {
                 rows,
@@ -3048,7 +3773,7 @@ impl Terminal {
                 pixel_width: self.pixel_width,
                 pixel_height: self.pixel_height,
             },
-            recording: RecordingConfig::default(),
+            recording: output_only_recording_config(),
         })
     }
 
@@ -3092,12 +3817,23 @@ impl Terminal {
 
     /// 是否可以重连
     pub fn can_reconnect(&self) -> bool {
-        !self.is_read_only() && (self.ssh_config.is_some() || self.serial_params.is_some())
+        !self.is_read_only()
+            && (self.ssh_config.is_some()
+                || self.serial_params.is_some()
+                || self.telnet_params.is_some())
+    }
+
+    /// 当前会话的退格键编码；非 Telnet 会话保持历史默认 DEL（0x7F）。
+    pub fn telnet_backspace_code(&self) -> one_core::storage::TelnetBackspaceCode {
+        self.telnet_params
+            .as_ref()
+            .map(|params| params.backspace_code)
+            .unwrap_or_default()
     }
 
     /// 写入数据到终端
     pub fn write(&self, data: &[u8]) {
-        if self.is_read_only() {
+        if self.is_read_only() || self.is_locked() {
             return;
         }
         if let Some(ref backend) = self.backend {
@@ -3113,7 +3849,7 @@ impl Terminal {
     }
 
     pub fn external_input_handle(&self) -> Option<TerminalInputHandle> {
-        if self.is_read_only() {
+        if self.is_read_only() || self.is_locked() {
             return None;
         }
         self.backend
@@ -3122,7 +3858,7 @@ impl Terminal {
     }
 
     pub fn external_exec_handle(&self) -> Option<TerminalExecHandle> {
-        if self.is_read_only() {
+        if self.is_read_only() || self.is_locked() {
             return None;
         }
         self.backend
@@ -3131,7 +3867,7 @@ impl Terminal {
     }
 
     pub fn external_control_handle(&self) -> Option<TerminalControlHandle> {
-        if self.is_read_only() {
+        if self.is_read_only() || self.is_locked() {
             return None;
         }
         self.backend
@@ -3141,9 +3877,9 @@ impl Terminal {
 
     /// 调整终端大小
     pub fn resize(&mut self, cols: usize, rows: usize, pixel_width: u16, pixel_height: u16) {
-        if self.is_recording_playback() {
-            // The recording header and Resize events are authoritative for the
-            // playback grid. Canvas layout may update only cached pixel size.
+        if self.is_read_only() {
+            // The artifact header and Resize events are authoritative for the
+            // read-only grid. Canvas layout may update only cached pixel size.
             self.pixel_width = pixel_width;
             self.pixel_height = pixel_height;
             return;
@@ -3302,6 +4038,28 @@ impl Terminal {
                 generation,
                 cx,
             );
+        } else if let Some(params) = self
+            .telnet_base_params
+            .clone()
+            .or_else(|| self.telnet_params.clone())
+        {
+            self.connection_state = ConnectionState::Connecting;
+            self.set_connection_active(false, cx);
+            if let Some(backend) = self.backend.take() {
+                backend.shutdown();
+            }
+            self.prepare_surface_for_reconnect();
+            let generation = self.next_connection_generation();
+            self.record_connection_generation_marker(generation);
+            self.telnet_credential_request = None;
+
+            if params.prompts_for_username() || params.prompts_for_password() {
+                if !self.queue_telnet_credential_request(generation, cx) {
+                    return false;
+                }
+            } else if !self.start_telnet_connection_attempt(params, generation, cx) {
+                return false;
+            }
         } else {
             return false;
         }
@@ -3311,8 +4069,15 @@ impl Terminal {
     }
 
     fn prepare_surface_for_reconnect(&mut self) {
-        // Keep the existing alacritty grid and scrollback. The replacement
-        // backend appends its output to the same terminal surface.
+        // Keep the primary grid and scrollback, but never carry a stale full-screen
+        // alternate-screen application (such as Vim) into the replacement backend.
+        let mut term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            let mut processor: Processor<StdSyncHandler> = Processor::new();
+            processor.advance(&mut *term, b"\x1b[?1049l");
+            term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+        }
+        drop(term);
         self.child_exited = None;
         self.current_working_dir = None;
     }
@@ -3427,13 +4192,21 @@ impl Terminal {
                 tracing::warn!(%error, "failed to shut down terminal recording runtime");
             }
         }
+        if let Some(session_log_runtime) = &self.session_log_runtime {
+            if let Err(error) = session_log_runtime.shutdown() {
+                tracing::warn!(
+                    %error,
+                    "failed to shut down automatic terminal session log runtime"
+                );
+            }
+        }
     }
 
     // ========== 选择操作 ==========
 
     /// 获取选中的文本
     pub fn selection_text(&self) -> Option<String> {
-        self.term.lock().selection_to_string()
+        crate::selection_text_from_term(&self.term.lock())
     }
 
     /// 清除选择
@@ -3558,6 +4331,15 @@ impl Terminal {
     }
 }
 
+/// 解析持久化边界上的 Telnet 参数。
+///
+/// `StoredConnection.params` 可能来自旧版本迁移、云同步、导入或数据库损坏，
+/// 调用方必须处理解析失败，不能直接 expect/panic。
+fn parse_stored_telnet_params(conn: &StoredConnection) -> Result<TelnetParams, String> {
+    conn.to_telnet_params()
+        .map_err(|error| format!("Telnet 连接参数损坏或不兼容: {error}"))
+}
+
 fn format_connection_error(err: &anyhow::Error) -> String {
     format!("{err:#}")
 }
@@ -3635,18 +4417,20 @@ mod tests {
     #[cfg(target_os = "macos")]
     use super::with_local_terminal_default_env;
     use super::{
-        CommandRecordGate, ConnectionState, HostKeyVerificationReason, HostKeyVerificationRequest,
+        AutomaticSessionLogRequestInput, CommandRecordGate, ConnectionState,
+        HostKeyVerificationReason, HostKeyVerificationRequest, SessionLockState,
         SshConnectionUpdate, SshCredentialPromptPolicy, TermDimensions, Terminal,
         TerminalConnectionKind, TerminalMfaPrompt, TerminalMfaRequest, TerminalMfaResponder,
-        TerminalScrollProxy, TerminalSessionMode, TerminalSshCredentials, build_cd_command,
-        build_ssh_base_init_commands, build_ssh_init_commands, clear_screen_remote_redraw_bytes,
-        compose_ssh_init_commands, flush_pending_terminal_events, format_connection_error,
-        host_key_verification_request, is_reconnect_generation, is_ssh_password_prompt,
-        keyboard_interactive_answers_for_terminal, merge_history_matches,
-        normalize_history_matches, receive_terminal_event_for_gpui, recent_text_from_term,
+        TerminalScrollProxy, TerminalSessionMode, TerminalSshCredentials,
+        build_automatic_session_log_request, build_cd_command, build_ssh_base_init_commands,
+        build_ssh_init_commands, clear_screen_remote_redraw_bytes, compose_ssh_init_commands,
+        flush_pending_terminal_events, format_connection_error, host_key_verification_request,
+        is_reconnect_generation, is_ssh_password_prompt, keyboard_interactive_answers_for_terminal,
+        merge_history_matches, normalize_history_matches, parse_stored_telnet_params,
+        receive_terminal_event_for_gpui, recent_text_from_term,
         resolve_default_windows_shell_from_env, resolve_local_working_dir, resolve_ssh_connection,
-        send_coalesced_wakeup, shell_escape_arg, ssh_config_with_confirmed_host_key,
-        ssh_config_with_runtime_credentials,
+        send_coalesced_wakeup, shell_escape_arg, should_install_connected_backend,
+        ssh_config_with_confirmed_host_key, ssh_config_with_runtime_credentials,
     };
     use crate::history::{
         HistoryEntry, ShellHistoryFormat, collect_history_suggestions, normalize_history_command,
@@ -3654,12 +4438,13 @@ mod tests {
     };
     use crate::recording::{
         ASCIICAST_VERSION, NAVOP_EVENT_STREAM, NAVOP_RECORDING_FORMAT_VERSION, ParsedRecording,
-        RecordingBackend, RecordingCompleteness, RecordingConfig, RecordingEvent,
-        RecordingEventKind, RecordingFileLimits, RecordingHeader, RecordingHeaderMetadata,
-        RecordingMetadata, RecordingPlayback, RecordingPlaybackError, RecordingPlaybackLimits,
-        RecordingPlaybackSearchKind, RecordingPlaybackState, RecordingPlaybackTransition,
-        RecordingRuntime, RecordingRuntimeConfig, RecordingRuntimeError, RecordingStartRequest,
-        RecordingState, RecordingTapOutcome, RecordingTransition, read_recording,
+        RecordingArtifactKind, RecordingBackend, RecordingCompleteness, RecordingConfig,
+        RecordingEvent, RecordingEventKind, RecordingFileLimits, RecordingHeader,
+        RecordingHeaderMetadata, RecordingMetadata, RecordingPlayback, RecordingPlaybackError,
+        RecordingPlaybackLimits, RecordingPlaybackSearchKind, RecordingPlaybackState,
+        RecordingPlaybackTransition, RecordingRuntime, RecordingRuntimeConfig,
+        RecordingRuntimeError, RecordingSessionMetadata, RecordingStartRequest, RecordingState,
+        RecordingTapOutcome, RecordingTransition, read_recording,
     };
     use crate::{
         TerminalBackend, TerminalControlHandle, TerminalEvent, TerminalExecHandle,
@@ -3669,8 +4454,8 @@ mod tests {
     use alacritty_terminal::grid::Dimensions;
     use alacritty_terminal::index::{Column, Line, Point, Side};
     use alacritty_terminal::selection::SelectionType;
-    use alacritty_terminal::term::TermDamage;
     use alacritty_terminal::term::cell::Flags;
+    use alacritty_terminal::term::{TermDamage, TermMode};
     use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
     use anyhow::anyhow;
     use one_core::storage::models::{SshAuthMethod, SshParams, StoredConnection};
@@ -3687,6 +4472,19 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::mpsc::unbounded_channel;
+
+    #[test]
+    fn connected_backend_installation_rejects_a_prior_disconnect() {
+        assert!(should_install_connected_backend(
+            &ConnectionState::Connecting
+        ));
+        assert!(should_install_connected_backend(
+            &ConnectionState::Connected
+        ));
+        assert!(!should_install_connected_backend(
+            &ConnectionState::Disconnected { error: None }
+        ));
+    }
 
     struct ResizeProbe {
         sizes: Arc<Mutex<Vec<TerminalSize>>>,
@@ -3759,12 +4557,22 @@ mod tests {
             performance_metrics,
             backend: None,
             recording_runtime,
+            session_log_runtime: None,
             playback_runtime: None,
             recording_session_id: "terminal-runtime-test-session".to_string(),
+            recording_session_metadata: RecordingSessionMetadata {
+                connection_id: Some(1),
+                connection_name: Some("test SSH".to_string()),
+                remote_user: Some("tester".to_string()),
+                remote_host: Some("example.test".to_string()),
+                remote_port: Some(22),
+                ..RecordingSessionMetadata::default()
+            },
             title: String::new(),
             current_working_dir: None,
             child_exited: None,
             connection_state: ConnectionState::Connected,
+            session_lock: None,
             cols: 80,
             rows: 24,
             pixel_width: 640,
@@ -3779,6 +4587,9 @@ mod tests {
             zmodem_responder: None,
             pending_host_key_verification: None,
             serial_params: None,
+            telnet_params: None,
+            telnet_base_params: None,
+            telnet_credential_request: None,
             wakeup_pending,
             event_tx: Some(event_tx),
             event_proxy: Some(event_proxy),
@@ -3803,9 +4614,11 @@ mod tests {
                 recording_id: "terminal-runtime-test-recording".to_string(),
                 session_id: "terminal-runtime-test-session".to_string(),
                 backend: RecordingBackend::Ssh,
+                artifact_kind: RecordingArtifactKind::Recording,
                 application_version: "0.1.0-test".to_string(),
                 started_at_unix_ms: 1_700_000_000_123,
                 capture_input: false,
+                session: None,
             },
             initial_size: TerminalSize {
                 rows: 24,
@@ -3832,10 +4645,12 @@ mod tests {
                     recording_id: "terminal-playback-test-recording".to_string(),
                     session_id: "terminal-playback-test-session".to_string(),
                     backend,
+                    artifact_kind: RecordingArtifactKind::Recording,
                     application_version: "0.1.0-test".to_string(),
                     started_at_unix_ms: 1_700_000_000_123,
                     capture_input: true,
                     event_stream: NAVOP_EVENT_STREAM.to_string(),
+                    session: None,
                 },
             },
             events: vec![
@@ -3994,6 +4809,17 @@ mod tests {
         assert!(!first.metadata.capture_input);
         assert!(!first.recording.capture_input);
         assert_eq!(
+            Some(&RecordingSessionMetadata {
+                connection_id: Some(1),
+                connection_name: Some("test SSH".to_string()),
+                remote_user: Some("tester".to_string()),
+                remote_host: Some("example.test".to_string()),
+                remote_port: Some(22),
+                ..RecordingSessionMetadata::default()
+            }),
+            first.metadata.session.as_ref()
+        );
+        assert_eq!(
             TerminalSize {
                 rows: 24,
                 cols: 80,
@@ -4007,6 +4833,48 @@ mod tests {
 
         terminal.shutdown();
         terminal.shutdown();
+    }
+
+    #[test]
+    fn automatic_session_log_request_is_output_only_and_uses_dated_catalog_path() {
+        let request = build_automatic_session_log_request(AutomaticSessionLogRequestInput {
+            data_directory: PathBuf::from("/data"),
+            backend: RecordingBackend::Serial,
+            session_id: "logical-session".to_string(),
+            initial_size: TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            session: RecordingSessionMetadata {
+                connection_id: Some(7),
+                connection_name: Some("console".to_string()),
+                serial_port: Some("/dev/ttyUSB0".to_string()),
+                ..RecordingSessionMetadata::default()
+            },
+            started_at_unix_ms: 1_723_651_441_123,
+            recording_id: "recording-id".to_string(),
+        })
+        .expect("build automatic session log request");
+
+        assert_eq!(
+            PathBuf::from(
+                "/data/session-logs/2024/08/20240814-160401-123-serial-recording-id.cast"
+            ),
+            request.final_path
+        );
+        assert!(!request.metadata.capture_input);
+        assert!(!request.recording.capture_input);
+        assert_eq!("logical-session", request.metadata.session_id);
+        assert_eq!(
+            Some("/dev/ttyUSB0"),
+            request
+                .metadata
+                .session
+                .as_ref()
+                .and_then(|session| session.serial_port.as_deref())
+        );
     }
 
     #[test]
@@ -4186,6 +5054,63 @@ mod tests {
                 .lock()
                 .expect("external input probe should lock")
         );
+
+        terminal.write(b"human input");
+        assert_eq!(
+            vec![b"human input".to_vec()],
+            *direct_writes
+                .lock()
+                .expect("direct input probe should lock")
+        );
+
+        terminal.shutdown();
+        terminal.shutdown();
+    }
+
+    #[test]
+    fn locked_session_blocks_all_input_routes_and_unlock_requires_password_match() {
+        let runtime = RecordingRuntime::new(RecordingRuntimeConfig::default())
+            .expect("create recording runtime");
+        let mut terminal = test_terminal_with_recording_runtime(Ok(runtime));
+        let direct_writes = Arc::new(Mutex::new(Vec::new()));
+        let external_writes = Arc::new(Mutex::new(Vec::new()));
+        terminal.backend = Some(Box::new(InputRouteProbe {
+            direct_writes: direct_writes.clone(),
+            external_writes: external_writes.clone(),
+        }));
+
+        let hash = "correct-lock-hash";
+        terminal.session_lock = Some(SessionLockState {
+            password_hash: hash.to_string(),
+            hide_output: true,
+        });
+
+        assert!(terminal.is_locked());
+        assert!(terminal.hide_output());
+        assert!(terminal.lock_password_matches(hash));
+
+        terminal.write(b"human input");
+        terminal.write_external_input(b"external input");
+        assert!(
+            direct_writes
+                .lock()
+                .expect("direct input probe should lock")
+                .is_empty()
+        );
+        assert!(
+            external_writes
+                .lock()
+                .expect("external input probe should lock")
+                .is_empty()
+        );
+        assert!(terminal.external_input_handle().is_none());
+        assert!(terminal.external_exec_handle().is_none());
+        assert!(terminal.external_control_handle().is_none());
+
+        assert!(!terminal.lock_password_matches("wrong-lock-hash"));
+
+        terminal.session_lock = None;
+        assert!(!terminal.is_locked());
 
         terminal.write(b"human input");
         assert_eq!(
@@ -4411,6 +5336,69 @@ mod tests {
     }
 
     #[test]
+    fn session_log_constructor_materializes_static_read_only_terminal_history() {
+        let mut parsed =
+            test_parsed_playback_recording(RecordingBackend::Ssh, RecordingCompleteness::Complete);
+        parsed.header.navop.artifact_kind = RecordingArtifactKind::SessionLog;
+        let playback = RecordingPlayback::from_parsed(parsed, RecordingPlaybackLimits::default())
+            .expect("validate session log");
+        let (mut terminal, _event_loop) = Terminal::build_session_log(playback, 100_000);
+
+        assert_eq!(TerminalSessionMode::SessionLog, terminal.session_mode());
+        assert!(terminal.is_session_log());
+        assert!(terminal.is_read_only());
+        assert!(!terminal.is_recording_playback());
+        assert_eq!(TerminalConnectionKind::Ssh, terminal.connection_kind());
+        assert_eq!(None, terminal.live_connection_kind());
+        assert!(terminal.backend.is_none());
+        assert!(terminal.external_input_handle().is_none());
+        assert!(terminal.external_exec_handle().is_none());
+        assert!(terminal.external_control_handle().is_none());
+        assert!(!terminal.can_reconnect());
+
+        assert_eq!(100, terminal.cols());
+        assert_eq!(40, terminal.rows());
+        let text = terminal.visible_text();
+        assert!(text.contains("one"));
+        assert!(text.contains("two"));
+        assert!(!text.contains("typed-command"));
+        assert!(!text.contains("checkpoint"));
+
+        assert_eq!(None, terminal.recording_playback_state());
+        assert_eq!(None, terminal.recording_playback_elapsed());
+        assert_eq!(None, terminal.recording_playback_duration());
+        assert_eq!(None, terminal.recording_playback_speed());
+        assert!(matches!(
+            terminal.resume_recording_playback(),
+            Err(RecordingPlaybackError::NotPlaybackSession)
+        ));
+        assert!(matches!(
+            terminal.pause_recording_playback(),
+            Err(RecordingPlaybackError::NotPlaybackSession)
+        ));
+        assert!(matches!(
+            terminal.set_recording_playback_speed(2.0),
+            Err(RecordingPlaybackError::NotPlaybackSession)
+        ));
+        assert!(matches!(
+            terminal.advance_recording_playback(Duration::from_millis(1)),
+            Err(RecordingPlaybackError::NotPlaybackSession)
+        ));
+        assert!(matches!(
+            terminal.seek_recording_playback(Duration::ZERO),
+            Err(RecordingPlaybackError::NotPlaybackSession)
+        ));
+        assert!(matches!(
+            terminal.search_recording_playback("one", 10),
+            Err(RecordingPlaybackError::NotPlaybackSession)
+        ));
+
+        terminal.resize(200, 60, 1_600, 900);
+        assert_eq!(100, terminal.cols());
+        assert_eq!(40, terminal.rows());
+    }
+
+    #[test]
     fn recording_playback_source_kind_never_restores_live_capabilities() {
         for (backend, expected_kind) in [
             (RecordingBackend::Local, TerminalConnectionKind::Local),
@@ -4524,6 +5512,7 @@ mod tests {
         let mut connection = StoredConnection::new_ssh(
             "Latest SSH".to_string(),
             SshParams {
+                sftp_account: None,
                 host: "latest.example".to_string(),
                 port: 2222,
                 username: "latest-user".to_string(),
@@ -4548,6 +5537,7 @@ mod tests {
                 proxy: None,
                 os_id: None,
                 icon: None,
+                account_expect: Default::default(),
             },
             None,
         );
@@ -4587,6 +5577,7 @@ mod tests {
         let connection = StoredConnection::new_ssh(
             "Prompted SSH".to_string(),
             SshParams {
+                sftp_account: None,
                 host: "prompted.example".to_string(),
                 port: 22,
                 username: "stored-user".to_string(),
@@ -4611,6 +5602,7 @@ mod tests {
                 proxy: None,
                 os_id: None,
                 icon: None,
+                account_expect: Default::default(),
             },
             None,
         );
@@ -4657,6 +5649,7 @@ mod tests {
         let connection = StoredConnection::new_ssh(
             "No keyboard-interactive".to_string(),
             SshParams {
+                sftp_account: None,
                 host: "no-ki.example".to_string(),
                 port: 22,
                 username: "user".to_string(),
@@ -4681,6 +5674,7 @@ mod tests {
                 proxy: None,
                 os_id: None,
                 icon: None,
+                account_expect: Default::default(),
             },
             None,
         );
@@ -4713,6 +5707,7 @@ mod tests {
         let connection = StoredConnection::new_ssh(
             "Host-key retry".to_string(),
             SshParams {
+                sftp_account: None,
                 host: "host-key.example".to_string(),
                 port: 22,
                 username: "stored-user".to_string(),
@@ -4737,6 +5732,7 @@ mod tests {
                 proxy: None,
                 os_id: None,
                 icon: None,
+                account_expect: Default::default(),
             },
             None,
         );
@@ -5577,12 +6573,15 @@ mod tests {
                 event_tx.clone(),
                 wakeup_pending.clone(),
             ),
+            session_log_runtime: None,
             playback_runtime: None,
             recording_session_id: "surface-reset-test-session".to_string(),
+            recording_session_metadata: RecordingSessionMetadata::default(),
             title: "old title".to_string(),
             current_working_dir: Some("/tmp/project".to_string()),
             child_exited: Some(255),
             connection_state: ConnectionState::Connected,
+            session_lock: None,
             cols: 80,
             rows: 24,
             pixel_width: 0,
@@ -5597,6 +6596,9 @@ mod tests {
             zmodem_responder: None,
             pending_host_key_verification: None,
             serial_params: None,
+            telnet_params: None,
+            telnet_base_params: None,
+            telnet_credential_request: None,
             wakeup_pending,
             event_tx: Some(event_tx),
             event_proxy: None,
@@ -5617,6 +6619,11 @@ mod tests {
         processor.advance(&mut *terminal.term.lock(), b"hello");
 
         assert_eq!(terminal.term.lock().grid()[Line(0)][Column(0)].c, 'h');
+        processor.advance(&mut *terminal.term.lock(), b"\x1b[?1049hvim");
+        {
+            let term = terminal.term.lock();
+            assert!(term.mode().contains(TermMode::ALT_SCREEN));
+        }
         let previous = terminal.performance_snapshot();
         terminal
             .performance_metrics()
@@ -5634,6 +6641,7 @@ mod tests {
 
         processor.advance(&mut *terminal.term.lock(), b" world");
         let term = terminal.term.lock();
+        assert!(!term.mode().contains(TermMode::ALT_SCREEN));
         assert_eq!(term.grid()[Line(0)][Column(0)].c, 'h');
         assert_eq!(term.grid()[Line(0)][Column(5)].c, ' ');
         assert_eq!(term.grid()[Line(0)][Column(6)].c, 'w');
@@ -5849,12 +6857,15 @@ mod tests {
                 event_tx.clone(),
                 wakeup_pending.clone(),
             ),
+            session_log_runtime: None,
             playback_runtime: None,
             recording_session_id: "scrollback-test-session".to_string(),
+            recording_session_metadata: RecordingSessionMetadata::default(),
             title: String::new(),
             current_working_dir: None,
             child_exited: None,
             connection_state: ConnectionState::Connected,
+            session_lock: None,
             cols: 80,
             rows: 24,
             pixel_width: 0,
@@ -5869,6 +6880,9 @@ mod tests {
             zmodem_responder: None,
             pending_host_key_verification: None,
             serial_params: None,
+            telnet_params: None,
+            telnet_base_params: None,
+            telnet_credential_request: None,
             wakeup_pending,
             event_tx: Some(event_tx),
             event_proxy: Some(event_proxy),
@@ -5887,6 +6901,19 @@ mod tests {
 
         terminal.set_scrollback_lines(250_000);
         assert_eq!(250_000, terminal.scrollback_lines());
+    }
+
+    #[test]
+    fn telnet_params_parse_error_is_reported_without_panicking() {
+        let mut conn = StoredConnection::new_telnet(
+            "Broken Telnet".to_string(),
+            one_core::storage::models::TelnetParams::default(),
+            None,
+        );
+        conn.params = r#"[]"#.to_string();
+
+        let error = parse_stored_telnet_params(&conn).expect_err("非法 JSON 应解析失败");
+        assert!(error.contains("Telnet 连接参数损坏或不兼容"));
     }
 }
 

@@ -25,9 +25,13 @@ use one_ui::edit_table::Column;
 use smol::Timer;
 use tracing::log::error;
 
+use crate::sidebar::execution_history::ExecutionContext;
+use crate::sidebar::execution_history_panel::ExecutionHistoryPanel;
 use crate::table_data::cell_preview_host::CellPreviewHost;
 use crate::table_data::data_grid::{DataGrid, DataGridConfig, DataGridUsage};
 use ai_chat_view::AskAiButton;
+use db::cache_manager::{GlobalNodeCache, SchemaInvalidationPlan};
+use one_core::connection_notifier::{ConnectionDataEvent, GlobalConnectionNotifier};
 use one_core::gpui_tokio::Tokio;
 use one_core::settings::AppSettings;
 use parking_lot::Mutex;
@@ -103,6 +107,34 @@ pub(crate) struct SessionSqlRun {
     pub database: Option<String>,
     pub schema: Option<String>,
     pub database_type: one_core::storage::DatabaseType,
+    pub schema_invalidation: SessionSchemaInvalidation,
+}
+
+#[derive(Clone)]
+pub(crate) enum SessionSchemaInvalidation {
+    Immediate,
+    Deferred(Arc<Mutex<SchemaInvalidationPlan>>),
+}
+
+fn emit_schema_changed_events(
+    cx: &mut AsyncApp,
+    notifier: Option<&GlobalConnectionNotifier>,
+    scopes: Vec<(String, String, Option<String>)>,
+) {
+    let Some(notifier) = notifier else {
+        return;
+    };
+    for (connection_id, database, schema) in scopes {
+        let _ = cx.update(|cx| {
+            notifier.0.update(cx, |_, cx| {
+                cx.emit(ConnectionDataEvent::SchemaChanged {
+                    connection_id,
+                    database,
+                    schema,
+                });
+            });
+        });
+    }
 }
 
 impl StatementListData {
@@ -200,6 +232,7 @@ pub struct SqlResultTabContainer {
     pub total_elapsed_ms: Entity<f64>,
     /// 执行开始时间，用于实时更新运行时间
     pub execution_start: Entity<Option<Instant>>,
+    execution_history: Entity<ExecutionHistoryPanel>,
     /// 停止计时器的标志
     timer_stop_flag: Arc<AtomicBool>,
     /// 当前执行的取消令牌
@@ -209,7 +242,11 @@ pub struct SqlResultTabContainer {
 }
 
 impl SqlResultTabContainer {
-    pub(crate) fn new(_window: &mut Window, cx: &mut Context<Self>) -> SqlResultTabContainer {
+    pub(crate) fn new(
+        execution_history: Entity<ExecutionHistoryPanel>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> SqlResultTabContainer {
         let result_tabs = cx.new(|_| vec![]);
         let active_result_tab = cx.new(|_| 0);
         let all_results = cx.new(|_| vec![]);
@@ -236,6 +273,7 @@ impl SqlResultTabContainer {
             show_errors_only,
             total_elapsed_ms,
             execution_start,
+            execution_history,
             timer_stop_flag,
             execution_cancellation,
             execution_generation,
@@ -417,10 +455,23 @@ impl SqlResultTabContainer {
                 Ok(receiver) => receiver,
                 Err(e) => {
                     error!("Error starting streaming execution: {:?}", e);
+                    let error_message = e.to_string();
                     cx.update(|cx| {
                         if !clone_self.is_current_execution(generation) {
                             return;
                         }
+                        clone_self.execution_history.update(cx, |history, cx| {
+                            history.record_transport_error(
+                                ExecutionContext {
+                                    connection_id: connection_id_clone.clone(),
+                                    database: database_clone.clone(),
+                                    schema: schema_clone.clone(),
+                                },
+                                sql.clone(),
+                                error_message,
+                                cx,
+                            );
+                        });
                         // 停止计时器
                         clone_self.timer_stop_flag.store(true, Ordering::SeqCst);
                         // 清除开始时间
@@ -593,11 +644,13 @@ impl SqlResultTabContainer {
         });
 
         cx.spawn(async move |cx: &mut AsyncApp| {
-            let (global_state, max_rows) = cx.update(|cx| {
+            let (global_state, max_rows, cache, notifier) = cx.update(|cx| {
                 let global_state = cx.global::<GlobalDbState>().clone();
                 let sql_query_max_rows = AppSettings::current(cx).sql_query_max_rows;
                 let max_rows = (sql_query_max_rows > 0).then_some(sql_query_max_rows as usize);
-                (global_state, max_rows)
+                let cache = cx.try_global::<GlobalNodeCache>().cloned();
+                let notifier = cx.try_global::<GlobalConnectionNotifier>().cloned();
+                (global_state, max_rows, cache, notifier)
             });
             let exec_opts = db::ExecOptions {
                 stop_on_error: false,
@@ -608,9 +661,9 @@ impl SqlResultTabContainer {
             let sql = request.sql.clone();
             let execution_state = global_state.clone();
             let execution_task = Tokio::spawn_result(cx, async move {
-                execution_state
+                Ok(execution_state
                     .execute_session(session_id, sql, Some(exec_opts))
-                    .await
+                    .await)
             });
             let execution_result = tokio::select! {
                 biased;
@@ -627,8 +680,20 @@ impl SqlResultTabContainer {
                         error
                     );
                 }
+                if let Some(cache) = cache {
+                    let plan = global_state.conservative_sql_cache_invalidation_plan(
+                        &request.connection_id,
+                        request.database.as_deref(),
+                        request.schema.as_deref(),
+                    );
+                    let scopes = global_state
+                        .apply_sql_cache_invalidation_plan(&cache, &request.connection_id, &plan)
+                        .await;
+                    emit_schema_changed_events(cx, notifier.as_ref(), scopes);
+                }
                 return None;
             };
+            let execution_result = execution_result.unwrap_or_else(Err);
             let results = match execution_result {
                 Ok(results) => results,
                 Err(error) => vec![SqlResult::Error(SqlErrorInfo {
@@ -636,6 +701,40 @@ impl SqlResultTabContainer {
                     message: error.to_string(),
                 })],
             };
+            if let Some(cache) = cache {
+                let mut plan = SchemaInvalidationPlan::default();
+                for result in &results {
+                    let sql = match result {
+                        SqlResult::Query(result) => Some(result.sql.as_str()),
+                        SqlResult::Exec(result) => Some(result.sql.as_str()),
+                        SqlResult::Error(_) => None,
+                    };
+                    if let Some(sql) = sql.filter(|sql| !sql.trim().is_empty()) {
+                        plan.merge(global_state.plan_sql_cache_invalidation(
+                            &cache,
+                            &request.connection_id,
+                            sql,
+                            request.database.as_deref(),
+                            request.schema.as_deref(),
+                        ));
+                    }
+                }
+                match &request.schema_invalidation {
+                    SessionSchemaInvalidation::Immediate => {
+                        let scopes = global_state
+                            .apply_sql_cache_invalidation_plan(
+                                &cache,
+                                &request.connection_id,
+                                &plan,
+                            )
+                            .await;
+                        emit_schema_changed_events(cx, notifier.as_ref(), scopes);
+                    }
+                    SessionSchemaInvalidation::Deferred(pending) => {
+                        pending.lock().merge(plan);
+                    }
+                }
+            }
             let has_query_result = results
                 .iter()
                 .any(|result| matches!(result, SqlResult::Query(_)));
@@ -758,6 +857,17 @@ impl SqlResultTabContainer {
             session_id,
             database_type,
         } = execution;
+        self.execution_history.update(cx, |history, cx| {
+            history.record_sql_results(
+                ExecutionContext {
+                    connection_id: connection_id.clone(),
+                    database: database.clone(),
+                    schema: schema.clone(),
+                },
+                &results,
+                cx,
+            );
+        });
         let mut new_all_results = Vec::new();
         let mut new_tabs = Vec::new();
 
@@ -769,14 +879,13 @@ impl SqlResultTabContainer {
             new_all_results.push(result.clone());
 
             if let SqlResult::Query(query_result) = result {
-                let (editable, table_name) = if let Some(ref plugin) = plugin {
-                    match plugin.analyze_select_editability(&query_result.sql) {
-                        Some(parsed_table_name) => (true, parsed_table_name),
-                        None => (false, "".to_string()),
-                    }
+                let analysis = if let Some(ref plugin) = plugin {
+                    plugin.analyze_select_query(&query_result.sql)
                 } else {
-                    (false, "".to_string())
+                    db::SelectQueryAnalysis::default()
                 };
+                let editable = analysis.editable;
+                let table_name = analysis.table_name.unwrap_or_default();
 
                 let mut config = DataGridConfig::new(
                     db_name.clone(),
@@ -785,6 +894,7 @@ impl SqlResultTabContainer {
                     database_type.clone(),
                 )
                 .editable(editable)
+                .schema_metadata_safe(analysis.schema_metadata_safe)
                 .show_toolbar(true)
                 .usage(DataGridUsage::SqlResult)
                 .rows_count(query_result.rows.len())
@@ -797,7 +907,7 @@ impl SqlResultTabContainer {
                     config = config.with_session_id(session_id);
                 }
 
-                let data_grid = cx.new(|cx| DataGrid::new(config, _window, cx));
+                let data_grid = cx.new(|cx| DataGrid::new(config, None, _window, cx));
                 let content = cx.new(|cx| CellPreviewHost::new(data_grid.clone(), _window, cx));
 
                 let columns = query_result
@@ -819,7 +929,7 @@ impl SqlResultTabContainer {
                         query_result.binary_cells.clone(),
                         cx,
                     );
-                    this.load_column_meta_if_editable(cx);
+                    this.load_column_meta_for_sql_result(cx);
                 });
 
                 if editable
@@ -831,6 +941,7 @@ impl SqlResultTabContainer {
                     let database_name = db_name.clone();
                     let table_name = table_name.clone();
                     let data_grid = data_grid.clone();
+                    let expected_generation = data_grid.read(cx).current_data_generation();
                     cx.spawn(async move |cx: &mut AsyncApp| {
                         let result = global_state
                             .list_views_view(cx, connection_id, database_name)
@@ -851,7 +962,9 @@ impl SqlResultTabContainer {
                         if is_view {
                             cx.update(|cx| {
                                 data_grid.update(cx, |grid, cx| {
-                                    grid.set_editable(false, cx);
+                                    if grid.is_data_generation_current(expected_generation) {
+                                        grid.set_editable(false, cx);
+                                    }
                                 });
                             });
                         }
@@ -1249,7 +1362,7 @@ impl SqlResultTabContainer {
     fn render_sql_column(
         item: &StatementListItem,
         sql_display: String,
-        status_color: impl Into<gpui::Hsla>,
+        status_color: gpui::Hsla,
         idx: usize,
         _cx: &Context<Self>,
     ) -> impl IntoElement {
@@ -1319,7 +1432,7 @@ impl SqlResultTabContainer {
     fn render_message_column(
         &self,
         item: &StatementListItem,
-        status_color: impl Into<gpui::Hsla>,
+        status_color: gpui::Hsla,
         idx: usize,
         _cx: &Context<Self>,
     ) -> impl IntoElement {

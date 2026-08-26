@@ -2,11 +2,13 @@ use gpui::{App, AppContext, Context, Entity, Window};
 use gpui_component::{
     WindowExt, button::ButtonVariant, dialog::DialogButtonProps, notification::Notification,
 };
+use one_core::connection_notifier::{ConnectionDataEvent, emit_connection_event_from_app};
 use one_core::popup_window::{PopupWindowOptions, open_popup_window};
 use one_core::storage::{
     CredentialEntry, CredentialReferenceHit, CredentialRepository, DeleteCredentialOutcome,
     StorageManager,
 };
+use rust_i18n::t;
 
 use super::{CredentialVaultView, form_window::CredentialFormWindow};
 
@@ -22,14 +24,12 @@ impl CredentialVaultView {
         match result {
             Ok(Some(entry)) => self.open_form(Some(entry), window, cx),
             Ok(None) => window.push_notification(
-                Notification::error("凭据不存在，可能已被删除").autohide(true),
+                Notification::error(t!("CredentialVault.not_found").to_string()).autohide(true),
                 cx,
             ),
             Err(error) => window.push_notification(
-                Notification::error(format!(
-                    "无法打开凭据：{error}。若钥匙串已锁定，请先解锁主密钥。"
-                ))
-                .autohide(true),
+                Notification::error(t!("CredentialVault.open_failed", error = error).to_string())
+                    .autohide(true),
                 cx,
             ),
         }
@@ -46,9 +46,9 @@ impl CredentialVaultView {
         let view = cx.entity();
         open_popup_window(
             PopupWindowOptions::new(if editing {
-                "编辑凭据"
+                t!("CredentialForm.edit_title").to_string()
             } else {
-                "新增凭据"
+                t!("CredentialForm.create_title").to_string()
             })
             .size(700.0, 650.0)
             .min_width(560.0)
@@ -56,6 +56,7 @@ impl CredentialVaultView {
             move |window, cx| {
                 cx.new(|cx| CredentialFormWindow::new(existing, storage_manager, view, window, cx))
             },
+            Some(_window),
             cx,
         );
     }
@@ -73,16 +74,14 @@ impl CredentialVaultView {
             let storage_manager = storage_manager.clone();
             let view = view.clone();
             alert
-                .title("删除凭据")
-                .description(format!(
-                    "确定删除“{name}”吗？如果有连接仍在引用它，删除会被安全拒绝。"
-                ))
+                .title(t!("CredentialVault.delete_title").to_string())
+                .description(t!("CredentialVault.delete_description", name = name).to_string())
                 .confirm()
                 .button_props(
                     DialogButtonProps::default()
-                        .ok_text("删除")
+                        .ok_text(t!("CredentialVault.delete").to_string())
                         .ok_variant(ButtonVariant::Danger)
-                        .cancel_text("取消")
+                        .cancel_text(t!("CredentialForm.cancel").to_string())
                         .show_cancel(true),
                 )
                 .on_ok(move |_, window, cx| {
@@ -101,20 +100,41 @@ fn delete_credential(
 ) -> bool {
     let result = storage
         .get::<CredentialRepository>()
-        .ok_or_else(|| "CredentialRepository 尚未注册".to_string())
-        .and_then(|repo| repo.delete_checked(id).map_err(|e| e.to_string()));
+        .ok_or_else(|| t!("CredentialVault.repository_unavailable").to_string())
+        .and_then(|repo| {
+            let cloud_id = repo
+                .get_summary(id)
+                .map_err(|error| error.to_string())?
+                .and_then(|summary| summary.cloud_id);
+            let outcome = repo.delete_checked(id).map_err(|error| error.to_string())?;
+            Ok((outcome, cloud_id))
+        });
     match result {
-        Ok(DeleteCredentialOutcome::Deleted) => {
+        Ok((DeleteCredentialOutcome::Deleted, cloud_id)) => {
+            emit_connection_event_from_app(
+                ConnectionDataEvent::CredentialDeleted {
+                    credential_id: id,
+                    cloud_id,
+                },
+                cx,
+            );
             _ = view.update(cx, |view, cx| view.reload(cx));
-            window.push_notification(Notification::success("凭据已删除").autohide(true), cx);
+            window.push_notification(
+                Notification::success(t!("CredentialVault.deleted").to_string()).autohide(true),
+                cx,
+            );
             true
         }
-        Ok(DeleteCredentialOutcome::NotFound) => {
+        Ok((DeleteCredentialOutcome::NotFound, _)) => {
             _ = view.update(cx, |view, cx| view.reload(cx));
-            window.push_notification(Notification::warning("凭据已不存在").autohide(true), cx);
+            window.push_notification(
+                Notification::warning(t!("CredentialVault.already_deleted").to_string())
+                    .autohide(true),
+                cx,
+            );
             true
         }
-        Ok(DeleteCredentialOutcome::Referenced(hits)) => {
+        Ok((DeleteCredentialOutcome::Referenced(hits), _)) => {
             window.push_notification(
                 Notification::error(format_reference_hits(&hits)).autohide(false),
                 cx,
@@ -123,7 +143,8 @@ fn delete_credential(
         }
         Err(error) => {
             window.push_notification(
-                Notification::error(format!("删除凭据失败：{error}")).autohide(true),
+                Notification::error(t!("CredentialVault.delete_failed", error = error).to_string())
+                    .autohide(true),
                 cx,
             );
             false
@@ -132,19 +153,23 @@ fn delete_credential(
 }
 
 fn format_reference_hits(hits: &[CredentialReferenceHit]) -> String {
-    let mut lines = vec!["该凭据仍被以下连接引用，请先取消引用：".to_string()];
+    let mut lines = vec![t!("CredentialVault.reference_header").to_string()];
     lines.extend(hits.iter().take(5).map(|hit| {
         let via = hit
             .via_ssh_connection_id
-            .map(|id| format!("，经 SSH 连接 #{id}"))
+            .map(|id| t!("CredentialVault.reference_via_ssh", id = id).to_string())
             .unwrap_or_default();
-        format!(
-            "• {}（{:?} / {:?}{}）",
-            hit.connection_name, hit.connection_type, hit.location, via
+        t!(
+            "CredentialVault.reference_item",
+            name = hit.connection_name,
+            connection_type = format!("{:?}", hit.connection_type),
+            location = format!("{:?}", hit.location),
+            via = via
         )
+        .to_string()
     }));
     if hits.len() > 5 {
-        lines.push(format!("…以及另外 {} 个引用", hits.len() - 5));
+        lines.push(t!("CredentialVault.reference_more", count = hits.len() - 5).to_string());
     }
     lines.join("\n")
 }

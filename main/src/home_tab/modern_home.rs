@@ -1,9 +1,9 @@
 use gpui::{
-    AnyElement, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px,
+    AnyElement, ColorExt as _, FontWeight, InteractiveElement, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    ActiveTheme, Icon, IconName, IconSize, Sizable, StyledExt,
+    ActiveTheme, Icon, IconName, IconSize, InteractiveElementExt, Sizable, StyledExt,
     button::{Button, ButtonVariants as _},
     h_flex, v_flex,
 };
@@ -11,11 +11,15 @@ use one_core::storage::StoredConnection;
 use rust_i18n::t;
 
 use super::{
-    HomePage,
+    HomePage, HomeSyncButtonContext, HomeSyncButtonState, home_sync_button_state,
     modern_home_shortcuts::{new_connection_shortcut, quick_open_shortcut, terminal_shortcut},
+    sync_route,
 };
 use crate::connection_visuals::ConnectionVisualSize;
 use crate::home::connection_import_window::show_connection_import_window;
+use crate::license::is_feature_enabled;
+use one_core::license::Feature;
+use one_core::settings::AppSettings;
 
 const START_CENTER_MAX_WIDTH: gpui::Pixels = px(1040.0);
 const START_CENTER_MAIN_COLUMN_WIDTH: gpui::Pixels = px(580.0);
@@ -28,6 +32,21 @@ impl HomePage {
         cx: &mut gpui::Context<Self>,
     ) -> AnyElement {
         let view = cx.entity();
+        let route = sync_route(cx);
+        let personal_syncing = matches!(
+            crate::personal_sync_runtime::runtime_status(cx),
+            crate::personal_sync_status::PersonalSyncRuntimeStatus::Syncing
+        );
+        let sync_button_state = home_sync_button_state(HomeSyncButtonContext {
+            route,
+            sync_enabled: AppSettings::global(cx).sync_enabled,
+            is_logged_in: self.current_user.is_some(),
+            has_sync_license: is_feature_enabled(Feature::CloudSync, cx),
+            onet_syncing: self.syncing,
+            personal_sync_ready: crate::personal_sync_runtime::actions_enabled(cx),
+            personal_syncing,
+        });
+        let syncing = self.syncing || personal_syncing;
 
         div()
             .id("modern-home-start-center")
@@ -61,12 +80,13 @@ impl HomePage {
                                         .id("modern-home-side-column")
                                         .min_w_0()
                                         .flex_basis(START_CENTER_SIDE_COLUMN_WIDTH)
-                                        .flex_grow()
+                                        .flex_grow_1()
                                         .gap_3()
                                         .child(render_create_panel(cx.entity(), window, cx))
                                         .child(render_workspace_tools(cx.entity(), window, cx))
                                         .child(render_status_panel(
-                                            self.syncing,
+                                            syncing,
+                                            sync_button_state,
                                             cx.entity(),
                                             window,
                                             cx,
@@ -226,7 +246,7 @@ impl HomePage {
             .bg(cx.theme().background)
             .cursor_pointer()
             .hover(move |style| style.bg(hover_background).border_color(hover_border))
-            .on_click(
+            .on_double_click(
                 window.listener_for(&cx.entity(), move |home, _, window, cx| {
                     home.open_connection_from_quick(&open_connection, window, cx);
                 }),
@@ -246,7 +266,7 @@ impl HomePage {
             .child(
                 v_flex()
                     .min_w_0()
-                    .flex_grow()
+                    .flex_grow_1()
                     .gap_0p5()
                     .child(
                         div()
@@ -294,7 +314,7 @@ fn render_brand(cx: &gpui::App) -> impl IntoElement {
         .child(
             v_flex()
                 .min_w_0()
-                .flex_grow()
+                .flex_grow_1()
                 .gap_1()
                 .child(
                     div()
@@ -338,7 +358,7 @@ fn render_create_panel(
             view,
             window,
             |_, window, cx| {
-                show_connection_import_window(cx.entity(), window.window_handle(), cx);
+                show_connection_import_window(cx.entity(), window, cx);
             },
             cx,
         ))
@@ -372,18 +392,6 @@ fn render_workspace_tools(
                     cx,
                 ))
                 .child(utility_row(
-                    "modern-home-credential-vault",
-                    IconName::Key,
-                    t!("Home.credential_vault").to_string(),
-                    t!("Home.StartCenter.credential_vault_description").to_string(),
-                    view.clone(),
-                    window,
-                    |home, window, cx| {
-                        home.add_credential_vault_tab(window, cx);
-                    },
-                    cx,
-                ))
-                .child(utility_row(
                     "modern-home-ai",
                     IconName::Bot,
                     t!("Settings.General.Startup.default_page_ai_workbench").to_string(),
@@ -412,6 +420,7 @@ fn render_workspace_tools(
 
 fn render_status_panel(
     syncing: bool,
+    sync_button_state: HomeSyncButtonState,
     view: gpui::Entity<HomePage>,
     window: &mut Window,
     cx: &gpui::App,
@@ -421,7 +430,7 @@ fn render_status_panel(
     let key_view = view;
 
     surface_panel("modern-home-status-panel", cx)
-        .flex_grow()
+        .flex_grow_1()
         .child(panel_header(t!("Home.StartCenter.status"), None, cx))
         .child(
             v_flex()
@@ -441,12 +450,12 @@ fn render_status_panel(
                             t!("Home.sync").to_string()
                         },
                         t!("Home.StartCenter.sync_description").to_string(),
-                        !syncing,
+                        !sync_button_state.is_disabled(),
                         cx,
                     )
-                    .when(!syncing, |this| {
-                        this.on_click(window.listener_for(&sync_view, |home, _, _, cx| {
-                            home.trigger_sync(cx);
+                    .when(!sync_button_state.is_disabled(), |this| {
+                        this.on_click(window.listener_for(&sync_view, |home, _, window, cx| {
+                            home.handle_sync_click(window, cx);
                         }))
                     }),
                 )
@@ -504,7 +513,7 @@ fn panel_header(title: impl IntoElement, badge: Option<String>, cx: &gpui::App) 
             .child(
                 div()
                     .min_w_0()
-                    .flex_grow()
+                    .flex_grow_1()
                     .text_sm()
                     .font_semibold()
                     .text_color(cx.theme().foreground)
@@ -611,7 +620,7 @@ fn utility_row(
         .child(
             v_flex()
                 .min_w_0()
-                .flex_grow()
+                .flex_grow_1()
                 .gap_0p5()
                 .child(
                     div()
@@ -671,7 +680,7 @@ fn status_row(
         .child(
             v_flex()
                 .min_w_0()
-                .flex_grow()
+                .flex_grow_1()
                 .gap_0p5()
                 .child(
                     div()

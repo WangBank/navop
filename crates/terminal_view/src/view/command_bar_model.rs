@@ -1,4 +1,5 @@
-use one_core::storage::QuickCommand;
+use gpui::Keystroke;
+use one_core::{keybindings::keystroke_matches_shortcuts, storage::QuickCommand};
 use std::collections::HashSet;
 
 pub(super) const COMMAND_SUGGESTION_LIMIT: usize = 8;
@@ -181,6 +182,31 @@ pub(super) fn selected_quick_command(
         .map(|command| command.command.clone())
 }
 
+pub(super) fn quick_command_for_shortcut(
+    commands: &[QuickCommand],
+    connection_id: Option<i64>,
+    keystroke: &Keystroke,
+) -> Option<String> {
+    fn matches(command: &QuickCommand, keystroke: &Keystroke) -> bool {
+        command.shortcut.as_ref().is_some_and(|shortcut| {
+            keystroke_matches_shortcuts(keystroke, std::slice::from_ref(shortcut))
+        })
+    }
+
+    if let Some(connection_id) = connection_id {
+        if let Some(command) = commands.iter().find(|command| {
+            command.connection_id == Some(connection_id) && matches(command, keystroke)
+        }) {
+            return Some(command.command.clone());
+        }
+    }
+
+    commands
+        .iter()
+        .find(|command| command.connection_id.is_none() && matches(command, keystroke))
+        .map(|command| command.command.clone())
+}
+
 pub(super) fn command_submission_bytes(command: &str) -> Option<Vec<u8>> {
     let command = command.trim();
     if command.is_empty() {
@@ -189,6 +215,10 @@ pub(super) fn command_submission_bytes(command: &str) -> Option<Vec<u8>> {
     let mut bytes = command.as_bytes().to_vec();
     bytes.push(b'\r');
     Some(bytes)
+}
+
+pub(crate) fn quick_command_executes_on_click(command: &str) -> bool {
+    command.ends_with(['\r', '\n'])
 }
 
 /// Split a possibly multi-line command into individual statements so batch

@@ -17,6 +17,8 @@ mod host;
 
 #[cfg(feature = "wasm-components")]
 pub(crate) use host::ManifestConnectionImportHost;
+#[cfg(all(test, feature = "wasm-components"))]
+pub(crate) use host::candidates_for_platform;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestConnectionImporter {
@@ -33,6 +35,18 @@ pub struct ManifestConnectionImporter {
 pub struct ManualConnectionImportFile {
     pub importer_id: String,
     pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportPreviewReport {
+    pub records: Vec<ImportRecord>,
+    pub errors: Vec<ImportPreviewError>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportPreviewError {
+    pub importer_id: String,
+    pub message: String,
 }
 
 impl ManualConnectionImportFile {
@@ -170,7 +184,7 @@ pub async fn preview_manifest_connection_importers(
     composite_root: &Path,
     importer_ids: &[String],
     include_passwords: bool,
-) -> Result<Vec<ImportRecord>> {
+) -> Result<ImportPreviewReport> {
     preview_manifest_connection_importers_with_files(
         composite_root,
         importer_ids,
@@ -186,9 +200,9 @@ pub async fn preview_manifest_connection_importers_with_files(
     importer_ids: &[String],
     include_passwords: bool,
     manual_files: &[ManualConnectionImportFile],
-) -> Result<Vec<ImportRecord>> {
+) -> Result<ImportPreviewReport> {
     let importers = list_manifest_connection_importers(composite_root)?;
-    let mut records = Vec::new();
+    let mut report = ImportPreviewReport::default();
     for importer in importers
         .into_iter()
         .filter(|importer| importer_ids.contains(&importer.descriptor.id))
@@ -221,17 +235,21 @@ pub async fn preview_manifest_connection_importers_with_files(
                 for record in &mut preview {
                     record.importer_id = descriptor_id.clone();
                 }
-                records.extend(preview);
+                report.records.extend(preview);
             }
             Err(error) => {
                 tracing::warn!(
                     importer_id = %descriptor_id,
                     "connection import preview failed: {error:?}"
                 );
+                report.errors.push(ImportPreviewError {
+                    importer_id: descriptor_id,
+                    message: error.to_string(),
+                });
             }
         }
     }
-    Ok(records)
+    Ok(report)
 }
 
 fn connection_import_inputs(
@@ -276,6 +294,7 @@ fn scan_error_report(importer_id: String, message: String) -> ImportScanReport {
         availability: ImporterAvailability::Error { message },
         discovered_files: Vec::new(),
         warnings: Vec::new(),
+        discovered_workspace_paths: Vec::new(),
     }
 }
 
@@ -284,7 +303,7 @@ pub async fn preview_manifest_connection_importers(
     _composite_root: &Path,
     _importer_ids: &[String],
     _include_passwords: bool,
-) -> Result<Vec<ImportRecord>> {
+) -> Result<ImportPreviewReport> {
     Err(anyhow::anyhow!("wasm component runtime is disabled"))
 }
 
@@ -294,7 +313,7 @@ pub async fn preview_manifest_connection_importers_with_files(
     _importer_ids: &[String],
     _include_passwords: bool,
     _manual_files: &[ManualConnectionImportFile],
-) -> Result<Vec<ImportRecord>> {
+) -> Result<ImportPreviewReport> {
     Err(anyhow::anyhow!("wasm component runtime is disabled"))
 }
 
@@ -312,6 +331,7 @@ fn runtime_id(manifest: &Manifest, contrib: &ConnectionImporterContrib) -> Strin
 
 fn descriptor(manifest: &Manifest, contrib: &ConnectionImporterContrib) -> ImporterDescriptor {
     let manual_file_pick_prompt = manual_file_pick_prompt(contrib);
+    let manual_directory_pick_prompt = manual_directory_pick_prompt(contrib);
     ImporterDescriptor {
         id: format!("{}/{}", manifest.id, contrib.id),
         display_name: contrib.display_name.clone(),
@@ -332,7 +352,9 @@ fn descriptor(manifest: &Manifest, contrib: &ConnectionImporterContrib) -> Impor
             supports_scan: true,
             supports_password_import: false,
             supports_manual_file_pick: manual_file_pick_prompt.is_some(),
+            supports_manual_directory_pick: contrib.manual_file_pick.supports_directories,
             manual_file_pick_prompt,
+            manual_directory_pick_prompt,
             supports_incremental_preview: false,
         },
     }
@@ -342,6 +364,16 @@ fn manual_file_pick_prompt(contrib: &ConnectionImporterContrib) -> Option<String
     contrib
         .manual_file_pick
         .prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+        .map(str::to_string)
+}
+
+fn manual_directory_pick_prompt(contrib: &ConnectionImporterContrib) -> Option<String> {
+    contrib
+        .manual_file_pick
+        .directory_prompt
         .as_deref()
         .map(str::trim)
         .filter(|prompt| !prompt.is_empty())
@@ -370,6 +402,8 @@ fn parse_output_kind(value: &str) -> Option<ImportRecordKind> {
         "database" => Some(ImportRecordKind::Database),
         "ssh" => Some(ImportRecordKind::Ssh),
         "port-forwarding" | "port_forwarding" => Some(ImportRecordKind::PortForwarding),
+        "quick-command" | "quick_command" => Some(ImportRecordKind::QuickCommand),
+        "workspace" => Some(ImportRecordKind::Workspace),
         _ => None,
     }
 }

@@ -1,6 +1,6 @@
 use one_core::storage::{
     JumpServerConfig, MongoDBParams, ProxyConfig, ProxyType, SshAuthMethod, SshParams,
-    StoredConnection,
+    StoredConnection, TelnetLoginStep, TelnetParams,
 };
 
 use super::{connection_full_info_text_for_locale, connection_share_text_for_locale};
@@ -9,6 +9,7 @@ fn ssh_connection() -> StoredConnection {
     StoredConnection::new_ssh(
         "Production SSH".to_string(),
         SshParams {
+            sftp_account: None,
             host: "ssh.example.test".to_string(),
             port: 2222,
             username: "alice".to_string(),
@@ -33,6 +34,7 @@ fn ssh_connection() -> StoredConnection {
             proxy: None,
             os_id: None,
             icon: None,
+            account_expect: Default::default(),
         },
         None,
     )
@@ -91,6 +93,7 @@ fn basic_info_omits_nested_credentials_and_embedded_private_keys() {
     let connection = StoredConnection::new_ssh(
         "Nested SSH".to_string(),
         SshParams {
+            sftp_account: None,
             host: "ssh.example.test".to_string(),
             port: 22,
             username: "alice".to_string(),
@@ -131,6 +134,7 @@ fn basic_info_omits_nested_credentials_and_embedded_private_keys() {
             }),
             os_id: None,
             icon: None,
+            account_expect: Default::default(),
         },
         None,
     );
@@ -151,6 +155,7 @@ fn full_info_keeps_credentials_but_always_redacts_embedded_private_key_contents(
     let mut connection = StoredConnection::new_ssh(
         "Sensitive SSH".to_string(),
         SshParams {
+            sftp_account: None,
             host: "ssh.example.test".to_string(),
             port: 22,
             username: "alice".to_string(),
@@ -191,6 +196,7 @@ fn full_info_keeps_credentials_but_always_redacts_embedded_private_key_contents(
             }),
             os_id: None,
             icon: None,
+            account_expect: Default::default(),
         },
         Some(17),
     );
@@ -288,4 +294,37 @@ fn full_info_redacts_private_key_payloads_even_when_their_json_shape_is_unexpect
     ] {
         assert!(!text.contains(private_key_body));
     }
+}
+
+#[test]
+fn full_info_redacts_telnet_login_script_send_values() {
+    let connection = StoredConnection::new_telnet(
+        "Telnet Switch".to_string(),
+        TelnetParams {
+            host: "switch.example.test".to_string(),
+            port: 23,
+            credential_reference: None,
+            prompt_username: None,
+            prompt_password: None,
+            backspace_code: Default::default(),
+            login_script: vec![
+                TelnetLoginStep {
+                    expect: "Username:".to_string(),
+                    send: "admin".to_string(),
+                },
+                TelnetLoginStep {
+                    expect: "Password:".to_string(),
+                    send: "telnet-password-secret".to_string(),
+                },
+            ],
+        },
+        None,
+    );
+
+    let text = connection_full_info_text_for_locale(&connection, "en").unwrap();
+    assert!(text.contains("switch.example.test"));
+    assert!(text.contains("Username:"));
+    assert!(text.contains("Password:"));
+    assert!(!text.contains("telnet-password-secret"));
+    assert!(text.contains("Redacted login script credential"));
 }

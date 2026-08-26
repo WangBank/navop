@@ -6,12 +6,12 @@ use crate::storage::{
 
 #[test]
 fn new_credentials_are_local_only_by_default() {
-    assert!(!CredentialEntry::new("Production", "username_password").sync_enabled);
+    assert!(!CredentialEntry::new("Production").sync_enabled);
 }
 
 #[test]
 fn debug_output_redacts_all_secret_fields() {
-    let mut credential = CredentialEntry::new("Production", "composite");
+    let mut credential = CredentialEntry::new("Production");
     credential.password = Some("super-secret-password".to_string());
     credential.private_key_content = Some("super-secret-private-key".to_string());
     credential.passphrase = Some("super-secret-passphrase".to_string());
@@ -26,7 +26,7 @@ fn debug_output_redacts_all_secret_fields() {
 
 #[test]
 fn serialization_omits_all_secret_and_local_key_fields() {
-    let mut credential = CredentialEntry::new("Production", "composite");
+    let mut credential = CredentialEntry::new("Production");
     credential.username = Some("deploy".to_string());
     credential.password = Some("super-secret-password".to_string());
     credential.private_key_path = Some("/Users/me/.ssh/id_ed25519".to_string());
@@ -53,7 +53,7 @@ fn serialization_omits_all_secret_and_local_key_fields() {
 
 #[test]
 fn private_key_content_takes_precedence_over_local_path() {
-    let mut credential = CredentialEntry::new("SSH", "ssh_key");
+    let mut credential = CredentialEntry::new("SSH");
     credential.private_key_path = Some("/Users/me/.ssh/id_ed25519".to_string());
     credential.private_key_content = Some("-----BEGIN PRIVATE KEY-----".to_string());
 
@@ -67,6 +67,7 @@ fn private_key_content_takes_precedence_over_local_path() {
 fn strict_resolution_rejects_missing_or_empty_selected_fields() {
     let reference = CredentialReference {
         credential_id: 42,
+        credential_cloud_id: None,
         username: false,
         password: true,
         private_key: false,
@@ -77,7 +78,7 @@ fn strict_resolution_rejects_missing_or_empty_selected_fields() {
         .expect_err("missing credential must fail");
     assert!(missing.to_string().contains("credential 42 was not found"));
 
-    let credential = CredentialEntry::new("Empty", "password");
+    let credential = CredentialEntry::new("Empty");
     let empty = resolve_credential_reference_strict(manual, &reference, Some(&credential))
         .expect_err("selected empty password must fail");
     assert!(empty.to_string().contains("has no password"));
@@ -85,11 +86,12 @@ fn strict_resolution_rejects_missing_or_empty_selected_fields() {
 
 #[test]
 fn strict_resolution_preserves_unselected_manual_fields() {
-    let mut credential = CredentialEntry::new("Shared password", "password");
+    let mut credential = CredentialEntry::new("Shared password");
     credential.username = Some("vault-user".to_string());
     credential.password = Some("vault-password".to_string());
     let reference = CredentialReference {
         credential_id: 1,
+        credential_cloud_id: None,
         username: false,
         password: true,
         private_key: false,
@@ -109,6 +111,35 @@ fn strict_resolution_preserves_unselected_manual_fields() {
 
     assert_eq!(Some("manual-user"), resolved.username.as_deref());
     assert_eq!(Some("vault-password"), resolved.password.as_deref());
+}
+
+#[test]
+fn strict_resolution_supports_vault_username_with_manual_password() {
+    let mut credential = CredentialEntry::new("Shared username");
+    credential.username = Some("vault-user".to_string());
+    credential.password = Some("vault-password".to_string());
+    let reference = CredentialReference {
+        credential_id: 1,
+        credential_cloud_id: None,
+        username: true,
+        password: false,
+        private_key: false,
+        passphrase: false,
+    };
+    let resolved = resolve_credential_reference_strict(
+        ReferencedCredentialFields::new(
+            Some("manual-user".to_string()),
+            Some("manual-password".to_string()),
+            None,
+            None,
+        ),
+        &reference,
+        Some(&credential),
+    )
+    .expect("resolve selected username");
+
+    assert_eq!(Some("vault-user"), resolved.username.as_deref());
+    assert_eq!(Some("manual-password"), resolved.password.as_deref());
 }
 
 #[test]

@@ -185,6 +185,10 @@ SSH:
     en: Enter username
     zh-CN: 请输入用户名
     zh-HK: 請輸入用戶名
+  keychain:
+    en: Keychain
+    zh-CN: 钥匙串
+    zh-HK: 鑰匙圈
   save_username_desc:
     en: Save username
     zh-CN: 保存用户名
@@ -225,6 +229,10 @@ SSH:
     en: SSH Agent
     zh-CN: SSH Agent
     zh-HK: SSH Agent
+  pageant:
+    en: Pageant (Windows)
+    zh-CN: Pageant（Windows）
+    zh-HK: Pageant（Windows）
   auto_publickey:
     en: Auto Public Key
     zh-CN: 自动公钥认证
@@ -278,9 +286,9 @@ SSH:
     zh-CN: 终端类型
     zh-HK: 終端類型
   auto_publickey_hint:
-    en: Try SSH Agent first, then default private keys under ~/.ssh.
-    zh-CN: 将优先尝试 SSH Agent，若不可用则尝试 ~/.ssh 下的默认私钥。
-    zh-HK: 將優先嘗試 SSH Agent，若不可用則嘗試 ~/.ssh 下的預設私鑰。
+    en: Try available SSH agents first (including Pageant on Windows), then default private keys under ~/.ssh.
+    zh-CN: 将优先尝试可用的 SSH Agent（Windows 上包括 Pageant），再尝试 ~/.ssh 下的默认私钥。
+    zh-HK: 將優先嘗試可用的 SSH Agent（Windows 上包括 Pageant），再嘗試 ~/.ssh 下的預設私鑰。
   auto_publickey_next_step:
     en: Please load SSH Agent or switch to "Private Key" mode to specify a key file manually
     zh-CN: 请加载 SSH Agent，或切换为「私钥文件」模式手动指定私钥
@@ -362,6 +370,10 @@ SSH:
     en: Jump Server
     zh-CN: 跳板机
     zh-HK: 跳板機
+  tab_sftp_account:
+    en: SFTP Account
+    zh-CN: SFTP 账户
+    zh-HK: SFTP 賬戶
   tab_proxy:
     en: Proxy
     zh-CN: 代理设置
@@ -415,6 +427,23 @@ SSH:
     en: Jump server requires MFA. Fill in the dynamic field below, then test again.
     zh-CN: 跳板机要求 MFA。请填写下方动态字段后重新测试。
     zh-HK: 跳板機要求 MFA。請填寫下方動態字段後重新測試。
+  # 独立 SFTP 账户相关
+  sftp_account:
+    en: Separate SFTP Account
+    zh-CN: 独立 SFTP 账户
+    zh-HK: 獨立 SFTP 賬戶
+  sftp_account_desc:
+    en: When enabled, SFTP transfers and remote file editing use this account while the SSH terminal keeps using the main account. Leave it disabled to share the SSH credentials.
+    zh-CN: 启用后，SFTP 传输与远程文件编辑使用该账户连接，SSH 终端仍使用主账户；关闭时 SFTP 与 SSH 共用一套凭据。
+    zh-HK: 啟用後，SFTP 傳輸與遠程文件編輯使用該賬戶連接，SSH 終端仍使用主賬戶；關閉時 SFTP 與 SSH 共用一套憑據。
+  sftp_username:
+    en: SFTP Username
+    zh-CN: SFTP 用户名
+    zh-HK: SFTP 用戶名
+  sftp_password:
+    en: SFTP Password
+    zh-CN: SFTP 密码
+    zh-HK: SFTP 密碼
   mfa_prompt_placeholder:
     en: MFA response
     zh-CN: MFA 响应
@@ -466,9 +495,9 @@ SSH:
     zh-CN: 允许旧版 SSH 算法
     zh-HK: 允許舊版 SSH 演算法
   allow_legacy_algorithms_desc:
-    en: Enable compatibility key-exchange algorithms for legacy SSH servers. Keep disabled unless the server requires them.
-    zh-CN: 为旧版 SSH 服务器启用兼容密钥交换算法。仅在服务器确有需要时开启。
-    zh-HK: 為舊版 SSH 伺服器啟用相容金鑰交換演算法。僅在伺服器確有需要時開啟。
+    en: Enable legacy key-exchange and host-key algorithms, including ssh-dss. Keep disabled unless the server requires them.
+    zh-CN: 启用旧版密钥交换和主机密钥算法，包括 ssh-dss。仅在服务器确有需要时开启。
+    zh-HK: 啟用舊版金鑰交換和主機金鑰演算法，包括 ssh-dss。僅在伺服器確有需要時開啟。
   # 初始化
   init_script:
     en: Init Script
@@ -561,6 +590,10 @@ ConnectionForm:
 
 # 设置面板
 Settings:
+  suggestion_popup:
+    en: Suggestion popup
+    zh-CN: 弹框候选词
+    zh-HK: 彈框候選詞
   title:
     en: Settings
     zh-CN: 设置
@@ -625,6 +658,18 @@ Settings:
     en: Confirm high-risk command paste
     zh-CN: 高危命令粘贴需确认
     zh-HK: 高危命令貼上需確認
+  session_logging:
+    en: Session Logging
+    zh-CN: 会话日志
+    zh-HK: 會話日誌
+  automatic_session_logging:
+    en: Automatically save new sessions
+    zh-CN: 自动保存新建会话
+    zh-HK: 自動儲存新建會話
+  automatic_session_logging_help:
+    en: Enabled by default for new local terminal, SSH, and serial sessions. Saves terminal output history for static, read-only terminal browsing with scrolling, selection, copying, searching, and TXT export. Keyboard input is never recorded. Session logs have no playback timeline or replay controls. Existing sessions are not affected.
+    zh-CN: 默认自动保存之后新建的本地终端、SSH 和串口会话输出历史，并以静态只读终端方式查看，支持滚动、选中、复制、搜索和导出 TXT。绝不记录键盘输入；会话日志没有播放时间轴或回放控制。已打开的会话不受影响。
+    zh-HK: 預設自動儲存之後新建的本地終端、SSH 和序列埠會話輸出歷史，並以靜態唯讀終端方式查看，支援捲動、選取、複製、搜尋和匯出 TXT。絕不記錄鍵盤輸入；工作階段日誌沒有播放時間軸或回放控制。已開啟的會話不受影響。
   auto_copy:
     en: Auto copy on select
     zh-CN: 选中自动复制
@@ -1060,10 +1105,10 @@ TerminalView:
     en: The pasted content contains an unterminated quoted string. Without bracketed paste, the remote shell may continue waiting for more input and merge later commands into the same block.
     zh-CN: 粘贴内容包含未闭合的引号结构。当前远端未开启 bracketed paste，shell 可能继续等待补全输入，并把后续命令并入同一块内容。
     zh-HK: 貼上內容包含未閉合的引號結構。當前遠端未開啟 bracketed paste，shell 可能繼續等待補全輸入，並把後續命令併入同一塊內容。
-  unbracketed_paste_continuation_message:
-    en: The pasted content uses trailing backslash line continuation. Without bracketed paste, the remote shell may continue consuming later input and break the pasted block.
-    zh-CN: 粘贴内容包含行尾反斜杠续行。当前远端未开启 bracketed paste，shell 可能继续吞入后续输入，导致整块粘贴被拆乱。
-    zh-HK: 貼上內容包含行尾反斜杠續行。當前遠端未開啟 bracketed paste，shell 可能繼續吞入後續輸入，導致整塊貼上被拆亂。
+  paste_anyway:
+    en: Paste Anyway
+    zh-CN: 仍然粘贴
+    zh-HK: 仍然貼上
   paste_preview:
     en: Paste preview
     zh-CN: 粘贴预览
@@ -1216,6 +1261,46 @@ QuickCommand:
     en: Enter command
     zh-CN: 输入命令
     zh-HK: 輸入命令
+  auto_run:
+    en: Execute on click
+    zh-CN: 点击执行
+    zh-HK: 點擊執行
+  auto_run_hint:
+    en: Send Enter automatically after triggering the command
+    zh-CN: 触发后自动发送回车执行命令
+    zh-HK: 觸發後自動傳送回車執行命令
+  shortcut:
+    en: Shortcut
+    zh-CN: 快捷键
+    zh-HK: 快捷鍵
+  shortcut_unassigned:
+    en: Not assigned
+    zh-CN: 未绑定
+    zh-HK: 未綁定
+  press_shortcut:
+    en: Press a shortcut
+    zh-CN: 请按下快捷键
+    zh-HK: 請按下快捷鍵
+  invalid_shortcut:
+    en: Shortcut must include Ctrl, Alt, Shift, or Command
+    zh-CN: 快捷键必须包含 Ctrl、Alt、Shift 或 Command
+    zh-HK: 快捷鍵必須包含 Ctrl、Alt、Shift 或 Command
+  scope:
+    en: Scope
+    zh-CN: 作用范围
+    zh-HK: 作用範圍
+  current_connection:
+    en: Current connection
+    zh-CN: 当前连接
+    zh-HK: 目前連線
+  global_shared:
+    en: Global
+    zh-CN: 全局共享
+    zh-HK: 全域共享
+  global_shared_description:
+    en: Available to all connections and local terminals
+    zh-CN: 所有连接和本地终端均可使用
+    zh-HK: 所有連線和本機終端均可使用
   add:
     en: Add Quick Command
     zh-CN: 新增快捷命令
@@ -1513,6 +1598,139 @@ Sidebar:
     zh-CN: 从侧边栏移除
     zh-HK: 從側邊欄移除
 
+# Telnet 连接
+Telnet:
+  new:
+    en: New Telnet Connection
+    zh-CN: 新建 Telnet 连接
+    zh-HK: 新建 Telnet 連接
+  edit:
+    en: Edit Telnet Connection
+    zh-CN: 编辑 Telnet 连接
+    zh-HK: 編輯 Telnet 連接
+  name:
+    en: Connection Name
+    zh-CN: 连接名称
+    zh-HK: 連線名稱
+  name_placeholder:
+    en: Enter connection name
+    zh-CN: 请输入连接名称
+    zh-HK: 請輸入連線名稱
+  host:
+    en: Host
+    zh-CN: 主机
+    zh-HK: 主機
+  host_placeholder:
+    en: "e.g. 192.168.1.1 or switch.example.com"
+    zh-CN: "如 192.168.1.1 或 switch.example.com"
+    zh-HK: "如 192.168.1.1 或 switch.example.com"
+  port:
+    en: Port
+    zh-CN: 端口
+    zh-HK: 端口
+  port_placeholder:
+    en: "23"
+    zh-CN: "23"
+    zh-HK: "23"
+  backspace_code:
+    en: Backspace Key
+    zh-CN: 退格键
+    zh-HK: 退格鍵
+  keychain:
+    en: Keychain
+    zh-CN: 钥匙串
+    zh-HK: 鑰匙圈
+  workspace:
+    en: Workspace
+    zh-CN: 工作区
+    zh-HK: 工作區
+  remark:
+    en: Remark
+    zh-CN: 备注
+    zh-HK: 備註
+  remark_placeholder:
+    en: Enter remark
+    zh-CN: 请输入备注
+    zh-HK: 請輸入備註
+  validation_error:
+    en: Please enter a valid host and port
+    zh-CN: 请输入有效的主机和端口
+    zh-HK: 請輸入有效的主機和端口
+  login_script:
+    en: Login Script
+    zh-CN: 登录脚本
+    zh-HK: 登入腳本
+  login_script_hint:
+    en: "Expect is a regular expression matched against server output. An explicit Send value takes priority; when Send is empty, Navop recognizes username/password prompts from Expect and uses the referenced keychain value. A carriage return is appended automatically when Send does not end with \\r or \\n."
+    zh-CN: "Expect 是匹配服务端输出的正则表达式。显式填写的发送内容优先；发送内容为空时，Navop 会根据 Expect 识别用户名或密码提示，并使用引用钥匙串中的对应值。发送内容不以 \\r 或 \\n 结尾时会自动补回车。"
+    zh-HK: "Expect 是比對伺服器輸出的正規表示式。明確填寫的傳送內容優先；傳送內容為空時，Navop 會依據 Expect 識別使用者名稱或密碼提示，並使用引用鑰匙圈中的對應值。傳送內容不以 \\r 或 \\n 結尾時會自動補回車。"
+  login_script_credential_hint:
+    en: "Keychain values are injected only into the in-memory connection and are not written to the connection configuration. Automated login sends are excluded from input recording, but Telnet still transmits credentials in plaintext on the network."
+    zh-CN: "钥匙串中的值只会注入本次内存连接，不会写入连接配置；自动登录发送内容不会写入输入录制，但 Telnet 仍会在网络上明文传输凭据。"
+    zh-HK: "鑰匙圈中的值只會注入本次記憶體連線，不會寫入連線設定；自動登入傳送內容不會寫入輸入錄製，但 Telnet 仍會在網路上以明文傳輸憑據。"
+  login_script_expect:
+    en: Expect Regex
+    zh-CN: Expect 正则
+    zh-HK: Expect 正規表示式
+  login_script_expect_placeholder:
+    en: "e.g. (?i)(?:login|username)\\s*:"
+    zh-CN: "如 (?i)(?:login|username)\\s*:"
+    zh-HK: "如 (?i)(?:login|username)\\s*:"
+  login_script_send:
+    en: Send
+    zh-CN: 发送内容
+    zh-HK: 傳送內容
+  login_script_send_placeholder:
+    en: "Leave empty to use the recognized keychain field"
+    zh-CN: "留空时使用识别到的钥匙串字段"
+    zh-HK: "留空時使用識別到的鑰匙圈欄位"
+  login_script_add:
+    en: Add Step
+    zh-CN: 添加步骤
+    zh-HK: 新增步驟
+  login_script_remove:
+    en: Remove Step
+    zh-CN: 移除步骤
+    zh-HK: 移除步驟
+  login_script_validation_error:
+    en: Please complete all expect fields and use valid regular expressions that do not match empty input
+    zh-CN: 请完整填写登录脚本的 expect 字段，并使用不会匹配空内容的有效正则表达式
+    zh-HK: 請完整填寫登入腳本的 expect 欄位，並使用不會匹配空內容的有效正規表示式
+  save_failed:
+    en: "Failed to save Telnet connection: %{error}"
+    zh-CN: "保存 Telnet 连接失败：%{error}"
+    zh-HK: "儲存 Telnet 連線失敗：%{error}"
+  test_tcp:
+    en: Test TCP Port
+    zh-CN: 测试 TCP 端口
+    zh-HK: 測試 TCP 端口
+  test_tcp_success:
+    en: TCP port is reachable (this does not validate the Telnet protocol or login script)
+    zh-CN: TCP 端口可达（此测试不验证 Telnet 协议或登录脚本）
+    zh-HK: TCP 端口可達（此測試不驗證 Telnet 協定或登入腳本）
+  test_timeout:
+    en: TCP connection timed out
+    zh-CN: TCP 连接超时
+    zh-HK: TCP 連接超時
+
+TelnetSession:
+  credentials_required:
+    en: Telnet Credentials Required
+    zh-CN: 需要 Telnet 连接凭据
+    zh-HK: 需要 Telnet 連線憑據
+  credentials_hint:
+    en: The referenced keychain item is unavailable on this device. Enter a username and password for this connection only; they will not be saved or synced.
+    zh-CN: 当前设备无法获取此连接引用的钥匙串，请仅为本次连接输入用户名和密码；这些内容不会保存或同步。
+    zh-HK: 目前裝置無法取得此連線引用的鑰匙圈，請只為本次連線輸入使用者名稱和密碼；這些內容不會儲存或同步。
+  username:
+    en: Username
+    zh-CN: 用户名
+    zh-HK: 使用者名稱
+  password:
+    en: Password
+    zh-CN: 密码
+    zh-HK: 密碼
+
 # 串口连接
 Serial:
   new:
@@ -1543,6 +1761,10 @@ Serial:
     en: Baud Rate
     zh-CN: 波特率
     zh-HK: 波特率
+  custom_baud_rate_placeholder:
+    en: Custom baud rate (optional)
+    zh-CN: 自定义波特率（可选）
+    zh-HK: 自訂波特率（可選）
   data_bits:
     en: Data Bits
     zh-CN: 数据位
@@ -1647,9 +1869,9 @@ SshSession:
     zh-CN: 需要 SSH 连接凭据
     zh-HK: 需要 SSH 連線憑據
   credentials_hint:
-    en: This connection does not save the following credentials. Enter them to continue.
-    zh-CN: 此连接未保存以下凭据，请输入后继续连接。
-    zh-HK: 此連線未儲存以下憑據，請輸入後繼續連線。
+    en: Enter the required credentials for this connection only. They will not be saved or synced.
+    zh-CN: 请输入本次连接所需的凭据；这些内容不会保存或同步。
+    zh-HK: 請輸入本次連線所需的憑據；這些內容不會儲存或同步。
   username:
     en: Username
     zh-CN: 用户名
@@ -2247,6 +2469,12 @@ TerminalRecording:
     en: Failed to select recording folder
     zh-CN: 选择录制目录失败
     zh-HK: 選擇錄製目錄失敗
+
+TerminalSessionLog:
+  tab_title:
+    en: "Log · %{name}"
+    zh-CN: "日志 · %{name}"
+    zh-HK: "日誌 · %{name}"
 
 TerminalRecordingPlayback:
   title:

@@ -6,8 +6,9 @@ use crate::persistent_connection_sidebar::{
 };
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, ExternalPaths, Focusable, InteractiveElement,
-    IntoElement, KeyBinding, Keystroke, ParentElement, Render, Styled, Task, Window, actions, div,
+    AnyElement, App, AppContext, ColorExt as _, Context, Entity, ExternalPaths, Focusable,
+    InteractiveElement, IntoElement, KeyBinding, Keystroke, ParentElement, Render, Styled, Task,
+    Window, actions, div,
 };
 use gpui_component::{WindowExt, dialog::DialogButtonProps, kbd::Kbd, notification::Notification};
 use one_core::gpui_tokio::{JoinError, Tokio};
@@ -118,6 +119,10 @@ fn init_ssh_session_service(cx: &mut App) {
     // GPUI only gives quit callbacks a short fixed budget, so it must not be
     // the primary owner shutdown path.
     cx.on_app_quit(move |cx| {
+        let rdp_shutdown_report =
+            remote_desktop_view::fail_closed_windows_native_rdp_for_platform_quit(cx);
+        log_windows_native_rdp_shutdown("gpui quit fallback", rdp_shutdown_report);
+
         let service = fallback_service.clone();
         let shutdown_task = Tokio::spawn(cx, async move { service.shutdown().await });
         async move {
@@ -174,25 +179,55 @@ fn log_ssh_session_shutdown(
     }
 }
 
-/// Await the bounded application-owned SSH teardown before invoking GPUI's
-/// platform quit routine.
+fn log_windows_native_rdp_shutdown(
+    reason: &'static str,
+    report: remote_desktop_view::WindowsNativeRdpShutdownReport,
+) {
+    if report.incomplete() {
+        tracing::warn!(
+            reason,
+            requested = report.requested(),
+            destroyed = report.destroyed(),
+            timed_out_leaked = report.timed_out_leaked(),
+            owner_lost = report.owner_lost(),
+            controller_unavailable = report.controller_unavailable(),
+            "Windows native RDP shutdown completed with incomplete cleanup"
+        );
+    } else {
+        tracing::info!(
+            reason,
+            requested = report.requested(),
+            destroyed = report.destroyed(),
+            "Windows native RDP shutdown completed"
+        );
+    }
+}
+
+/// Await bounded application-owned resource teardown before invoking GPUI's
+/// platform quit routine. Native RDP hosts drain before their shared SSH
+/// transports so COM/child-window cleanup retains a live application owner.
 ///
 /// This is intentionally the only production helper that calls `cx.quit()`.
-/// Repeated callers join the same idempotent `SshSessionService::shutdown`
-/// lifecycle rather than creating an independent transport teardown.
-pub(crate) fn shutdown_ssh_sessions_and_quit(cx: &mut App, reason: &'static str) {
-    let Some(shutdown_task) = spawn_ssh_session_shutdown(cx) else {
-        tracing::error!(
-            reason,
-            "SSH session service global is missing; quitting without shared-session teardown"
-        );
-        cx.quit();
-        return;
-    };
+/// Repeated callers join the same idempotent Native RDP drain and
+/// `SshSessionService::shutdown` lifecycle.
+pub(crate) fn shutdown_application_resources_and_quit(cx: &mut App, reason: &'static str) {
+    let rdp_shutdown_task = remote_desktop_view::shutdown_windows_native_rdp(cx);
 
     cx.spawn(async move |cx| {
-        let shutdown_result = shutdown_task.await;
-        log_ssh_session_shutdown(reason, shutdown_result);
+        let rdp_shutdown_report = rdp_shutdown_task.await;
+        log_windows_native_rdp_shutdown(reason, rdp_shutdown_report);
+
+        let ssh_shutdown_task = cx.update(|cx| spawn_ssh_session_shutdown(cx));
+        if let Some(shutdown_task) = ssh_shutdown_task {
+            let shutdown_result = shutdown_task.await;
+            log_ssh_session_shutdown(reason, shutdown_result);
+        } else {
+            tracing::error!(
+                reason,
+                "SSH session service global is missing; quitting after remaining application teardown"
+            );
+        }
+
         let _ = cx.update(|cx| cx.quit());
     })
     .detach();
@@ -280,7 +315,7 @@ use gpui::px;
 use gpui_component::dock::ToggleZoom;
 use gpui_component::{ActiveTheme, Root};
 use one_core::llm::manager::GlobalProviderState;
-use one_core::settings::{AppSettings, HomePageStyle, MainWindowSize, StartupDefaultPage};
+use one_core::settings::{AppSettings, HomePageStyle, MainWindowState, StartupDefaultPage};
 use one_core::storage::manager::get_config_dir;
 use one_core::tab_container::{TabContainer, TabContainerEvent, TabContentRegistry, TabItem};
 use one_core::tab_navigation::{
@@ -698,7 +733,7 @@ fn quit_app(cx: &mut App) {
 
 fn request_active_window_quit(cx: &mut App) {
     let Some(active_window) = cx.active_window() else {
-        shutdown_ssh_sessions_and_quit(cx, "quit without an active window");
+        shutdown_application_resources_and_quit(cx, "quit without an active window");
         return;
     };
     cx.defer(move |cx| {
@@ -713,7 +748,7 @@ fn request_window_quit(window: &mut Window, cx: &mut App) {
         .try_global::<GlobalOnetCliApp>()
         .map(|global| global.app.clone())
     else {
-        shutdown_ssh_sessions_and_quit(cx, "quit without the application entity");
+        shutdown_application_resources_and_quit(cx, "quit without the application entity");
         return;
     };
     app.update(cx, |app, cx| {
@@ -730,20 +765,33 @@ fn default_shortcut(macos: &'static str, other: &'static str) -> &'static str {
 }
 
 fn close_active_window_default_shortcut() -> &'static str {
-    default_shortcut("cmd-w", "ctrl-w")
+    default_shortcut("cmd-w", "ctrl-d")
 }
+
+const LOG_FILE_NAME: &str = "onetcli.log";
 
 pub(crate) fn configured_log_file_path(value: &str) -> anyhow::Result<PathBuf> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         Ok(default_log_file_path()?)
     } else {
-        Ok(PathBuf::from(trimmed))
+        let path = PathBuf::from(trimmed);
+        // 旧配置允许填写完整文件路径；无扩展名的新值则按日志目录处理。
+        let is_directory = path.is_dir()
+            || trimmed.ends_with('/')
+            || trimmed.ends_with('\\')
+            || (!path.is_file() && path.extension().is_none());
+
+        if is_directory {
+            Ok(path.join(LOG_FILE_NAME))
+        } else {
+            Ok(path)
+        }
     }
 }
 
 fn default_log_file_path() -> anyhow::Result<PathBuf> {
-    Ok(get_config_dir()?.join("logs").join("onetcli.log"))
+    Ok(get_config_dir()?.join("logs").join(LOG_FILE_NAME))
 }
 
 pub(crate) fn log_file_appender(path: &Path) -> std::io::Result<std::fs::File> {
@@ -1194,7 +1242,7 @@ impl OnetCliApp {
                     .timer(Duration::from_millis(150))
                     .await;
                 app.update_in(cx, |app, window, cx| {
-                    app.save_main_window_size(window, cx);
+                    app.save_main_window_state(window, cx);
                     app.main_window_size_save_task.take();
                 })
                 .ok();
@@ -1289,6 +1337,10 @@ impl OnetCliApp {
         });
         tab_container.update(cx, |tc, cx| {
             tc.set_tab_content_visible(main_content == MainContent::Tabs, cx);
+            tc.set_active_presentation_obscured_by_main_content(
+                main_content != MainContent::Tabs,
+                cx,
+            );
             if layout.pin_home {
                 let home_tab = TabItem::new(layout.home_tab_id, "app", home_page.clone());
                 tc.insert_pinned_tab_at(0, home_tab, cx);
@@ -1330,6 +1382,7 @@ impl OnetCliApp {
                     cx.defer(move |cx| {
                         app.update(cx, |app, cx| {
                             app.set_main_content(MainContent::Tabs, cx);
+                            app.show_home_if_tab_container_is_empty(cx);
                             app.sync_connection_sidebar_theme(cx);
                         });
                     });
@@ -1391,6 +1444,14 @@ impl OnetCliApp {
     fn set_main_content(&mut self, main_content: MainContent, cx: &mut Context<Self>) {
         self.tab_container.update(cx, |tabs, cx| {
             tabs.set_tab_content_visible(main_content == MainContent::Tabs, cx);
+            // The modern Home page is not a pinned tab, so the active tab stays
+            // present in the TabContainer while Home renders. Mark the active
+            // tab content as obscured so Windows-native RDP overlays are
+            // deactivated and stop intercepting mouse/keyboard input on Home.
+            tabs.set_active_presentation_obscured_by_main_content(
+                main_content != MainContent::Tabs,
+                cx,
+            );
         });
         if self.main_content == main_content {
             return;
@@ -1595,21 +1656,31 @@ impl OnetCliApp {
             .update(cx, |sidebar, cx| sidebar.set_terminal_colors(colors, cx));
     }
 
-    fn save_main_window_size(&self, window: &Window, cx: &mut App) {
+    fn save_main_window_state(&self, window: &Window, cx: &mut App) {
         let bounds = window.window_bounds().get_bounds();
-        let width = f32::from(bounds.size.width);
-        let height = f32::from(bounds.size.height);
-        let Some(size) = MainWindowSize::new(width, height) else {
+        let display_uuid = window
+            .display(cx)
+            .and_then(|display| display.uuid().ok())
+            .map(|uuid| uuid.to_string());
+        let Some(state) = MainWindowState::new(
+            f32::from(bounds.origin.x),
+            f32::from(bounds.origin.y),
+            f32::from(bounds.size.width),
+            f32::from(bounds.size.height),
+            display_uuid,
+        ) else {
             return;
         };
-        if AppSettings::current(cx).main_window_size == Some(size) {
+        if AppSettings::current(cx).main_window_state.as_ref() == Some(&state) {
             return;
         }
-        AppSettings::update_and_save(cx, |settings| settings.main_window_size = Some(size));
+        AppSettings::update_and_save(cx, |settings| {
+            settings.main_window_state = Some(state);
+        });
     }
 
     fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.save_main_window_size(window, cx);
+        self.save_main_window_state(window, cx);
         if self.quit_state.request() == QuitRequestDecision::OpenPrompt {
             self.show_quit_confirmation(window, cx);
         }
@@ -1664,7 +1735,7 @@ impl OnetCliApp {
             let _ = this.update(cx, |app, cx| {
                 app.quit_state.finish_close(can_quit);
                 if can_quit {
-                    shutdown_ssh_sessions_and_quit(cx, "confirmed application quit");
+                    shutdown_application_resources_and_quit(cx, "confirmed application quit");
                 }
             });
         })
@@ -1675,7 +1746,7 @@ impl OnetCliApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        GlobalSshSessionService, MainContent, MainContentPresentation,
+        GlobalSshSessionService, LOG_FILE_NAME, MainContent, MainContentPresentation,
         close_active_window_default_shortcut, configured_log_file_path, default_log_file_path,
         init_ssh_session_service, initial_content_layout, log_file_appender,
         main_content_presentation,
@@ -1731,6 +1802,11 @@ mod tests {
         assert!(
             constructor
                 .contains("tc.set_tab_content_visible(main_content == MainContent::Tabs, cx)")
+        );
+        assert!(
+            constructor.contains(
+                "tc.set_active_presentation_obscured_by_main_content(\n                main_content != MainContent::Tabs,"
+            )
         );
         assert!(!constructor.contains("set_base_content"));
         assert!(constructor.contains("let home_tab ="));
@@ -1798,6 +1874,41 @@ mod tests {
         assert!(
             setter.contains("tabs.set_tab_content_visible(main_content == MainContent::Tabs, cx);")
         );
+        assert!(setter.contains("tabs.set_active_presentation_obscured_by_main_content("));
+    }
+
+    #[test]
+    fn stale_tab_activation_cannot_replace_modern_home_with_an_empty_container() {
+        let source = include_str!("onetcli_app.rs").replace("\r\n", "\n");
+        let activated_arm = source
+            .split("TabContainerEvent::TabActivated { .. } =>")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("TabContainerEvent::LayoutChanged | TabContainerEvent::TabClosed")
+                    .next()
+            })
+            .expect("TabActivated event arm");
+        let set_tabs = activated_arm
+            .find("app.set_main_content(MainContent::Tabs, cx);")
+            .expect("TabActivated switches to tabs");
+        let empty_guard = activated_arm
+            .find("app.show_home_if_tab_container_is_empty(cx);")
+            .expect("TabActivated rechecks the empty-container fallback");
+        let sync_theme = activated_arm
+            .find("app.sync_connection_sidebar_theme(cx);")
+            .expect("TabActivated syncs the sidebar theme");
+        assert!(set_tabs < empty_guard);
+        assert!(empty_guard < sync_theme);
+
+        let fallback = source
+            .split("fn show_home_if_tab_container_is_empty")
+            .nth(1)
+            .and_then(|source| source.split("\n    fn render_main_content").next())
+            .expect("empty-container fallback");
+        assert!(fallback.contains("HomePageStyle::Modern"));
+        assert!(fallback.contains("tabs.tabs().is_empty() && !tabs.is_pinned_tab_active()"));
+        assert!(fallback.contains("self.set_main_content(MainContent::Home, cx);"));
     }
 
     #[test]
@@ -1856,13 +1967,13 @@ mod tests {
         assert!(keybindings.contains("CloseActiveWindow"));
         assert!(keybindings.contains("close_active_window_default_shortcut()"));
         assert!(refreshable_keybindings.contains("close_active_window_default_shortcut()"));
-        assert!(source.contains(r#"default_shortcut("cmd-w", "ctrl-w")"#));
+        assert!(source.contains(r#"default_shortcut("cmd-w", "ctrl-d")"#));
         assert_eq!(
             close_active_window_default_shortcut(),
             if cfg!(target_os = "macos") {
                 "cmd-w"
             } else {
-                "ctrl-w"
+                "ctrl-d"
             }
         );
         assert!(!keybindings.contains("ClosePanel"));
@@ -1884,7 +1995,30 @@ mod tests {
         assert!(render.contains(".when(show_persistent_sidebar"));
         assert!(render.contains("layout.child(self.connection_sidebar.clone())"));
         assert!(sidebar_source.contains("fn is_expanded"));
-        assert!(sidebar_source.contains(".when(self.tree_expanded"));
+        assert!(sidebar_source.contains("fn render_floating_tree"));
+    }
+
+    #[test]
+    fn auto_hide_off_renders_a_docked_split_panel_instead_of_a_floating_overlay() {
+        let source = include_str!("onetcli_app.rs");
+        let sidebar_source = include_str!("persistent_connection_sidebar/mod.rs");
+        let render = source
+            .rsplit("impl Render for OnetCliApp")
+            .next()
+            .expect("OnetCliApp render source");
+
+        assert!(
+            render.contains("is_auto_hide_tree()"),
+            "主渲染需读取连接树的自动隐藏开关"
+        );
+        assert!(
+            render.contains("render_docked_connection_tree"),
+            "非自动隐藏时应渲染并排的分割面板"
+        );
+        assert!(
+            render.contains("show_persistent_sidebar && sidebar_expanded && auto_hide_tree"),
+            "浮层连接树仅应在自动隐藏开启时渲染，避免遮挡终端"
+        );
     }
 
     #[test]
@@ -1893,7 +2027,10 @@ mod tests {
         let home = include_str!("home_tab/render.rs");
         let legacy_home = include_str!("home_tab/legacy_home.rs");
         let sidebar = include_str!("home_tab/sidebar.rs");
+        let sidebar_navigation = include_str!("home_tab/sidebar_navigation.rs");
         let persistent_sidebar = include_str!("persistent_connection_sidebar/mod.rs");
+        let persistent_navigation =
+            include_str!("persistent_connection_sidebar/navigation_sections.rs");
         let settings = include_str!("setting_tab.rs");
 
         assert!(app.contains("home_page_style.uses_persistent_sidebar()"));
@@ -1902,8 +2039,12 @@ mod tests {
         assert!(home.contains("self.render_legacy_home(window, cx)"));
         assert!(home.contains("self.render_modern_home(window, cx)"));
         assert!(legacy_home.contains("self.render_sidebar(window, cx)"));
-        assert!(sidebar.contains("for filter in ConnectionType::all()"));
+        assert!(sidebar_navigation.contains("for filter in visible_connection_types()"));
         assert!(!sidebar.contains("\"legacy-open-home\""));
+        assert!(sidebar_navigation.contains("\"legacy-more-connection-types\""));
+        assert!(sidebar_navigation.contains("\"legacy-more-applications\""));
+        assert!(persistent_navigation.contains("\"persistent-more-connection-types\""));
+        assert!(persistent_navigation.contains("\"persistent-more-applications\""));
         assert!(!persistent_sidebar.contains("HomePageStyle"));
         assert!(!persistent_sidebar.contains("render_legacy_sidebar"));
         assert!(settings.contains("HomePageStyle::Legacy"));
@@ -1983,24 +2124,33 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_and_update_quit_paths_await_shared_ssh_shutdown() {
+    fn confirmed_and_update_quit_paths_await_all_application_resource_shutdown() {
         let source = include_str!("onetcli_app.rs").replace("\r\n", "\n");
         let helper_start = source
-            .find("pub(crate) fn shutdown_ssh_sessions_and_quit")
-            .expect("shared SSH shutdown helper");
+            .find("pub(crate) fn shutdown_application_resources_and_quit")
+            .expect("shared application resource shutdown helper");
         let helper_end = source[helper_start..]
             .find("\n}\n\n#[derive(Clone, Copy")
             .map(|offset| helper_start + offset)
-            .expect("shared SSH shutdown helper end");
+            .expect("shared application resource shutdown helper end");
         let helper = &source[helper_start..helper_end];
-        let await_shutdown = helper
+        let start_rdp_shutdown = helper
+            .find("remote_desktop_view::shutdown_windows_native_rdp(cx)")
+            .expect("start Windows native RDP shutdown");
+        let await_rdp_shutdown = helper
+            .find("let rdp_shutdown_report = rdp_shutdown_task.await;")
+            .expect("await Windows native RDP shutdown");
+        let await_ssh_shutdown = helper
             .find("let shutdown_result = shutdown_task.await;")
             .expect("await SSH shutdown");
         let platform_quit = helper
             .find("cx.update(|cx| cx.quit())")
             .expect("platform quit");
 
-        assert!(await_shutdown < platform_quit);
+        assert!(start_rdp_shutdown < await_rdp_shutdown);
+        assert!(await_rdp_shutdown < await_ssh_shutdown);
+        assert!(await_ssh_shutdown < platform_quit);
+        assert!(helper.contains("log_windows_native_rdp_shutdown"));
 
         let confirm_start = source.find("fn confirm_quit").expect("confirm_quit");
         let confirm_end = source[confirm_start..]
@@ -2008,12 +2158,41 @@ mod tests {
             .map(|offset| confirm_start + offset)
             .expect("confirm_quit end");
         let confirm_quit = &source[confirm_start..confirm_end];
-        assert!(confirm_quit.contains("shutdown_ssh_sessions_and_quit"));
+        assert!(confirm_quit.contains("shutdown_application_resources_and_quit"));
         assert!(!confirm_quit.contains("cx.quit()"));
 
         let update_dialog = include_str!("update/dialog.rs");
-        assert!(update_dialog.contains("shutdown_ssh_sessions_and_quit"));
+        assert!(update_dialog.contains("shutdown_application_resources_and_quit"));
         assert!(!update_dialog.contains("cx.quit()"));
+    }
+
+    #[test]
+    fn platform_quit_fails_closed_native_rdp_before_ssh_without_recursive_quit() {
+        let source = include_str!("onetcli_app.rs").replace("\r\n", "\n");
+        let start = source
+            .find("fn init_ssh_session_service")
+            .expect("init_ssh_session_service");
+        let end = source[start..]
+            .find("\n}\n\nfn spawn_ssh_session_shutdown")
+            .map(|offset| start + offset)
+            .expect("init_ssh_session_service end");
+        let init = &source[start..end];
+        let callback_start = init
+            .find("cx.on_app_quit(move |cx|")
+            .expect("platform quit callback");
+        let callback = &init[callback_start..];
+        let fail_closed_rdp = callback
+            .find("remote_desktop_view::fail_closed_windows_native_rdp_for_platform_quit(cx)")
+            .expect("Native RDP platform-quit fail-closed fallback");
+        let spawn_ssh = callback
+            .find("Tokio::spawn(cx")
+            .expect("SSH platform-quit fallback");
+
+        assert!(fail_closed_rdp < spawn_ssh);
+        assert!(callback.contains("log_windows_native_rdp_shutdown"));
+        assert!(!callback.contains("shutdown_application_resources_and_quit"));
+        assert!(!callback.contains("shutdown_windows_native_rdp(cx)"));
+        assert!(!callback.contains("cx.quit()"));
     }
 
     #[test]
@@ -2031,7 +2210,7 @@ mod tests {
     }
 
     #[test]
-    fn onetcli_app_persists_window_size_after_bounds_changes() {
+    fn onetcli_app_persists_window_state_after_bounds_changes() {
         let source = include_str!("onetcli_app.rs");
         let start = source.find("pub fn new").expect("OnetCliApp::new");
         let end = source[start..]
@@ -2041,7 +2220,29 @@ mod tests {
         let new_fn = &source[start..end];
 
         assert!(new_fn.contains("observe_window_bounds"));
-        assert!(new_fn.contains("save_main_window_size(window, cx)"));
+        assert!(new_fn.contains("save_main_window_state(window, cx)"));
+    }
+
+    #[test]
+    fn saved_main_window_state_includes_position_size_and_display() {
+        let source = include_str!("onetcli_app.rs");
+        let start = source
+            .find("fn save_main_window_state")
+            .expect("save_main_window_state");
+        let end = source[start..]
+            .find("\n    fn request_quit")
+            .map(|offset| start + offset)
+            .expect("save_main_window_state end");
+        let save = &source[start..end];
+
+        assert!(save.contains("bounds.origin.x"));
+        assert!(save.contains("bounds.origin.y"));
+        assert!(save.contains("bounds.size.width"));
+        assert!(save.contains("bounds.size.height"));
+        assert!(save.contains("let display_uuid = window"));
+        assert!(save.contains(".display(cx)"));
+        assert!(save.contains("display.uuid()"));
+        assert!(save.contains("settings.main_window_state = Some(state)"));
     }
 
     #[test]
@@ -2193,6 +2394,54 @@ mod tests {
     }
 
     #[test]
+    fn configured_log_file_path_treats_extensionless_path_as_directory() {
+        let directory =
+            std::env::temp_dir().join(format!("onetcli-log-directory-test-{}", std::process::id()));
+
+        let path = configured_log_file_path(&directory.to_string_lossy()).expect("应返回日志路径");
+
+        assert_eq!(path, directory.join(LOG_FILE_NAME));
+    }
+
+    #[test]
+    fn configured_log_file_path_uses_existing_directory() {
+        let directory = std::env::temp_dir().join(format!(
+            "onetcli-existing-log-directory-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("应创建测试日志目录");
+
+        let path = configured_log_file_path(&directory.to_string_lossy()).expect("应返回日志路径");
+
+        assert_eq!(path, directory.join(LOG_FILE_NAME));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn configured_log_file_path_preserves_existing_extensionless_file() {
+        let file_path = std::env::temp_dir().join(format!(
+            "onetcli-extensionless-log-file-test-{}",
+            std::process::id()
+        ));
+        std::fs::write(&file_path, "").expect("应创建无扩展名测试文件");
+
+        let path = configured_log_file_path(&file_path.to_string_lossy()).expect("应返回日志路径");
+
+        assert_eq!(path, file_path);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn configured_log_file_path_accepts_windows_directory() {
+        let path = configured_log_file_path(r"D:\Navop\logs").expect("应返回 Windows 日志文件路径");
+
+        assert_eq!(path, std::path::PathBuf::from(r"D:\Navop\logs\onetcli.log"));
+    }
+
+    #[test]
     fn log_file_appender_creates_parent_directories_and_appends() {
         let path = std::env::temp_dir()
             .join(format!("onetcli-log-test-{}", std::process::id()))
@@ -2244,6 +2493,24 @@ impl Render for OnetCliApp {
         let dialog_layer = Root::render_dialog_layer(window, cx);
         let notification_layer = Root::render_notification_layer(window, cx);
         let main_content = self.render_main_content(cx);
+        let show_persistent_sidebar = self.home_page_style.uses_persistent_sidebar();
+        let sidebar_expanded = self.connection_sidebar.read(cx).is_expanded();
+        let auto_hide_tree = self.connection_sidebar.read(cx).is_auto_hide_tree();
+        let docked_tree = show_persistent_sidebar && sidebar_expanded && !auto_hide_tree;
+        let floating_tree = if show_persistent_sidebar && sidebar_expanded && auto_hide_tree {
+            Some(self.connection_sidebar.update(cx, |sidebar, cx| {
+                sidebar.render_floating_tree(window, cx)
+            }))
+        } else {
+            None
+        };
+        let docked_tree_element = if docked_tree {
+            Some(self.connection_sidebar.update(cx, |sidebar, cx| {
+                sidebar.render_docked_connection_tree(window, cx)
+            }))
+        } else {
+            None
+        };
         div()
             .size_full()
             .relative()
@@ -2269,7 +2536,6 @@ impl Render for OnetCliApp {
             }))
             .bg(cx.theme().background)
             .child({
-                let show_persistent_sidebar = self.home_page_style.uses_persistent_sidebar();
                 gpui_component::h_flex()
                     .size_full()
                     .min_w_0()
@@ -2277,7 +2543,37 @@ impl Render for OnetCliApp {
                     .when(show_persistent_sidebar, |layout| {
                         layout.child(self.connection_sidebar.clone())
                     })
-                    .child(div().flex_1().min_w_0().h_full().child(main_content))
+                    .when_some(docked_tree_element, |layout, tree| {
+                        layout.child(tree)
+                    })
+                    .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .when(
+                            show_persistent_sidebar && sidebar_expanded && auto_hide_tree,
+                            |this| {
+                            this.on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|this, event: &gpui::MouseDownEvent, _window, cx| {
+                                    if !this.connection_sidebar.read(cx).is_expanded() {
+                                        return;
+                                    }
+                                    let layout = cx.theme().geometry.layout;
+                                    let in_terminal = event.position.x > layout.global_rail
+                                        && event.position.y > layout.tab_bar;
+                                    if in_terminal {
+                                        this.set_connection_sidebar_expanded(false, cx);
+                                    }
+                                }),
+                            )
+                        })
+                        .child(main_content),
+                    )
+            })
+            .when(show_persistent_sidebar && sidebar_expanded && auto_hide_tree, |this| {
+                this.child(floating_tree.unwrap())
             })
             .children(sheet_layer)
             .children(dialog_layer)
