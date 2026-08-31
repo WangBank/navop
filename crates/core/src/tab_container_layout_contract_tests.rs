@@ -18,6 +18,33 @@ fn scrollable_tabs_keep_window_controls_at_the_right_edge() {
 }
 
 #[test]
+fn background_task_entry_stays_before_window_controls() {
+    let source = include_str!("tab_container.rs");
+    let dropdown = source
+        .find("Button::new(\"tab-dropdown-btn\")")
+        .expect("tab dropdown");
+    let background = source
+        .find(".id(\"background-task-entry\")")
+        .expect("background task entry");
+    let controls = source[dropdown..]
+        .find("self.render_window_controls(window, cx)")
+        .map(|offset| dropdown + offset)
+        .expect("window controls");
+
+    assert!(dropdown < background, "entry follows the dropdown");
+    assert!(
+        background < controls,
+        "entry precedes native window controls"
+    );
+
+    let panel = include_str!("background_task_panel.rs");
+    assert!(panel.contains("fn render_entry(&self, cx: &mut Context<Self>) -> impl IntoElement"));
+    assert!(panel.contains("open_background_task_dialog"));
+    assert!(panel.contains("window.open_dialog(cx"));
+    assert!(source[background..].contains(".flex_shrink_0()"));
+}
+
+#[test]
 fn active_tab_intrinsic_size_cannot_shrink_the_window_chrome() {
     let source = include_str!("tab_container.rs");
     let render_start = source
@@ -106,19 +133,37 @@ fn sidebar_center_clips_active_view_intrinsic_size_at_every_flex_boundary() {
         .expect("tab content renderer");
     let renderer = &source[renderer_start..renderer_end];
 
+    // 中心区域两条分支（有无底栏）都以绝对定位包裹层承载 active view，
+    // 每一层直接边界（包裹层 → tab-sidebar-center → 内容层）都必须截断
+    // intrinsic size，避免图片/远程桌面等内容反向挤压窗口 chrome。
     let center_start = renderer
-        .find("let center_content = div()")
-        .expect("sidebar center content");
-    let center_end = renderer[center_start..]
         .find("let center = if bottom.is_empty()")
-        .map(|offset| center_start + offset)
         .expect("sidebar center layout");
+    let center_end = renderer[center_start..]
+        .find("let mut root = div()")
+        .map(|offset| center_start + offset)
+        .expect("sidebar root layout");
     let center = &renderer[center_start..center_end];
 
-    assert!(center.contains(".size_full()"));
-    assert!(center.contains(".min_w_0()"));
-    assert!(center.contains(".min_h_0()"));
-    assert!(center.contains(".overflow_hidden()"));
+    assert_eq!(
+        center.matches(".absolute()").count(),
+        2,
+        "both center branches must float so panels never enter the flex flow"
+    );
+    // min_w_0/min_h_0 出现 4 次：两个包裹层分支 + tab-sidebar-center + 内容层
+    assert!(
+        center.matches(".min_w_0()").count() >= 4,
+        "every center boundary must zero its min width"
+    );
+    assert!(
+        center.matches(".min_h_0()").count() >= 4,
+        "every center boundary must zero its min height"
+    );
+    assert!(
+        center.matches(".overflow_hidden()").count() >= 4,
+        "every center boundary must clip overflow"
+    );
+    assert!(center.contains(".flex_1()"));
 
     let bottom_center_start = renderer
         .find(".id(\"tab-sidebar-center\")")

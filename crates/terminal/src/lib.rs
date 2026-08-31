@@ -17,6 +17,7 @@ pub mod ssh_backend;
 mod ssh_expect;
 mod ssh_ingress;
 mod ssh_session_identity;
+mod ssh_shell_integration;
 pub mod telnet_backend;
 mod telnet_expect;
 mod telnet_ingress;
@@ -45,6 +46,7 @@ pub use ssh_backend::SshBackend;
 pub use ssh_session_identity::{
     PersistedSshSessionIdentity, PersistedSshSessionIdentityError, SshSessionIdentityTransition,
 };
+pub use ssh_shell_integration::test_support;
 pub use telnet_backend::TelnetBackend;
 pub use terminal::{TerminalScrollProxy, TerminalSessionMode, TerminalTextSnapshot};
 pub use types::{
@@ -52,6 +54,7 @@ pub use types::{
     TerminalControlHandle, TerminalControlOutput, TerminalControlReadiness, TerminalControlRequest,
     TerminalExecCompletion, TerminalExecHandle, TerminalExecObserver, TerminalExecOutput,
     TerminalExecProgress, TerminalExecRequest, TerminalInputHandle, TerminalSize,
+    TerminalTransferCancelHandle,
 };
 
 #[cfg(test)]

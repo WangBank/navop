@@ -2,6 +2,8 @@
 
 Navop 內建 MySQL、PostgreSQL、SQLite、DuckDB、SQL Server、Oracle 與 ClickHouse，並可透過擴充加入達夢、金倉、GBase 8s、OceanBase、openGauss、IoTDB 等驅動。欄位與能力依驅動和伺服器版本而異。
 
+內建 Oracle 驅動需要 [Oracle Instant Client](https://www.oracle.com/database/technologies/instant-client/downloads.html)；若不想安裝 Instant Client，可從擴充市場安裝純 Go Oracle 驅動。連線 Oracle 時可依需求選擇 Native 或 Go 驅動。
+
 ## 建立網路資料庫連線
 
 選擇類型，填寫名稱、主機、連接埠、使用者、密碼和預設資料庫。先測試網路、驗證與驅動再儲存。失敗時依序檢查 DNS、連接埠、防火牆、帳號權限、資料庫狀態和版本，不要一次修改多個變數。
@@ -18,7 +20,7 @@ SQLite 與 DuckDB 可直接選擇本機檔案，也可透過 `.db` 或 `.duckdb`
 
 無法直連時可使用 SOCKS5 或 HTTP CONNECT，並依需要設定代理驗證。代理只改變網路路徑，不會取代資料庫 TLS 和權限。
 
-SSH 通道可引用已儲存的 SSH/SFTP 連線，或手動設定跳板機；支援密碼、私鑰檔、私鑰內容和 SSH Agent。資料庫不在跳板機本機時，必須設定真正目標。先測試 SSH，再測試資料庫。
+SSH 通道可引用已儲存的 SSH/SFTP 連線，或手動設定跳板機；支援密碼、私鑰檔、私鑰內容和 SSH Agent。資料庫不在跳板機本機時，必須設定真正目標。先測試 SSH，再測試資料庫。停用跳板機後其設定仍會保留，便於快速重新啟用，不必重新填寫驗證資訊。
 
 ## SSL/TLS 與憑證
 

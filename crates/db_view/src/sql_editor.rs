@@ -1,18 +1,28 @@
+use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 
+use crate::sql_editor_hover::DefaultSqlHoverProvider;
+use crate::sql_editor_signature::DefaultSqlSignatureHelpProvider;
 use anyhow::Result;
 use db::plugin::SqlCompletionInfo;
+use db::sql_editor::diagnostics::{
+    SqlDiagnostic, SqlDiagnosticSeverity, SqlMetadataView, analyze_parser_diagnostics,
+    analyze_semantic_diagnostics,
+};
 use db::sql_editor::sql_context_inferrer::{ContextInferrer, SqlContext as InferredSqlContext};
 use db::sql_editor::sql_symbol_table::SymbolTable;
-use db::sql_editor::sql_tokenizer::SqlTokenizer;
+use db::sql_editor::sql_tokenizer::{SqlKeyword, SqlToken, SqlTokenKind, SqlTokenizer};
+use db::sql_editor::statement_ranges::{SqlDialect, SqlStatementSnapshot};
 use gpui::{
     App, AppContext, Context, Entity, Font, IntoElement, Render, Styled as _, Subscription, Task,
     Window,
 };
+use gpui_component::highlighter::{Diagnostic, DiagnosticSeverity};
 use gpui_component::input::{
     CodeActionProvider, CompletionProvider, HoverProvider, Input, InputContextMenuItem, InputEvent,
-    InputState, TabSize,
+    InputState, SignatureHelpProvider, TabSize,
 };
 use gpui_component::scroll::ScrollbarShow;
 use gpui_component::{Rope, RopeExt};
@@ -25,7 +35,65 @@ use one_core::settings::{AppSettings, installed_grid_monospace_font};
 use rust_i18n::t;
 use sum_tree::Bias;
 
-/// Simple schema hints to improve autocomplete suggestions.
+/// Kind of a table-like schema object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SqlObjectType {
+    #[default]
+    Table,
+    View,
+}
+
+impl SqlObjectType {
+    /// Stable display name used by hover content and DDL preview.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SqlObjectType::Table => "TABLE",
+            SqlObjectType::View => "VIEW",
+        }
+    }
+}
+
+/// Detailed column metadata for hover and generated DDL preview.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SqlColumnDetail {
+    pub name: String,
+    pub data_type: String,
+    pub is_nullable: bool,
+    pub is_primary_key: bool,
+    pub default_value: Option<String>,
+    pub comment: Option<String>,
+}
+
+/// Detailed table-like object metadata for hover.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SqlTableDetail {
+    pub object_type: SqlObjectType,
+    pub schema: Option<String>,
+    pub comment: Option<String>,
+    pub engine: Option<String>,
+    pub columns: Vec<SqlColumnDetail>,
+}
+
+/// 外部 database/schema（qualifier）的表/列元数据快照，用于跨库限定名补全。
+///
+/// 由视图层懒加载并按 qualifier 名（小写键）缓存在 [`SqlSchema::foreign_schemas`]。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ForeignSchema {
+    /// qualifier 原始名称（保持大小写）。
+    pub name: String,
+    /// (表名, 说明)
+    pub tables: Vec<(String, String)>,
+    /// 表→列映射，每列为 (name, data_type, doc)
+    pub columns_by_table: std::collections::HashMap<String, Vec<(String, String, String)>>,
+    /// 表名→详细信息（供 hover 复用）。
+    pub table_details: std::collections::HashMap<String, SqlTableDetail>,
+}
+
+/// Schema hints used by autocomplete and hover.
+///
+/// The snapshot is always scoped to one connection's currently selected
+/// database/schema (see `current_database`/`current_schema`), which hover
+/// resolution uses to reject cross-database bare-name references.
 #[derive(Clone, Default)]
 pub struct SqlSchema {
     pub tables: Vec<(String, String)>,    // (name, doc)
@@ -33,6 +101,18 @@ pub struct SqlSchema {
     pub functions: Vec<(String, String)>, // (signature, doc)
     /// 表→列映射，每列包含 (name, data_type, doc)
     pub columns_by_table: std::collections::HashMap<String, Vec<(String, String, String)>>,
+    /// 可用 database/schema（qualifier）列表，由视图层按方言填充。
+    /// 当前 database/schema 由 `current_database` / `current_schema` 单独保存，
+    /// completion 构建时与这里的外部 qualifier 合并。
+    pub qualifiers: Vec<(String, String)>,
+    /// 已懒加载的外部 qualifier 元数据，key 为 qualifier 小写名。
+    pub foreign_schemas: std::collections::HashMap<String, ForeignSchema>,
+    /// Database this snapshot was loaded for (scope guard for hover).
+    pub current_database: Option<String>,
+    /// Schema this snapshot was loaded for (scope guard for hover).
+    pub current_schema: Option<String>,
+    /// Detailed object info keyed by table name (as loaded), used by hover.
+    pub table_details: std::collections::HashMap<String, SqlTableDetail>,
 }
 
 impl SqlSchema {
@@ -96,6 +176,34 @@ impl SqlSchema {
         );
         self
     }
+    /// 记录本快照所属的 database/schema，供 hover 作用域校验使用。
+    pub fn with_scope(mut self, database: Option<String>, schema: Option<String>) -> Self {
+        self.current_database = database;
+        self.current_schema = schema;
+        self
+    }
+    /// 设置其他可用 database/schema（qualifier）候选列表。
+    pub fn with_qualifiers(
+        mut self,
+        qualifiers: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        self.qualifiers = qualifiers
+            .into_iter()
+            .map(|(n, d)| (n.into(), d.into()))
+            .collect();
+        self
+    }
+    /// 缓存一个外部 qualifier 的元数据（key 归一化为小写）。
+    pub fn with_foreign_schema(mut self, foreign: ForeignSchema) -> Self {
+        self.foreign_schemas
+            .insert(foreign.name.to_lowercase(), foreign);
+        self
+    }
+    /// 添加表的详细元数据（用于 hover 与 DDL 预览）。
+    pub fn with_table_detail(mut self, table: impl Into<String>, detail: SqlTableDetail) -> Self {
+        self.table_details.insert(table.into(), detail);
+        self
+    }
 }
 
 /// SQL context for smarter completion suggestions
@@ -123,6 +231,127 @@ pub enum SqlContext {
     FunctionArgs,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SqlDotCompletionTarget {
+    /// 当前 database/schema 的表列表。
+    Tables,
+    /// 当前库表名 → 列。
+    Columns(String),
+    /// 外部 database/schema → 表列表。
+    ForeignTables(String),
+    /// 外部 qualifier + 表名 → 列。
+    ForeignColumns(String, String),
+    None,
+}
+
+fn scope_matches(schema: &SqlSchema, qualifier: &str) -> bool {
+    schema
+        .current_database
+        .as_deref()
+        .is_some_and(|database| database.eq_ignore_ascii_case(qualifier))
+        || schema
+            .current_schema
+            .as_deref()
+            .is_some_and(|schema| schema.eq_ignore_ascii_case(qualifier))
+}
+
+/// 解析点号补全目标。`chain` 是光标前最后一个点号之前的限定链。
+/// 返回值使用元数据中的规范名（大小写以元数据为准）。
+pub(crate) fn sql_dot_completion_target_for_chain(
+    schema: &SqlSchema,
+    chain: &[String],
+) -> SqlDotCompletionTarget {
+    match chain {
+        [name] => {
+            if scope_matches(schema, name) {
+                return SqlDotCompletionTarget::Tables;
+            }
+            if let Some(qualifier) = canonical_qualifier(schema, name) {
+                return SqlDotCompletionTarget::ForeignTables(qualifier);
+            }
+            table_name_in_schema(schema, name)
+                .map(SqlDotCompletionTarget::Columns)
+                .unwrap_or(SqlDotCompletionTarget::None)
+        }
+        [qualifier, table] => {
+            if let Some(canonical) = canonical_qualifier(schema, qualifier) {
+                return SqlDotCompletionTarget::ForeignColumns(canonical, table.clone());
+            }
+            if scope_matches(schema, qualifier) {
+                return table_name_in_schema(schema, table)
+                    .map(SqlDotCompletionTarget::Columns)
+                    .unwrap_or(SqlDotCompletionTarget::None);
+            }
+            SqlDotCompletionTarget::None
+        }
+        _ => SqlDotCompletionTarget::None,
+    }
+}
+
+/// 返回元数据中的规范 qualifier 名（大小写不敏感匹配）。
+fn canonical_qualifier(schema: &SqlSchema, name: &str) -> Option<String> {
+    schema
+        .qualifiers
+        .iter()
+        .find(|(qualifier, _)| qualifier.eq_ignore_ascii_case(name))
+        .map(|(qualifier, _)| qualifier.clone())
+}
+
+/// 返回元数据中的规范表名（优先列映射键，其次表列表）。
+fn table_name_in_schema(schema: &SqlSchema, name: &str) -> Option<String> {
+    schema
+        .columns_by_table
+        .keys()
+        .find(|table| table.eq_ignore_ascii_case(name))
+        .cloned()
+        .or_else(|| {
+            schema
+                .tables
+                .iter()
+                .find(|(table, _)| table.eq_ignore_ascii_case(name))
+                .map(|(table, _)| table.clone())
+        })
+}
+
+pub(crate) fn sql_dot_completion_target(
+    schema: &SqlSchema,
+    qualifier: &str,
+) -> SqlDotCompletionTarget {
+    sql_dot_completion_target_for_chain(schema, &[qualifier.to_string()])
+}
+
+/// 解析光标前最后一个点号之前的限定链：`db.tbl.` → ["db","tbl"]。
+///
+/// 只收集点号之前的标识符；正在输入的最后一个词（点号之后）不属于链。
+pub(crate) fn dot_qualifier_chain(text: &str, offset: usize) -> Vec<String> {
+    let mut tokenizer = SqlTokenizer::new(text);
+    let tokens = tokenizer.tokenize();
+    let meaningful: Vec<&SqlToken> = tokens
+        .iter()
+        .filter(|token| token.end <= offset && !token.is_whitespace() && !token.is_comment())
+        .collect();
+    let Some(mut index) = meaningful
+        .iter()
+        .rposition(|token| token.kind == SqlTokenKind::Dot)
+    else {
+        return Vec::new();
+    };
+    let mut chain = Vec::new();
+    while index > 0 {
+        let token = meaningful[index - 1];
+        if !matches!(token.kind, SqlTokenKind::Ident | SqlTokenKind::QuotedIdent) {
+            break;
+        }
+        chain.insert(0, completion_identifier_text(token));
+        if index >= 2 && meaningful[index - 2].kind == SqlTokenKind::Dot {
+            index -= 2;
+        } else {
+            break;
+        }
+    }
+    chain
+}
+
 /// Priority scores for context-aware completion sorting.
 /// Lower scores appear first in completion list (higher priority).
 ///
@@ -139,6 +368,8 @@ pub mod completion_priority {
     pub const KEYWORDS_BASE: i32 = 1000;
     pub const DATA_TYPES_BASE: i32 = 1500;
     pub const TABLES_BASE: i32 = 2000;
+    /// 外部 database/schema（qualifier）名补全，排在当前库表之后、列之前。
+    pub const QUALIFIERS_BASE: i32 = 2800;
     pub const COLUMNS_BASE: i32 = 3000;
     pub const SNIPPETS_BASE: i32 = 4000;
     pub const OPERATORS_BASE: i32 = 4500;
@@ -386,31 +617,57 @@ pub(crate) const SQL_DATA_TYPES: &[(&str, &str)] = &[
 
 #[derive(Clone)]
 pub struct DefaultSqlCompletionProvider {
-    schema: SqlSchema,
-    db_completion_info: Option<SqlCompletionInfo>,
+    sources: Rc<RefCell<SqlCompletionSources>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SqlCompletionSources {
+    pub(crate) schema: Arc<SqlSchema>,
+    pub(crate) db_completion_info: Option<SqlCompletionInfo>,
+}
+
+impl Default for SqlCompletionSources {
+    fn default() -> Self {
+        Self {
+            schema: Arc::new(SqlSchema::default()),
+            db_completion_info: None,
+        }
+    }
 }
 
 impl DefaultSqlCompletionProvider {
     pub fn new(schema: SqlSchema) -> Self {
         Self {
-            schema,
-            db_completion_info: None,
+            sources: Rc::new(RefCell::new(SqlCompletionSources {
+                schema: Arc::new(schema),
+                db_completion_info: None,
+            })),
         }
     }
 
-    pub fn with_db_completion_info(mut self, info: SqlCompletionInfo) -> Self {
-        self.db_completion_info = Some(info);
+    pub fn with_db_completion_info(self, info: SqlCompletionInfo) -> Self {
+        self.sources.borrow_mut().db_completion_info = Some(info);
         self
+    }
+
+    /// Atomically replace metadata while keeping this provider object alive.
+    pub fn set_sources(&self, schema: SqlSchema, db_completion_info: SqlCompletionInfo) {
+        *self.sources.borrow_mut() = SqlCompletionSources {
+            schema: Arc::new(schema),
+            db_completion_info: Some(db_completion_info),
+        };
+    }
+
+    pub(crate) fn sources(&self) -> SqlCompletionSources {
+        self.sources.borrow().clone()
     }
 
     /// Parse SQL text and return both context and symbol table.
     ///
     /// This method is used when we need the symbol table for DotColumn filtering.
-    fn parse_context_with_symbols(text: &str, offset: usize) -> (SqlContext, SymbolTable) {
-        let mut tokenizer = SqlTokenizer::new(text);
-        let tokens = tokenizer.tokenize();
-        let symbol_table = SymbolTable::build_from_tokens(&tokens);
-        let inferred = ContextInferrer::infer(&tokens, offset, &symbol_table);
+    fn parse_context_with_symbols(tokens: &[SqlToken], offset: usize) -> (SqlContext, SymbolTable) {
+        let symbol_table = SymbolTable::build_from_tokens(tokens);
+        let inferred = ContextInferrer::infer(tokens, offset, &symbol_table);
         (Self::convert_context(inferred), symbol_table)
     }
 
@@ -431,6 +688,474 @@ impl DefaultSqlCompletionProvider {
     }
 }
 
+pub(crate) fn clip_sql_offset(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset = offset.saturating_sub(1);
+    }
+    offset
+}
+
+pub(crate) fn cursor_is_in_sql_literal_or_comment(
+    text: &str,
+    tokens: &[SqlToken],
+    offset: usize,
+) -> bool {
+    let offset = clip_sql_offset(text, offset);
+    tokens.iter().any(|token| {
+        if token.start >= offset || offset > token.end {
+            return false;
+        }
+
+        match token.kind {
+            SqlTokenKind::String => {
+                offset < token.end
+                    || (token.end == text.len()
+                        && !token
+                            .text
+                            .strip_prefix('\'')
+                            .is_some_and(|body| body.ends_with('\'') && !body.ends_with("''")))
+            }
+            SqlTokenKind::LineComment => offset <= token.end,
+            SqlTokenKind::BlockComment => {
+                offset < token.end
+                    || (token.end == text.len() && !token.text.trim_end().ends_with("*/"))
+            }
+            _ => false,
+        }
+    })
+}
+
+pub(crate) fn current_statement_has_from_keyword(
+    text: &str,
+    tokens: &[SqlToken],
+    offset: usize,
+) -> bool {
+    let offset = clip_sql_offset(text, offset);
+    let statement_start = tokens
+        .iter()
+        .filter(|token| token.kind == SqlTokenKind::Semicolon && token.end <= offset)
+        .map(|token| token.end)
+        .next_back()
+        .unwrap_or(0);
+    let statement_end = tokens
+        .iter()
+        .find(|token| token.kind == SqlTokenKind::Semicolon && token.start >= offset)
+        .map(|token| token.start)
+        .unwrap_or(text.len());
+
+    tokens.iter().any(|token| {
+        token.start >= statement_start
+            && token.end <= statement_end
+            && token.is_keyword_of(SqlKeyword::From)
+    })
+}
+
+pub(crate) fn insert_column_target_table(text: &str, offset: usize) -> Option<String> {
+    let meaningful = meaningful_tokens_before(text, offset);
+    let into = meaningful
+        .iter()
+        .rposition(|token| token.is_keyword_of(SqlKeyword::Into))?;
+    let (table, target_end) = qualified_table_after(&meaningful, into + 1)?;
+    let mut stack = Vec::new();
+    let mut values_before_open = false;
+    for token in meaningful.iter().skip(target_end) {
+        match token.kind {
+            SqlTokenKind::LParen => stack.push(token),
+            SqlTokenKind::RParen => {
+                stack.pop();
+            }
+            SqlTokenKind::Keyword(SqlKeyword::Values) if stack.is_empty() => {
+                values_before_open = true;
+            }
+            _ => {}
+        }
+    }
+    (!values_before_open && !stack.is_empty()).then_some(table)
+}
+
+pub(crate) fn update_target_table(text: &str, offset: usize) -> Option<String> {
+    let meaningful = meaningful_tokens_before(text, offset);
+    let update = meaningful
+        .iter()
+        .rposition(|token| token.is_keyword_of(SqlKeyword::Update))?;
+    qualified_table_after(&meaningful, update + 1).map(|(table, _)| table)
+}
+
+fn meaningful_tokens_before(text: &str, offset: usize) -> Vec<SqlToken> {
+    let mut tokenizer = SqlTokenizer::new(text);
+    tokenizer
+        .tokenize()
+        .into_iter()
+        .filter(|token| {
+            token.end <= offset
+                && !token.is_whitespace()
+                && !token.is_comment()
+                && token.kind != SqlTokenKind::Eof
+        })
+        .collect()
+}
+
+fn qualified_table_after(tokens: &[SqlToken], start: usize) -> Option<(String, usize)> {
+    let first = tokens.get(start)?;
+    if !matches!(first.kind, SqlTokenKind::Ident | SqlTokenKind::QuotedIdent) {
+        return None;
+    }
+    let mut table = completion_identifier_text(first);
+    let mut index = start + 1;
+    while tokens
+        .get(index)
+        .is_some_and(|token| token.kind == SqlTokenKind::Dot)
+    {
+        let part = tokens.get(index + 1)?;
+        if !matches!(part.kind, SqlTokenKind::Ident | SqlTokenKind::QuotedIdent) {
+            break;
+        }
+        table = completion_identifier_text(part);
+        index += 2;
+    }
+    Some((table, index))
+}
+
+fn completion_identifier_text(token: &SqlToken) -> String {
+    let text = &token.text;
+    if let Some(body) = text
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
+        body.replace("\"\"", "\"")
+    } else if let Some(body) = text
+        .strip_prefix('`')
+        .and_then(|value| value.strip_suffix('`'))
+    {
+        body.replace("``", "`")
+    } else if let Some(body) = text
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    {
+        body.replace("]]", "]")
+    } else {
+        text.clone()
+    }
+}
+
+/// 查找已缓存的外部 qualifier 元数据（大小写不敏感）。
+pub(crate) fn find_foreign_schema<'a>(
+    schema: &'a SqlSchema,
+    qualifier: &str,
+) -> Option<&'a ForeignSchema> {
+    schema
+        .foreign_schemas
+        .get(&qualifier.to_lowercase())
+        .or_else(|| {
+            schema
+                .foreign_schemas
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(qualifier))
+                .map(|(_, value)| value)
+        })
+}
+
+/// 当前列查找：先当前库，再回退到外部 qualifier 缓存
+/// （SymbolTable 对 `FROM db.tbl` 只保留表名，跨库表靠兜底解析）。
+pub(crate) fn find_columns_with_foreign<'a>(
+    schema: &'a SqlSchema,
+    table: &str,
+) -> Option<&'a Vec<(String, String, String)>> {
+    find_schema_columns(schema, table).or_else(|| {
+        schema.foreign_schemas.values().find_map(|foreign| {
+            foreign.columns_by_table.get(table).or_else(|| {
+                foreign
+                    .columns_by_table
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(table))
+                    .map(|(_, value)| value)
+            })
+        })
+    })
+}
+
+/// 补全项构建上下文，统一过滤、匹配加权和 text_edit 生成。
+struct ItemBuildContext<'a> {
+    context: &'a SqlContext,
+    current_word: &'a str,
+    replace_range: LspRange,
+}
+
+impl ItemBuildContext<'_> {
+    fn matches(&self, label: &str) -> bool {
+        identifier_match_rank(label, self.current_word).is_some()
+    }
+
+    fn match_boost(&self, label: &str) -> i32 {
+        match identifier_match_rank(label, self.current_word) {
+            Some(0) => completion_priority::PREFIX_MATCH_BOOST,
+            Some(1) => completion_priority::BOUNDARY_MATCH_BOOST,
+            _ => 0,
+        }
+    }
+
+    fn matched_prefix(&self, label: &str) -> String {
+        let upper = label.to_uppercase();
+        if !self.current_word.is_empty() && upper.starts_with(self.current_word) {
+            label
+                .chars()
+                .take(self.current_word.chars().count())
+                .collect()
+        } else {
+            String::new()
+        }
+    }
+
+    fn kind_base(kind: CompletionItemKind) -> i32 {
+        match kind {
+            CompletionItemKind::KEYWORD => completion_priority::KEYWORDS_BASE,
+            CompletionItemKind::TYPE_PARAMETER => completion_priority::DATA_TYPES_BASE,
+            CompletionItemKind::STRUCT => completion_priority::TABLES_BASE,
+            CompletionItemKind::FIELD => completion_priority::COLUMNS_BASE,
+            CompletionItemKind::FUNCTION => completion_priority::FUNCTIONS_BASE,
+            CompletionItemKind::OPERATOR => completion_priority::OPERATORS_BASE,
+            CompletionItemKind::SNIPPET => completion_priority::SNIPPETS_BASE,
+            _ => completion_priority::COLUMNS_BASE,
+        }
+    }
+
+    /// 以 `base` 作为类型基准分（默认类型基准之外的自定义基准，如 QUALIFIERS_BASE）。
+    fn score(&self, label: &str, kind: CompletionItemKind, base: i32) -> i32 {
+        completion_priority::calculate_score_with_match(
+            self.context,
+            Some(kind),
+            self.match_boost(label),
+        ) - Self::kind_base(kind)
+            + base
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push(
+        &self,
+        items: &mut Vec<CompletionItem>,
+        label: String,
+        new_text: String,
+        kind: CompletionItemKind,
+        base: i32,
+        detail: Option<String>,
+        doc: Option<String>,
+    ) {
+        let filter_text = self.matched_prefix(&label);
+        let sort_text =
+            completion_priority::score_to_sort_text(self.score(&label, kind, base), &label);
+        items.push(CompletionItem {
+            label,
+            kind: Some(kind),
+            detail,
+            text_edit: Some(CompletionTextEdit::InsertAndReplace(InsertReplaceEdit {
+                new_text,
+                insert: self.replace_range,
+                replace: self.replace_range,
+            })),
+            filter_text: Some(filter_text),
+            documentation: doc.map(lsp_types::Documentation::String),
+            sort_text: Some(sort_text),
+            ..Default::default()
+        });
+    }
+}
+
+/// 外部 qualifier 的表列表补全项。
+pub(crate) fn foreign_table_items(
+    foreign: &ForeignSchema,
+    context: &SqlContext,
+    current_word: &str,
+    replace_range: LspRange,
+) -> Vec<CompletionItem> {
+    let ctx = ItemBuildContext {
+        context,
+        current_word,
+        replace_range,
+    };
+    let mut items = Vec::new();
+    for (table, doc) in &foreign.tables {
+        if !ctx.matches(table) {
+            continue;
+        }
+        ctx.push(
+            &mut items,
+            table.clone(),
+            table.clone(),
+            CompletionItemKind::STRUCT,
+            completion_priority::TABLES_BASE,
+            Some("Table".to_string()),
+            Some(doc.clone()),
+        );
+    }
+    sort_and_truncate(items)
+}
+
+/// 外部 qualifier 内某张表的列补全项。
+pub(crate) fn foreign_column_items(
+    foreign: &ForeignSchema,
+    table: &str,
+    context: &SqlContext,
+    current_word: &str,
+    replace_range: LspRange,
+) -> Vec<CompletionItem> {
+    let Some(columns) = foreign.columns_by_table.get(table).or_else(|| {
+        foreign
+            .columns_by_table
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(table))
+            .map(|(_, value)| value)
+    }) else {
+        return Vec::new();
+    };
+    column_list_items(columns, table, context, current_word, replace_range)
+}
+
+/// 列补全项（label 为列名，detail 展示类型或来源表）。
+pub(crate) fn column_list_items(
+    columns: &[(String, String, String)],
+    table: &str,
+    context: &SqlContext,
+    current_word: &str,
+    replace_range: LspRange,
+) -> Vec<CompletionItem> {
+    let ctx = ItemBuildContext {
+        context,
+        current_word,
+        replace_range,
+    };
+    let mut items = Vec::new();
+    for (column, data_type, doc) in columns {
+        if !ctx.matches(column) {
+            continue;
+        }
+        let detail = if data_type.is_empty() {
+            format!("{table}.{column}")
+        } else {
+            format!("{column}: {data_type}")
+        };
+        ctx.push(
+            &mut items,
+            column.clone(),
+            column.clone(),
+            CompletionItemKind::FIELD,
+            completion_priority::COLUMNS_BASE,
+            Some(detail),
+            (!doc.is_empty()).then(|| doc.clone()),
+        );
+    }
+    sort_and_truncate(items)
+}
+
+/// database/schema（qualifier）名补全项，接受后插入 `name.` 触发表名补全。
+pub(crate) fn qualifier_name_items(
+    schema: &SqlSchema,
+    context: &SqlContext,
+    current_word: &str,
+    replace_range: LspRange,
+) -> Vec<CompletionItem> {
+    let ctx = ItemBuildContext {
+        context,
+        current_word,
+        replace_range,
+    };
+    let mut candidates = Vec::new();
+    if let Some(database) = &schema.current_database {
+        candidates.push((
+            database.clone(),
+            t!("SqlEditor.database_object").to_string(),
+        ));
+    }
+    if let Some(current_schema) = &schema.current_schema {
+        if !candidates
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(current_schema))
+        {
+            candidates.push((
+                current_schema.clone(),
+                t!("SqlEditor.schema_object").to_string(),
+            ));
+        }
+    }
+    for (name, doc) in &schema.qualifiers {
+        if !candidates
+            .iter()
+            .any(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+        {
+            candidates.push((name.clone(), doc.clone()));
+        }
+    }
+
+    let mut items = Vec::new();
+    for (name, doc) in candidates {
+        if !ctx.matches(&name) {
+            continue;
+        }
+        ctx.push(
+            &mut items,
+            name.clone(),
+            format!("{name}."),
+            CompletionItemKind::MODULE,
+            completion_priority::QUALIFIERS_BASE,
+            Some(doc.clone()),
+            (!doc.is_empty()).then_some(doc),
+        );
+    }
+    sort_and_truncate(items)
+}
+
+fn sort_and_truncate(items: Vec<CompletionItem>) -> Vec<CompletionItem> {
+    let mut items = items;
+    items.sort_by(|a, b| {
+        a.sort_text
+            .as_ref()
+            .unwrap_or(&a.label)
+            .cmp(b.sort_text.as_ref().unwrap_or(&b.label))
+    });
+    items.truncate(50);
+    items
+}
+
+/// 扫描文本中出现的、已知且尚未缓存的外部 qualifier（`q.` 模式），供懒加载触发。
+pub(crate) fn pending_foreign_qualifiers(text: &str, schema: &SqlSchema) -> Vec<String> {
+    if schema.qualifiers.is_empty() {
+        return Vec::new();
+    }
+    let mut tokenizer = SqlTokenizer::new(text);
+    let tokens = tokenizer.tokenize();
+    let mut found: Vec<String> = Vec::new();
+    for pair in tokens.windows(2) {
+        if pair[1].kind != SqlTokenKind::Dot {
+            continue;
+        }
+        if !matches!(
+            pair[0].kind,
+            SqlTokenKind::Ident | SqlTokenKind::QuotedIdent
+        ) {
+            continue;
+        }
+        let name = completion_identifier_text(&pair[0]);
+        let Some((qualifier, _)) = schema
+            .qualifiers
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(&name))
+        else {
+            continue;
+        };
+        let cached = schema
+            .foreign_schemas
+            .contains_key(&qualifier.to_lowercase());
+        if !cached
+            && !found
+                .iter()
+                .any(|item| item.eq_ignore_ascii_case(qualifier))
+        {
+            found.push(qualifier.clone());
+        }
+    }
+    found
+}
+
 impl CompletionProvider for DefaultSqlCompletionProvider {
     fn completions(
         &self,
@@ -441,17 +1166,20 @@ impl CompletionProvider for DefaultSqlCompletionProvider {
         cx: &mut Context<InputState>,
     ) -> Task<Result<CompletionResponse>> {
         let rope = rope.clone();
-        let schema = self.schema.clone();
-        let db_info = self.db_completion_info.clone();
+        let SqlCompletionSources {
+            schema,
+            db_completion_info: db_info,
+        } = self.sources();
 
         cx.background_spawn(async move {
             let text = rope.to_string();
+            let offset = rope.clip_offset(offset.min(rope.len()), Bias::Left);
+            debug_assert!(text.is_char_boundary(offset));
+            let before_cursor = &text[..offset];
 
-            // Check if inside a comment (-- style)
-            let before_cursor = &text[..offset.min(text.len())];
-            let last_newline = before_cursor.rfind('\n').map(|p| p + 1).unwrap_or(0);
-            let current_line = &before_cursor[last_newline..];
-            if current_line.contains("--") {
+            let mut tokenizer = SqlTokenizer::new(&text);
+            let tokens = tokenizer.tokenize();
+            if cursor_is_in_sql_literal_or_comment(&text, &tokens, offset) {
                 return Ok(CompletionResponse::Array(vec![]));
             }
 
@@ -461,11 +1189,11 @@ impl CompletionProvider for DefaultSqlCompletionProvider {
             }
 
             // Use tokenizer-based context parsing with symbol table
-            let (context, symbol_table) = Self::parse_context_with_symbols(&text, offset);
+            let (context, symbol_table) = Self::parse_context_with_symbols(&tokens, offset);
 
             // Current word - find word start by scanning backwards from offset
             // Use clip_offset to ensure we're on a char boundary
-            let mut start_offset = rope.clip_offset(offset, Bias::Left);
+            let mut start_offset = offset;
             while start_offset > 0 {
                 let prev_offset = rope.clip_offset(start_offset.saturating_sub(1), Bias::Left);
                 if prev_offset >= start_offset {
@@ -508,15 +1236,209 @@ impl CompletionProvider for DefaultSqlCompletionProvider {
                 }
             };
 
+            let target_table = insert_column_target_table(&text, offset).or_else(|| {
+                matches!(context, SqlContext::SetClause)
+                    .then(|| update_target_table(&text, offset))
+                    .flatten()
+            });
+            if let Some(target_table) = target_table {
+                if let Some(columns) = find_columns_with_foreign(&schema, &target_table) {
+                    for (column, data_type, doc) in columns {
+                        if !matches_filter(column) {
+                            continue;
+                        }
+                        let score = completion_priority::calculate_score_with_match(
+                            &SqlContext::SetClause,
+                            Some(CompletionItemKind::FIELD),
+                            match_boost(column),
+                        );
+                        items.push(CompletionItem {
+                            label: column.clone(),
+                            kind: Some(CompletionItemKind::FIELD),
+                            detail: Some(if data_type.is_empty() {
+                                format!("{target_table}.{column}")
+                            } else {
+                                format!("{column}: {data_type}")
+                            }),
+                            text_edit: Some(CompletionTextEdit::InsertAndReplace(
+                                InsertReplaceEdit {
+                                    new_text: column.clone(),
+                                    insert: replace_range,
+                                    replace: replace_range,
+                                },
+                            )),
+                            filter_text: Some(matched_prefix(column)),
+                            documentation: Some(lsp_types::Documentation::String(doc.clone())),
+                            sort_text: Some(completion_priority::score_to_sort_text(score, column)),
+                            ..Default::default()
+                        });
+                    }
+                }
+                items.sort_by(|a, b| a.sort_text.cmp(&b.sort_text));
+                items.truncate(50);
+                return Ok(CompletionResponse::Array(items));
+            }
+
             // Handle dot context (table.column) - highest priority
             // Uses SymbolTable to resolve alias to actual table name
             if let SqlContext::DotColumn(alias_or_table) = &context {
+                let chain = dot_qualifier_chain(&text, offset);
+                let qualifier = chain
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| alias_or_table.clone());
+
+                // 多级限定链（db.tbl. / schema.tbl.）直接按元数据解析，不走别名解析
+                if chain.len() >= 2 {
+                    let items = match sql_dot_completion_target_for_chain(&schema, &chain) {
+                        SqlDotCompletionTarget::ForeignTables(name) => {
+                            find_foreign_schema(&schema, &name)
+                                .map(|foreign| {
+                                    foreign_table_items(
+                                        foreign,
+                                        &SqlContext::TableName,
+                                        &current_word,
+                                        replace_range,
+                                    )
+                                })
+                                .unwrap_or_default()
+                        }
+                        SqlDotCompletionTarget::ForeignColumns(qualifier, table) => {
+                            find_foreign_schema(&schema, &qualifier)
+                                .map(|foreign| {
+                                    foreign_column_items(
+                                        foreign,
+                                        &table,
+                                        &context,
+                                        &current_word,
+                                        replace_range,
+                                    )
+                                })
+                                .unwrap_or_default()
+                        }
+                        SqlDotCompletionTarget::Columns(table) => {
+                            find_columns_with_foreign(&schema, &table)
+                                .map(|columns| {
+                                    column_list_items(
+                                        columns,
+                                        &table,
+                                        &context,
+                                        &current_word,
+                                        replace_range,
+                                    )
+                                })
+                                .unwrap_or_default()
+                        }
+                        SqlDotCompletionTarget::Tables | SqlDotCompletionTarget::None => Vec::new(),
+                    };
+                    return Ok(CompletionResponse::Array(items));
+                }
+
                 // Resolve alias to table name using symbol table
                 // If alias is found, use the resolved table name; otherwise use as-is
                 let resolved_table = symbol_table
-                    .resolve(alias_or_table)
+                    .resolve(&qualifier)
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| alias_or_table.clone());
+
+                let projected_columns = symbol_table
+                    .projected_columns(&qualifier)
+                    .or_else(|| symbol_table.projected_columns(&resolved_table));
+                if let Some(columns) = projected_columns {
+                    for column in columns {
+                        if !matches_filter(column) {
+                            continue;
+                        }
+                        let score = completion_priority::calculate_score_with_match(
+                            &context,
+                            Some(CompletionItemKind::FIELD),
+                            match_boost(column),
+                        );
+                        items.push(CompletionItem {
+                            label: column.clone(),
+                            kind: Some(CompletionItemKind::FIELD),
+                            detail: Some(format!("{qualifier}.{column}")),
+                            text_edit: Some(CompletionTextEdit::InsertAndReplace(
+                                InsertReplaceEdit {
+                                    new_text: column.clone(),
+                                    insert: replace_range,
+                                    replace: replace_range,
+                                },
+                            )),
+                            filter_text: Some(matched_prefix(column)),
+                            sort_text: Some(completion_priority::score_to_sort_text(score, column)),
+                            ..Default::default()
+                        });
+                    }
+                    items.sort_by(|a, b| a.sort_text.cmp(&b.sort_text));
+                    items.truncate(50);
+                    return Ok(CompletionResponse::Array(items));
+                }
+
+                if sql_dot_completion_target(&schema, &resolved_table)
+                    == SqlDotCompletionTarget::Tables
+                {
+                    for (table, doc) in &schema.tables {
+                        if matches_filter(table) {
+                            let score = completion_priority::calculate_score_with_match(
+                                &SqlContext::TableName,
+                                Some(CompletionItemKind::STRUCT),
+                                match_boost(table),
+                            );
+                            items.push(CompletionItem {
+                                label: table.clone(),
+                                kind: Some(CompletionItemKind::STRUCT),
+                                detail: Some("Table".to_string()),
+                                text_edit: Some(CompletionTextEdit::InsertAndReplace(
+                                    InsertReplaceEdit {
+                                        new_text: table.clone(),
+                                        insert: replace_range,
+                                        replace: replace_range,
+                                    },
+                                )),
+                                filter_text: Some(matched_prefix(table)),
+                                documentation: Some(lsp_types::Documentation::String(doc.clone())),
+                                sort_text: Some(completion_priority::score_to_sort_text(
+                                    score, table,
+                                )),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    // 其他 database/schema 候选（接受后插入 `name.`）
+                    items.extend(qualifier_name_items(
+                        &schema,
+                        &SqlContext::TableName,
+                        &current_word,
+                        replace_range,
+                    ));
+                    items.sort_by(|a, b| {
+                        a.sort_text
+                            .as_ref()
+                            .unwrap_or(&a.label)
+                            .cmp(b.sort_text.as_ref().unwrap_or(&b.label))
+                    });
+                    items.truncate(50);
+                    return Ok(CompletionResponse::Array(items));
+                }
+
+                // 外部 database/schema 前缀（q.）→ 该库/schema 的表列表
+                // 元数据未加载时返回空列表，视图层懒加载完成后会刷新补全。
+                if let SqlDotCompletionTarget::ForeignTables(name) =
+                    sql_dot_completion_target_for_chain(&schema, &chain)
+                {
+                    let items = find_foreign_schema(&schema, &name)
+                        .map(|foreign| {
+                            foreign_table_items(
+                                foreign,
+                                &SqlContext::TableName,
+                                &current_word,
+                                replace_range,
+                            )
+                        })
+                        .unwrap_or_default();
+                    return Ok(CompletionResponse::Array(items));
+                }
 
                 // 处理子查询别名：显示提示信息
                 if resolved_table == "#subquery" {
@@ -548,15 +1470,12 @@ impl CompletionProvider for DefaultSqlCompletionProvider {
 
                 // Try to find columns for the resolved table
                 // First try exact match, then case-insensitive match
-                let columns = schema.columns_by_table.get(&resolved_table).or_else(|| {
-                    // Case-insensitive lookup
-                    let lower = resolved_table.to_lowercase();
-                    schema
-                        .columns_by_table
-                        .iter()
-                        .find(|(k, _)| k.to_lowercase() == lower)
-                        .map(|(_, v)| v)
-                });
+                let resolved_table = match sql_dot_completion_target(&schema, &resolved_table) {
+                    SqlDotCompletionTarget::Columns(table) => table,
+                    _ => return Ok(CompletionResponse::Array(items)),
+                };
+                // 当前库查不到时回退外部 qualifier 缓存（FROM db.tbl 只解析出裸表名）
+                let columns = find_columns_with_foreign(&schema, &resolved_table);
 
                 if let Some(cols) = columns {
                     for (column, data_type, doc) in cols {
@@ -682,6 +1601,24 @@ impl CompletionProvider for DefaultSqlCompletionProvider {
                         });
                     }
                 }
+                // 其他 database/schema 候选（接受后插入 `name.`）
+                items.extend(qualifier_name_items(
+                    &schema,
+                    &context,
+                    &current_word,
+                    replace_range,
+                ));
+            }
+
+            // 限定引用在列位置同样合法（SELECT test2.tbl. / WHERE test2.tbl.col = ...），
+            // 因此列上下文也要提供其他 database/schema 候选。
+            if show_columns {
+                items.extend(qualifier_name_items(
+                    &schema,
+                    &context,
+                    &current_word,
+                    replace_range,
+                ));
             }
 
             // Columns - priority based on context (Requirements 5.3, 5.4)
@@ -697,23 +1634,8 @@ impl CompletionProvider for DefaultSqlCompletionProvider {
                 );
 
                 if use_table_columns {
-                    // 检查当前语句是否有 FROM 子句
-                    // 需要检查整个语句（包括光标后的部分），这样在 SELECT 列表中编辑时也能正确补全
-                    // 找到当前语句的开始位置（从光标往前找分号或文件开头）
-                    let statement_start = before_cursor.rfind(';').map(|p| p + 1).unwrap_or(0);
-
-                    // 找到当前语句的结束位置（从光标往后找分号或文件结尾）
-                    let after_cursor = &text[offset..];
-                    let statement_end = after_cursor
-                        .find(';')
-                        .map(|p| offset + p)
-                        .unwrap_or(text.len());
-
-                    // 获取完整的当前语句
-                    let current_statement = &text[statement_start..statement_end];
-
-                    // 如果当前语句没有 FROM，不显示列
-                    let has_from = current_statement.to_uppercase().contains(" FROM ");
+                    // 检查完整当前语句（包括光标后的部分），并忽略字符串/注释中的 FROM。
+                    let has_from = current_statement_has_from_keyword(&text, &tokens, offset);
 
                     if !has_from {
                         // 当前语句没有 FROM，跳过列显示
@@ -1189,8 +2111,10 @@ impl CompletionProvider for DefaultSqlCompletionProvider {
         cx: &mut Context<InputState>,
     ) -> Task<Result<InlineCompletionResponse>> {
         let rope = rope.clone();
-        let schema = self.schema.clone();
-        let db_info = self.db_completion_info.clone();
+        let SqlCompletionSources {
+            schema,
+            db_completion_info: db_info,
+        } = self.sources();
 
         cx.background_spawn(async move {
             let text = rope.to_string();
@@ -1220,6 +2144,19 @@ impl CompletionProvider for DefaultSqlCompletionProvider {
     ) -> bool {
         self.is_completion_trigger_check(new_text)
     }
+}
+
+fn find_schema_columns<'a>(
+    schema: &'a SqlSchema,
+    table: &str,
+) -> Option<&'a Vec<(String, String, String)>> {
+    schema.columns_by_table.get(table).or_else(|| {
+        schema
+            .columns_by_table
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(table))
+            .map(|(_, columns)| columns)
+    })
 }
 
 impl DefaultSqlCompletionProvider {
@@ -1393,9 +2330,97 @@ impl CompletionProvider for TableMentionCompletionProvider {
     }
 }
 
+/// Result of one full-document diagnostics analysis.
+pub struct SqlDiagnosticSnapshot {
+    /// Document revision the analysis ran against. Consumers drop the result
+    /// when the current revision has moved on (spec §12.6 stale guard).
+    pub document_revision: u64,
+    /// Input-layer diagnostics ready for the squiggle renderer.
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Convert a `SqlSchema` snapshot into the metadata view used by the
+/// conservative semantic checker. Identifiers are normalized to uppercase by
+/// the builder; an empty `SqlSchema::default()` yields `has_metadata() ==
+/// false` so the checker stays silent until real metadata is loaded.
+fn schema_to_metadata_view(schema: &SqlSchema) -> SqlMetadataView {
+    let mut view = SqlMetadataView::default();
+    let tables: Vec<String> = schema.tables.iter().map(|(name, _)| name.clone()).collect();
+    view = view.with_tables(tables);
+    for (table, columns) in &schema.columns_by_table {
+        let names: Vec<String> = columns.iter().map(|(name, _, _)| name.clone()).collect();
+        view = view.with_columns(table, names);
+    }
+    if let Some(schema_name) = &schema.current_schema {
+        view = view.with_current_schema(schema_name);
+    }
+    if let Some(database) = &schema.current_database {
+        view = view.with_current_database(database);
+    }
+    view
+}
+
+/// Convert a `SqlDiagnostic` (UTF-8 byte range) into the input-layer
+/// `Diagnostic` (line/character positions) used by the squiggle renderer.
+fn sql_diagnostic_to_input(diag: &SqlDiagnostic, rope: &Rope) -> Diagnostic {
+    let start = rope.offset_to_position(diag.range.start_byte);
+    let end = rope.offset_to_position(diag.range.end_byte);
+    Diagnostic {
+        range: start..end,
+        severity: match diag.severity {
+            SqlDiagnosticSeverity::Error => DiagnosticSeverity::Error,
+            SqlDiagnosticSeverity::Warning => DiagnosticSeverity::Warning,
+            SqlDiagnosticSeverity::Information => DiagnosticSeverity::Info,
+            SqlDiagnosticSeverity::Hint => DiagnosticSeverity::Hint,
+        },
+        code: diag.code.as_deref().map(gpui::SharedString::from),
+        code_description: None,
+        source: Some("sql".into()),
+        message: diag.message.to_string().into(),
+        related_information: None,
+        tags: None,
+        data: None,
+    }
+}
+
+/// Pure full-document diagnostics analysis. The schema is an `Arc` snapshot,
+/// so callers capture the document text (one String copy) and a cheap shared
+/// schema handle on the UI thread, then hand all three to a background worker.
+fn analyze_diagnostics_pure(
+    text: String,
+    dialect: SqlDialect,
+    schema: Arc<SqlSchema>,
+    document_revision: u64,
+) -> SqlDiagnosticSnapshot {
+    let mut next_id = 0u64;
+    let snapshot = SqlStatementSnapshot::new(text, dialect);
+    let text = snapshot.text();
+    let mut sql_diags = analyze_parser_diagnostics(text, dialect, document_revision, &mut next_id);
+    let metadata = schema_to_metadata_view(&schema);
+    sql_diags.extend(analyze_semantic_diagnostics(
+        text,
+        &snapshot,
+        &metadata,
+        document_revision,
+        &mut next_id,
+    ));
+    let rope = Rope::from_str(text);
+    let diagnostics = sql_diags
+        .iter()
+        .map(|diag| sql_diagnostic_to_input(diag, &rope))
+        .collect();
+    SqlDiagnosticSnapshot {
+        document_revision,
+        diagnostics,
+    }
+}
+
 /// A reusable SQL editor component built on top of `Input`.
 pub struct SqlEditor {
     editor: Entity<InputState>,
+    default_completion_provider: Rc<DefaultSqlCompletionProvider>,
+    default_hover_provider: Option<Rc<DefaultSqlHoverProvider>>,
+    default_signature_help_provider: Option<Rc<DefaultSqlSignatureHelpProvider>>,
     _subscriptions: Vec<Subscription>,
     font_cache: Option<SqlEditorFontCache>,
 }
@@ -1407,6 +2432,17 @@ struct SqlEditorFontCache {
 
 impl SqlEditor {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let default_completion_provider =
+            Rc::new(DefaultSqlCompletionProvider::new(SqlSchema::default()));
+        let default_provider_trait: Rc<dyn CompletionProvider> =
+            default_completion_provider.clone();
+        let default_hover_provider = Rc::new(DefaultSqlHoverProvider::new(SqlSchema::default()));
+        let default_hover_provider_trait: Rc<dyn HoverProvider> = default_hover_provider.clone();
+        let default_signature_help_provider =
+            Rc::new(DefaultSqlSignatureHelpProvider::new(SqlSchema::default()));
+        let default_signature_help_provider_trait: Rc<dyn SignatureHelpProvider> =
+            default_signature_help_provider.clone();
+
         let editor = cx.new(|cx| {
             let mut editor = InputState::new(window, cx)
                 .code_editor("sql")
@@ -1420,10 +2456,10 @@ impl SqlEditor {
                 .soft_wrap(false)
                 .placeholder(t!("Query.editor_placeholder").to_string());
 
-            // Defaults: completion + hover + actions
-            let default_schema = SqlSchema::default();
-            editor.lsp.completion_provider =
-                Some(Rc::new(DefaultSqlCompletionProvider::new(default_schema)));
+            // Defaults: completion + hover + signature help + actions
+            editor.lsp.completion_provider = Some(default_provider_trait);
+            editor.lsp.hover_provider = Some(default_hover_provider_trait);
+            editor.lsp.signature_help_provider = Some(default_signature_help_provider_trait);
 
             editor
         });
@@ -1434,9 +2470,11 @@ impl SqlEditor {
                     cx.notify()
                 }),
             ];
-
         Self {
             editor,
+            default_completion_provider,
+            default_hover_provider: Some(default_hover_provider),
+            default_signature_help_provider: Some(default_signature_help_provider),
             _subscriptions,
             font_cache: None,
         }
@@ -1466,16 +2504,27 @@ impl SqlEditor {
         schema: SqlSchema,
         cx: &mut Context<Self>,
     ) {
-        let completion_provider =
-            DefaultSqlCompletionProvider::new(schema).with_db_completion_info(info.clone());
-        self.editor.update(cx, |state, _| {
-            state.lsp.completion_provider = Some(Rc::new(completion_provider));
-        });
+        self.update_default_completion_sources(schema, info, cx);
     }
 
     /// Access underlying editor state.
     pub fn input(&self) -> Entity<InputState> {
         self.editor.clone()
+    }
+
+    /// Invalidate active completion popup and inline completion requests.
+    pub fn invalidate_completions(&self, cx: &mut Context<Self>) {
+        self.editor
+            .update(cx, |state, cx| state.invalidate_completions(cx));
+    }
+
+    /// Invalidate metadata-dependent completion and hover state.
+    pub fn invalidate_metadata_context(&self, cx: &mut Context<Self>) {
+        self.editor.update(cx, |state, cx| {
+            state.invalidate_completions(cx);
+            state.invalidate_hover(cx);
+            state.close_signature_help(cx);
+        });
     }
 
     /// 设置编辑器右键菜单的扩展项（支持一级和二级菜单）。
@@ -1496,16 +2545,63 @@ impl SqlEditor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.editor.update(cx, |state, _| {
-            state.lsp.completion_provider = Some(provider)
+        self.editor.update(cx, |state, cx| {
+            state.invalidate_completions(cx);
+            state.lsp.completion_provider = Some(provider);
         });
     }
 
     /// Set schema for default completion provider.
     pub fn set_schema(&mut self, schema: SqlSchema, _window: &mut Window, cx: &mut Context<Self>) {
+        self.update_default_completion_sources(schema, SqlCompletionInfo::default(), cx);
+    }
+
+    /// Update the default provider's metadata without replacing its trait object.
+    ///
+    /// A custom provider remains untouched because metadata refreshes must not
+    /// override an explicitly installed provider.
+    fn update_default_completion_sources(
+        &self,
+        schema: SqlSchema,
+        info: SqlCompletionInfo,
+        cx: &mut Context<Self>,
+    ) {
+        // Provider objects are intentionally kept alive across metadata
+        // refreshes, so explicitly invalidate requests that captured their old
+        // source snapshot before replacing it.
+        self.invalidate_metadata_context(cx);
+        self.update_default_hover_sources(schema.clone(), cx);
+        self.update_default_signature_sources(schema.clone(), cx);
+        let default_provider = self.default_completion_provider.clone();
+        let default_provider_trait: Rc<dyn CompletionProvider> = default_provider.clone();
         self.editor.update(cx, |state, _| {
-            state.lsp.completion_provider =
-                Some(Rc::new(DefaultSqlCompletionProvider::new(schema)));
+            let is_default_provider_installed = state
+                .lsp
+                .completion_provider
+                .as_ref()
+                .is_some_and(|provider| Rc::ptr_eq(provider, &default_provider_trait));
+            if is_default_provider_installed {
+                default_provider.set_sources(schema, info);
+            }
+        });
+    }
+
+    /// Update the default hover provider's metadata without replacing its trait
+    /// object. A custom provider remains untouched (spec §25.1).
+    fn update_default_hover_sources(&self, schema: SqlSchema, cx: &mut Context<Self>) {
+        let Some(default_hover_provider) = self.default_hover_provider.clone() else {
+            return;
+        };
+        let default_hover_provider_trait: Rc<dyn HoverProvider> = default_hover_provider.clone();
+        self.editor.update(cx, |state, _| {
+            let is_default_provider_installed = state
+                .lsp
+                .hover_provider
+                .as_ref()
+                .is_some_and(|provider| Rc::ptr_eq(provider, &default_hover_provider_trait));
+            if is_default_provider_installed {
+                default_hover_provider.set_schema(schema);
+            }
         });
     }
 
@@ -1516,8 +2612,44 @@ impl SqlEditor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.editor
-            .update(cx, |state, _| state.lsp.hover_provider = Some(provider));
+        self.editor.update(cx, |state, cx| {
+            state.invalidate_hover(cx);
+            state.lsp.hover_provider = Some(provider);
+        });
+    }
+
+    /// Update the default signature help provider's schema without replacing
+    /// its trait object. A custom provider remains untouched (spec §25.1).
+    fn update_default_signature_sources(&self, schema: SqlSchema, cx: &mut Context<Self>) {
+        let Some(default_signature_provider) = self.default_signature_help_provider.clone() else {
+            return;
+        };
+        let default_signature_provider_trait: Rc<dyn SignatureHelpProvider> =
+            default_signature_provider.clone();
+        self.editor.update(cx, |state, cx| {
+            let is_default_provider_installed = state
+                .lsp
+                .signature_help_provider
+                .as_ref()
+                .is_some_and(|provider| Rc::ptr_eq(provider, &default_signature_provider_trait));
+            if is_default_provider_installed {
+                default_signature_provider.set_schema(schema);
+                state.close_signature_help(cx);
+            }
+        });
+    }
+
+    /// Replace signature help provider.
+    pub fn set_signature_help_provider(
+        &mut self,
+        provider: Rc<dyn SignatureHelpProvider>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor.update(cx, |state, cx| {
+            state.close_signature_help(cx);
+            state.lsp.signature_help_provider = Some(provider);
+        });
     }
 
     /// Add a custom code action provider.
@@ -1581,6 +2713,52 @@ impl SqlEditor {
         self.editor.read(cx).text().to_string()
     }
 
+    /// Get the current schema metadata snapshot as a cheap shared `Arc`.
+    ///
+    /// This is the same source consumed by the default completion/hover
+    /// providers, so diagnostics, completion and hover always agree on scope.
+    /// Callers that only need to read schema metadata (e.g. to hand a snapshot
+    /// to a background task) never pay for a deep copy here.
+    pub fn current_schema(&self) -> Arc<SqlSchema> {
+        self.default_completion_provider.sources().schema
+    }
+
+    /// Run the full parser + semantic diagnostics analysis for the current
+    /// editor content against the current schema snapshot.
+    ///
+    /// The returned snapshot carries the document revision it was computed
+    /// against; the caller drops it if the document has moved on
+    /// (spec §12.6). Viewport-incremental analysis is a future optimization —
+    /// the squiggle layer already clips rendering to the visible range.
+    pub fn analyze_diagnostics(&self, cx: &App, dialect: SqlDialect) -> SqlDiagnosticSnapshot {
+        let input = self.editor.read(cx);
+        let text = input.text().to_string();
+        let document_revision = input.document_revision();
+        let schema = self.current_schema();
+        analyze_diagnostics_pure(text, dialect, schema, document_revision)
+    }
+
+    /// Run the full parser + semantic diagnostics analysis without blocking the
+    /// UI thread.
+    ///
+    /// The document text, revision and schema snapshot are captured on the UI
+    /// thread, then the tokenizer/semantic passes run on a background worker.
+    /// Like the synchronous variant, the caller drops the returned snapshot if
+    /// the document revision has moved on before it lands (spec §12.6).
+    pub fn analyze_diagnostics_async(
+        &self,
+        cx: &App,
+        dialect: SqlDialect,
+    ) -> Task<SqlDiagnosticSnapshot> {
+        let input = self.editor.read(cx);
+        let text = input.text().to_string();
+        let document_revision = input.document_revision();
+        let schema = self.current_schema();
+        cx.background_spawn(async move {
+            analyze_diagnostics_pure(text, dialect, schema, document_revision)
+        })
+    }
+
     /// Get the currently selected text.
     /// Returns an empty string if no text is selected.
     pub fn get_selected_text(&self, cx: &App) -> String {
@@ -1613,8 +2791,19 @@ impl Render for SqlEditor {
 
 #[cfg(test)]
 mod tests {
-    use super::{SqlContext, completion_priority, identifier_match_rank};
+    use super::{
+        SqlContext, SqlSchema, analyze_diagnostics_pure, completion_priority,
+        identifier_match_rank, schema_to_metadata_view, sql_diagnostic_to_input,
+    };
+    use db::sql_editor::diagnostics::{
+        SqlDiagnosticSeverity, analyze_parser_diagnostics, analyze_semantic_diagnostics,
+    };
+    use db::sql_editor::statement_ranges::{SqlDialect, SqlStatementSnapshot};
+    use gpui_component::highlighter::DiagnosticSeverity;
+    use gpui_component::{Rope, RopeExt};
     use lsp_types::CompletionItemKind;
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[test]
     fn identifier_match_rank_prefers_prefix_then_boundary_then_substring() {
@@ -1697,5 +2886,175 @@ mod tests {
         assert!(!render.contains("cx.text_system().all_font_names()"));
         assert!(render.contains("AppSettings::global(cx).sql_editor_font_size"));
         assert!(render.contains(".text_size(gpui::px(font_size))"));
+    }
+
+    #[test]
+    fn empty_schema_has_no_metadata() {
+        let view = schema_to_metadata_view(&SqlSchema::default());
+        assert!(!view.has_metadata());
+        assert!(view.tables.is_empty());
+    }
+
+    #[test]
+    fn schema_to_metadata_view_maps_tables_columns_and_scope() {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "Users".to_string(),
+            vec![("id".to_string(), "int".to_string(), String::new())],
+        );
+        let schema = SqlSchema {
+            tables: vec![("Users".to_string(), String::new())],
+            columns_by_table: columns,
+            current_database: Some("app".to_string()),
+            current_schema: Some("public".to_string()),
+            ..Default::default()
+        };
+        let view = schema_to_metadata_view(&schema);
+        assert!(view.has_metadata());
+        assert!(view.table_exists("users"));
+        assert!(view.table_exists("USERS"));
+        assert_eq!(view.column_status("users", "id"), Some(true));
+        assert_eq!(view.column_status("users", "missing"), Some(false));
+        assert!(view.is_schema_or_db("public"));
+        assert!(view.is_schema_or_db("app"));
+    }
+
+    #[test]
+    fn parser_diagnostic_converts_to_input_severity_and_source() {
+        let text = "SELECT 'oops FROM users";
+        let mut next_id = 0;
+        let diags = analyze_parser_diagnostics(text, SqlDialect::Standard, 7, &mut next_id);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, SqlDiagnosticSeverity::Error);
+
+        let rope = Rope::from_str(text);
+        let input_diag = sql_diagnostic_to_input(&diags[0], &rope);
+        assert_eq!(input_diag.severity, DiagnosticSeverity::Error);
+        assert_eq!(input_diag.source.as_deref(), Some("sql"));
+        assert_eq!(input_diag.code.as_deref(), Some("parser.unclosed_string"));
+        assert!(input_diag.range.start <= input_diag.range.end);
+        // The range covers the unclosed literal token.
+        assert!(input_diag.range.start.character >= 7);
+    }
+
+    #[test]
+    fn diagnostic_byte_range_converts_for_multibyte_text() {
+        let text = "-- 中文注释\nSELECT * FROM missing;";
+        let mut next_id = 0;
+        let diags = analyze_semantic_diagnostics(
+            text,
+            &SqlStatementSnapshot::new(text.to_string(), SqlDialect::Standard),
+            &schema_to_metadata_view(&SqlSchema::default()),
+            1,
+            &mut next_id,
+        );
+        // No metadata -> semantic checker stays silent.
+        assert!(diags.is_empty());
+
+        let parser_diag_text = "SELECT '未闭合";
+        let mut parser_next_id = 0;
+        let parser_diags = analyze_parser_diagnostics(
+            parser_diag_text,
+            SqlDialect::Standard,
+            1,
+            &mut parser_next_id,
+        );
+        assert_eq!(parser_diags.len(), 1);
+        let rope = Rope::from_str(parser_diag_text);
+        let input_diag = sql_diagnostic_to_input(&parser_diags[0], &rope);
+        assert_eq!(
+            input_diag.range,
+            rope.offset_to_position(parser_diags[0].range.start_byte)
+                ..rope.offset_to_position(parser_diags[0].range.end_byte)
+        );
+    }
+
+    #[test]
+    fn diagnostics_pipeline_flags_unknown_table_with_real_schema() {
+        let text = "SELECT * FROM missing_table;\nSELECT COUNT(*) FROM users;";
+        let dialect = SqlDialect::Standard;
+        let snapshot = SqlStatementSnapshot::new(text.to_string(), dialect);
+
+        let mut columns = HashMap::new();
+        columns.insert(
+            "Users".to_string(),
+            vec![("id".to_string(), "int".to_string(), String::new())],
+        );
+        let schema = SqlSchema {
+            tables: vec![("Users".to_string(), String::new())],
+            columns_by_table: columns,
+            ..Default::default()
+        };
+        let metadata = schema_to_metadata_view(&schema);
+
+        let mut next_id = 0;
+        let mut diags = analyze_parser_diagnostics(text, dialect, 0, &mut next_id);
+        diags.extend(analyze_semantic_diagnostics(
+            text,
+            &snapshot,
+            &metadata,
+            0,
+            &mut next_id,
+        ));
+        let rope = Rope::from_str(text);
+        let input_diags: Vec<_> = diags
+            .iter()
+            .map(|d| sql_diagnostic_to_input(d, &rope))
+            .collect();
+
+        assert_eq!(input_diags.len(), 1);
+        let start_byte = text.find("missing_table").expect("token present");
+        let rope = Rope::from_str(text);
+        assert_eq!(
+            input_diags[0].range.start,
+            rope.offset_to_position(start_byte)
+        );
+    }
+
+    #[test]
+    fn analyze_diagnostics_pure_runs_parser_and_semantic_pass_off_thread() {
+        // `analyze_diagnostics_pure` is the computation the background worker
+        // runs; the cached `Arc` schema and the document revision must flow
+        // through unchanged.
+        let text = "SELECT * FROM missing_table;\nSELECT 'oops";
+        let dialect = SqlDialect::Standard;
+        let mut columns = HashMap::new();
+        columns.insert(
+            "Users".to_string(),
+            vec![("id".to_string(), "int".to_string(), String::new())],
+        );
+        let schema = Arc::new(SqlSchema {
+            tables: vec![("Users".to_string(), String::new())],
+            columns_by_table: columns,
+            ..Default::default()
+        });
+
+        let snapshot = analyze_diagnostics_pure(text.to_string(), dialect, schema, 42);
+        assert_eq!(snapshot.document_revision, 42);
+
+        let codes: Vec<&str> = snapshot
+            .diagnostics
+            .iter()
+            .map(|diag| diag.code.as_deref().unwrap_or(""))
+            .collect();
+        // Unclosed string literal raises a parser diagnostic, and the dangling
+        // `missing_table` reference raises a semantic one against the schema.
+        assert!(
+            codes.iter().any(|code| *code == "parser.unclosed_string"),
+            "missing parser diagnostic: {codes:?}"
+        );
+        assert!(
+            codes.iter().any(|code| code == &"semantic.unknown_table"),
+            "missing semantic diagnostic: {codes:?}"
+        );
+
+        let clean = analyze_diagnostics_pure(
+            "SELECT 1;".to_string(),
+            dialect,
+            Arc::new(SqlSchema::default()),
+            7,
+        );
+        assert_eq!(clean.document_revision, 7);
+        assert!(clean.diagnostics.is_empty());
     }
 }

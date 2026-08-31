@@ -4,13 +4,29 @@
 
 ## 擴充類型
 
-資料庫驅動增加連線類型；ACP Agent 接入外部 Agent；匯入擴充讀取其他應用程式；遠端桌面擴充提供 RDP/VNC；語言擴充加入介面語系。
+資料庫驅動增加連線類型；ACP Agent 接入外部 Agent；匯入擴充讀取其他應用程式；遠端桌面擴充提供 RDP/VNC；語言擴充加入介面語系。市場頁提供「有更新」篩選，可只看有可更新版本的擴充。
 
 相容清單中的產品名稱不代表驅動已安裝，建立連線前先檢查市場項目、平台和 Navop 版本。
+
+## 官方擴充倉庫
+
+第一方擴充在 [navop-extensions](https://github.com/feigeCode/navop-extensions) 倉庫獨立建置與發佈，市場中的官方擴充均來自該倉庫。目前目錄依類型分組如下：
+
+- **資料庫驅動**：DuckDB、Redis、MongoDB（4.2+ / 3.6 / 3.2–3.4 三檔）、達夢 DM、金倉 KingbaseES、GBase 8s、OceanBase、openGauss、Apache IoTDB、神通 Oscar，以及免 Oracle Instant Client 的純 Go Oracle 驅動。
+- **遠端桌面 Provider**：RDP、VNC。
+- **ACP Agent**：Codex、Claude Code、OpenCode。
+- **連線匯入**：SecureCRT、Xshell、WindTerm、OpenSSH config、Navicat、DBeaver、JetBrains DataGrip、MongoDB Compass、Redis Desktop、TablePlus。
+- **外部編輯器**：Zed、Notepad++、Notepad--。
+- **Notes 渲染與匯出**：Mermaid 圖、LaTeX 數學公式渲染，HTML / PDF / Word 匯出。
+- **語言套件**：基於 Tree-sitter 的多語系語法高亮擴充包。
+
+各擴充的平台支援、最低版本與方法契約以市場項目和倉庫文件為準；舊版 MongoDB 等面向 EOL 伺服器的驅動不承諾支援 SRV、TLS 等新特性。
 
 ## 安裝、更新與重新載入
 
 安裝前閱讀發佈者、說明、權限與版本資訊。完成後依提示重新載入擴充或重啟。Navop 會按擴充類型更新相關能力，並讓語言解析器維持按需載入，避免一般擴充變更觸發全部語言 WASM 編譯。更新驅動或 Provider 前先儲存工作，因連線行為可能變更。
+
+Navop 啟動後會在背景檢查擴充市場並與已安裝版本比對，發現新版本時彈出通知，可直接跳轉到擴充市場查看更新；同一批更新僅提醒一次。市場頁的「有更新」篩選可只顯示可更新擴充。
 
 異常時先停用再啟用或重新載入，接著檢查日誌和相容版本。正式任務進行中不要更新正在使用的驅動。
 

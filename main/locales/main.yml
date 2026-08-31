@@ -111,6 +111,22 @@ Home:
     en: New Connection
     zh-CN: 新建连接
     zh-HK: 新建連線
+  open:
+    en: Open
+    zh-CN: 打开
+    zh-HK: 開啟
+  open_in_new_tab:
+    en: Open in New Tab
+    zh-CN: 在新标签打开
+    zh-HK: 在新標籤開啟
+  remove_recent:
+    en: Remove from Recent
+    zh-CN: 移除最近记录
+    zh-HK: 移出最近記錄
+  recent_actions_tooltip:
+    en: Connection actions
+    zh-CN: 连接操作
+    zh-HK: 連線操作
   local_terminal:
     en: Terminal
     zh-CN: 终端
@@ -179,6 +195,10 @@ Home:
     en: Search applications...
     zh-CN: 搜索应用...
     zh-HK: 搜尋應用...
+  connection_filter:
+    en: Filter connections
+    zh-CN: 筛选连接
+    zh-HK: 篩選連線
   credential_vault:
     en: Keychain
     zh-CN: 钥匙串
@@ -212,6 +232,18 @@ Home:
       en: Workspace Tools
       zh-CN: 工作台工具
       zh-HK: 工作台工具
+    applications:
+      en: Applications
+      zh-CN: 应用
+      zh-HK: 應用
+    applications_description:
+      en: Workspaces, tools, and utilities
+      zh-CN: 工作区、工具与实用程序
+      zh-HK: 工作區、工具與實用程式
+    account:
+      en: Account
+      zh-CN: 账户
+      zh-HK: 帳戶
     status:
       en: Status
       zh-CN: 状态
@@ -225,9 +257,13 @@ Home:
       zh-CN: 打开连接后会显示在这里
       zh-HK: 開啟連線後會顯示在這裡
     sync_description:
-      en: Keep connection data synchronized
-      zh-CN: 保持连接数据同步
-      zh-HK: 保持連線資料同步
+      en: Connection data is synchronized
+      zh-CN: 连接数据已同步
+      zh-HK: 連線資料已同步
+    sync_description_syncing:
+      en: Syncing connection data
+      zh-CN: 正在同步连接数据
+      zh-HK: 正在同步連線資料
     key_description_unlocked:
       en: Personal key is ready
       zh-CN: 个人密钥已就绪
@@ -244,6 +280,10 @@ Home:
       en: Import saved connections from supported applications
       zh-CN: 从受支持的应用导入已有连接
       zh-HK: 從支援的應用程式匯入現有連線
+    account_login_description:
+      en: Sign in to sync connections, keys, and settings across devices
+      zh-CN: 登录后可跨设备同步连接、密钥与设置
+      zh-HK: 登入後可跨裝置同步連線、金鑰與設定
     notes_description:
       en: Keep commands, snippets, and operational notes together
       zh-CN: 集中记录命令、片段和运维笔记
@@ -797,6 +837,26 @@ SessionLogs:
     en: "Failed to export TXT: %{error}"
     zh-CN: "导出 TXT 失败：%{error}"
     zh-HK: "匯出 TXT 失敗：%{error}"
+  delete:
+    en: Delete
+    zh-CN: 删除
+    zh-HK: 刪除
+  delete_title:
+    en: Delete session log
+    zh-CN: 删除会话日志
+    zh-HK: 刪除工作階段日誌
+  delete_description:
+    en: "Delete %{name}? This cannot be undone."
+    zh-CN: "确定删除 %{name}？此操作无法撤销。"
+    zh-HK: "確定刪除 %{name}？此操作無法復原。"
+  delete_success:
+    en: Session log deleted.
+    zh-CN: 会话日志已删除。
+    zh-HK: 工作階段日誌已刪除。
+  delete_failed:
+    en: "Failed to delete session log: %{error}"
+    zh-CN: "删除会话日志失败：%{error}"
+    zh-HK: "刪除工作階段日誌失敗：%{error}"
   load_failed:
     en: "Failed to load session logs: %{error}"
     zh-CN: "加载会话日志失败：%{error}"
@@ -1503,9 +1563,9 @@ Connection:
     zh-CN: 批量操作
     zh-HK: 批量操作
   auto_hide_tree:
-    en: Auto-hide the tree after opening a session
-    zh-CN: 自动隐藏
-    zh-HK: 自動隱藏
+    en: "Floating sidebar: overlays the content and auto-hides after opening a connection. Turn off to keep it docked"
+    zh-CN: "浮动侧边栏：覆盖在主界面上，打开连接或点击主界面后自动收起；关闭则固定停靠在左侧"
+    zh-HK: "浮動側邊欄：覆蓋在主界面上，開啟連線或點擊主介面後自動收起；關閉則固定停靠在左側"
   batch_select_visible:
     en: Select or Deselect Visible Connections
     zh-CN: 选择或取消选择当前可见连接
@@ -2483,6 +2543,60 @@ Settings:
         zh-CN: 覆盖此扩展在当前设备上提供的可执行文件路径
         zh-HK: 覆蓋此擴充套件在目前裝置上提供的可執行檔路徑
 
+    SqlFormat:
+      group_title:
+        en: SQL Formatting
+        zh-CN: SQL 格式化
+        zh-HK: SQL 格式化
+      keyword_case:
+        en: Keyword Case
+        zh-CN: 关键字大小写
+        zh-HK: 關鍵字大小寫
+      keyword_case_desc:
+        en: Controls how SQL keywords are cased when formatting; "Preserve" keeps the text as written
+        zh-CN: 格式化时 SQL 关键字的大小写策略；“保持原样”不改变原文大小写
+        zh-HK: 格式化時 SQL 關鍵字的大小寫策略；“保持原樣”不改變原文大小寫
+      keyword_case_preserve:
+        en: Preserve as written
+        zh-CN: 保持原样
+        zh-HK: 保持原樣
+      keyword_case_upper:
+        en: UPPERCASE
+        zh-CN: 全部大写
+        zh-HK: 全部大寫
+      keyword_case_lower:
+        en: lowercase
+        zh-CN: 全部小写
+        zh-HK: 全部小寫
+      indent:
+        en: Indentation
+        zh-CN: 缩进风格
+        zh-HK: 縮排風格
+      indent_desc:
+        en: Indentation used for formatted SQL
+        zh-CN: 格式化后 SQL 使用的缩进
+        zh-HK: 格式化後 SQL 使用的縮排
+      indent_two_spaces:
+        en: 2 spaces
+        zh-CN: 2 空格
+        zh-HK: 2 空格
+      indent_four_spaces:
+        en: 4 spaces
+        zh-CN: 4 空格
+        zh-HK: 4 空格
+      indent_tabs:
+        en: Tabs
+        zh-CN: Tab 缩进
+        zh-HK: Tab 縮排
+      preview:
+        en: Live Preview
+        zh-CN: 实时预览
+        zh-HK: 實時預覽
+      preview_desc:
+        en: Edit the sample SQL below; the result is formatted live with the current settings. ${...} / #{...} / {{...}} template fragments are preserved verbatim.
+        zh-CN: 编辑示例 SQL，下方按当前配置实时显示格式化结果；${...}、#{...}、{{...}} 模板片段会原样保留。
+        zh-HK: 編輯示例 SQL，下方按當前配置實時顯示格式化結果；${...}、#{...}、{{...}} 模板片段會原樣保留。
+
     # 数据库设置
     Database:
       group_title:
@@ -2722,6 +2836,14 @@ Settings:
         en: Allow
         zh-CN: 允许
         zh-HK: 允許
+      approval_timeout:
+        en: Approval Timeout (ms)
+        zh-CN: 确认等待时间（毫秒）
+        zh-HK: 確認等待時間（毫秒）
+      approval_timeout_desc:
+        en: How long the confirmation dialog waits before an unanswered tool call is rejected with approval_timeout. 0 waits indefinitely.
+        zh-CN: 确认框等待用户点击的最长时间，超时后未响应的工具调用将以 approval_timeout 错误拒绝。0 表示无限等待。
+        zh-HK: 確認框等待用戶點擊的最長時間，超時後未回應的工具調用會以 approval_timeout 錯誤拒絕。0 表示無限等待。
       acp_permission_env_override:
         en: "ACP tool permission is overridden by ONETCLI_PUBLIC_MCP_PERMISSION=%{mode}"
         zh-CN: "ACP 工具权限已被环境变量 ONETCLI_PUBLIC_MCP_PERMISSION=%{mode} 覆盖"
@@ -2927,28 +3049,6 @@ Settings:
         en: Enter a directory to write onetcli.log, or a full log file path. Leave empty to use the default config directory logs folder. Restart the app after changing this path.
         zh-CN: 可填写日志目录（文件名为 onetcli.log）或完整日志文件路径；留空时使用默认配置目录下的 logs 文件夹。修改后重启应用生效。
         zh-HK: 可填寫日誌目錄（文件名為 onetcli.log）或完整日誌文件路徑；留空時使用默認配置目錄下的 logs 文件夾。修改後重啟應用生效。
-
-    Update:
-      group_title:
-        en: Update
-        zh-CN: 更新
-        zh-HK: 更新
-      auto_update:
-        en: Auto Update Check
-        zh-CN: 自动检查更新
-        zh-HK: 自動檢查更新
-      auto_update_desc:
-        en: Automatically check for updates when the application starts
-        zh-CN: 应用启动时自动检查新版本
-        zh-HK: 應用啟動時自動檢查新版本
-      check_now:
-        en: Check for Updates
-        zh-CN: 检查更新
-        zh-HK: 檢查更新
-      check_now_desc:
-        en: Manually check
-        zh-CN: 立即手动检查
-        zh-HK: 立即手動檢查
 
     Proxy:
       group_title:
@@ -3746,6 +3846,27 @@ Settings:
       en: "Open Source"
       zh-CN: "开源地址"
       zh-HK: "開源地址"
+    Update:
+      group_title:
+        en: Update
+        zh-CN: 更新
+        zh-HK: 更新
+      auto_update:
+        en: Auto Update Check
+        zh-CN: 自动检查更新
+        zh-HK: 自動檢查更新
+      auto_update_desc:
+        en: Automatically check for updates when the application starts
+        zh-CN: 应用启动时自动检查新版本
+        zh-HK: 應用啟動時自動檢查新版本
+      check_now:
+        en: Check for Updates
+        zh-CN: 检查更新
+        zh-HK: 檢查更新
+      check_now_desc:
+        en: Manually check
+        zh-CN: 立即手动检查
+        zh-HK: 立即手動檢查
 
   # 账户设置
   Account:
@@ -4069,6 +4190,10 @@ LlmProviders:
     en: "Default model: %{model}"
     zh-CN: "默认模型: %{model}"
     zh-HK: "默認模型: %{model}"
+  default_model_auto:
+    en: "Default model: Auto (from cloud model list)"
+    zh-CN: "默认模型: 自动（跟随云端模型列表）"
+    zh-HK: "默認模型: 自動（跟隨雲端模型列表）"
   optional_models_count:
     en: "Optional models: %{count}"
     zh-CN: "可选模型: %{count} 个"

@@ -8,7 +8,6 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::dialog::DialogButtonProps;
-use gpui_component::input::{Input, InputState};
 use gpui_component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_component::notification::Notification;
 use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarShow};
@@ -57,6 +56,7 @@ use crate::history_prompt::{HistoryPromptAccept, HistoryPromptMode, HistoryPromp
 use crate::host_key_dialog::{host_key_dialog_presentation, render_host_key_details_card};
 use crate::public_mcp::TerminalPublicMcpRegistration;
 use crate::quick_command_sync::{QuickCommandSyncEvent, QuickCommandSyncNotifier};
+use crate::selection_highlight_addon::SelectionHighlightAddon;
 use crate::settings::{
     GlobalTerminalLocalSettings, TerminalHighlightRule, TerminalSettings, TerminalSettingsEvent,
     current_settings, update_settings,
@@ -93,17 +93,18 @@ use mouse_input::{
     should_scroll_to_bottom_on_user_input, should_start_selection_from_pending_sgr_press,
     take_whole_scroll_lines, terminal_selection_autoscroll_delta_rows,
 };
+use one_core::background_tasks::BackgroundTaskId;
 use one_core::layout::{SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, TOOLBAR_WIDTH};
 use one_core::sidebar_contribution::{SidebarContribution, SidebarPlacement};
 use one_core::storage::models::{ActiveConnections, StoredConnection};
 use one_core::storage::{ConnectionRepository, GlobalStorageState, traits::Repository};
 use one_core::tab_container::{TabContent, TabContentEvent, TabContentView};
 use one_ui::resize_handle::{HandlePlacement, ResizePanel, resize_handle};
+#[cfg(test)]
+use paste_safety::has_unterminated_shell_quote;
 use paste_safety::{
     UnbracketedPasteHazard, detect_unbracketed_paste_hazard, multiline_non_empty_line_count,
 };
-#[cfg(test)]
-use paste_safety::has_unterminated_shell_quote;
 use remote_image_preview::image_from_local_path;
 use rust_i18n::t;
 use sftp::{RusshSftpClient, SftpClient};
@@ -114,23 +115,24 @@ use terminal::LocalConfig;
 use terminal::selection_text_from_term;
 use terminal::terminal::{
     ConnectionState, HostKeyVerificationDecision, SshConnectionUpdate, Terminal,
-    TerminalConnectionKind, TerminalModelEvent, TerminalScrollProxy, TerminalScrollSnapshot,
-    TerminalSshCredentialRequest, TerminalSshCredentials, TerminalTelnetCredentialRequest,
-    TerminalTelnetCredentials, resolve_local_working_dir,
+    TerminalConnectionKind, TerminalMfaPrompt, TerminalMfaRequest, TerminalModelEvent,
+    TerminalScrollProxy, TerminalScrollSnapshot, TerminalSshCredentials, TerminalTelnetCredentials,
+    resolve_local_working_dir,
 };
 use tokio::sync::Mutex;
 use workspace_explorer::{WorkspaceEditor, WorkspaceEditorEvent};
 
 mod actions;
 mod appearance;
+mod background_tasks;
 mod clipboard;
 mod clipboard_image;
 mod close;
 mod command_bar;
 mod command_bar_events;
 mod command_bar_model;
-mod connection_overlay;
 mod constructors;
+mod credential_capture;
 mod helpers;
 mod history_actions;
 mod history_query;
@@ -292,12 +294,12 @@ pub struct TerminalView {
     cd_completion_cache: CdCompletionCache,
     /// 当前正在加载目录候选的父目录
     cd_completion_loading_parent: Option<String>,
-    credential_inputs: Option<TerminalCredentialInputs>,
-    ssh_mfa_inputs: Vec<SshMfaInput>,
+    credential_capture: Option<credential_capture::CredentialCapture>,
     /// 当前已打开系统选择器的 ZMODEM 请求 ID，用于去重和拒绝过期结果。
     zmodem_picker_request_id: Option<u64>,
+    /// 已桥接到全局后台任务面板、尚未收到终态的 ZMODEM 传输任务。
+    zmodem_background_tasks: HashMap<terminal::zmodem::ZmodemTransferId, BackgroundTaskId>,
     focus_terminal_after_connect: bool,
-    reconnect_success_pending: bool,
 
     current_theme: TerminalTheme,
 

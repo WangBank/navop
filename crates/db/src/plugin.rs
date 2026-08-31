@@ -1,4 +1,5 @@
 use crate::QueryResult;
+use crate::SqlFormatOptions;
 use crate::connection::{DbConnection, DbError};
 use crate::executor::{SqlResult, SqlSource, StatementType};
 use crate::import_export::{
@@ -402,7 +403,12 @@ pub trait DatabasePlugin: Send + Sync {
 
     /// Format SQL for display (each database can customize this)
     fn format_sql(&self, sql: &str) -> String {
-        crate::format_sql(sql)
+        self.format_sql_with_options(sql, SqlFormatOptions::default())
+    }
+
+    /// Format SQL with user-configurable options (each database can customize this)
+    fn format_sql_with_options(&self, sql: &str, options: SqlFormatOptions) -> String {
+        crate::format_sql_with_options(sql, options)
     }
 
     /// Check if a SQL statement is a query (returns rows)
@@ -1078,7 +1084,7 @@ pub trait DatabasePlugin: Send + Sync {
         .with_parent_context(id)
         .with_metadata(metadata.clone());
         if table_count > 0 {
-            let children: Vec<DbNode> = tables
+            let mut children: Vec<DbNode> = tables
                 .into_iter()
                 .map(|table_info| {
                     let mut meta: HashMap<String, String> = metadata.clone();
@@ -1099,6 +1105,7 @@ pub trait DatabasePlugin: Send + Sync {
                     .with_metadata(meta)
                 })
                 .collect();
+            children.sort();
             table_folder.set_children(children)
         }
         nodes.push(table_folder);
@@ -1119,7 +1126,7 @@ pub trait DatabasePlugin: Send + Sync {
             .with_parent_context(id)
             .with_metadata(metadata.clone());
             if view_count > 0 {
-                let children: Vec<DbNode> = views
+                let mut children: Vec<DbNode> = views
                     .into_iter()
                     .map(|view| {
                         let mut meta: HashMap<String, String> = metadata.clone();
@@ -1142,6 +1149,7 @@ pub trait DatabasePlugin: Send + Sync {
                         vnode
                     })
                     .collect();
+                children.sort();
                 views_folder.set_children(children);
             }
             nodes.push(views_folder);
@@ -1164,7 +1172,7 @@ pub trait DatabasePlugin: Send + Sync {
             .with_parent_context(id)
             .with_metadata(metadata.clone());
             if function_count > 0 {
-                let children: Vec<DbNode> = functions
+                let mut children: Vec<DbNode> = functions
                     .into_iter()
                     .map(|func| {
                         routine_node(
@@ -1178,6 +1186,7 @@ pub trait DatabasePlugin: Send + Sync {
                         )
                     })
                     .collect();
+                children.sort();
                 functions_folder.set_children(children);
             }
             nodes.push(functions_folder);
@@ -1200,7 +1209,7 @@ pub trait DatabasePlugin: Send + Sync {
             .with_parent_context(id)
             .with_metadata(metadata.clone());
             if procedure_count > 0 {
-                let children: Vec<DbNode> = procedures
+                let mut children: Vec<DbNode> = procedures
                     .into_iter()
                     .map(|procedure| {
                         routine_node(
@@ -1214,6 +1223,7 @@ pub trait DatabasePlugin: Send + Sync {
                         )
                     })
                     .collect();
+                children.sort();
                 procedures_folder.set_children(children);
             }
             nodes.push(procedures_folder);
@@ -1236,7 +1246,7 @@ pub trait DatabasePlugin: Send + Sync {
             .with_parent_context(id)
             .with_metadata(metadata.clone());
             if sequence_count > 0 {
-                let children: Vec<DbNode> = sequences
+                let mut children: Vec<DbNode> = sequences
                     .into_iter()
                     .map(|seq| {
                         let mut seq_meta: HashMap<String, String> = metadata.clone();
@@ -1263,6 +1273,7 @@ pub trait DatabasePlugin: Send + Sync {
                         .with_metadata(seq_meta)
                     })
                     .collect();
+                children.sort();
                 sequences_folder.set_children(children);
             }
             nodes.push(sequences_folder);
@@ -1363,7 +1374,7 @@ pub trait DatabasePlugin: Send + Sync {
         match node.node_type {
             DbNodeType::TablesFolder => {
                 let tables = self.list_tables(connection, database, schema).await?;
-                Ok(tables
+                let mut children: Vec<DbNode> = tables
                     .into_iter()
                     .map(|t| {
                         let mut meta = node.metadata.clone();
@@ -1382,14 +1393,16 @@ pub trait DatabasePlugin: Send + Sync {
                         .with_parent_context(id)
                         .with_metadata(meta)
                     })
-                    .collect())
+                    .collect();
+                children.sort();
+                Ok(children)
             }
             DbNodeType::ViewsFolder => {
                 if !self.capabilities().supports_views {
                     return Ok(Vec::new());
                 }
                 let views = self.list_views(connection, database, schema).await?;
-                Ok(views
+                let mut children: Vec<DbNode> = views
                     .into_iter()
                     .map(|v| {
                         let mut meta = node.metadata.clone();
@@ -1406,14 +1419,16 @@ pub trait DatabasePlugin: Send + Sync {
                         .with_parent_context(id)
                         .with_metadata(meta)
                     })
-                    .collect())
+                    .collect();
+                children.sort();
+                Ok(children)
             }
             DbNodeType::FunctionsFolder => {
                 let functions = self
                     .list_functions_in_schema(connection, database, schema.clone())
                     .await
                     .unwrap_or_default();
-                Ok(functions
+                let mut children: Vec<DbNode> = functions
                     .into_iter()
                     .map(|f| {
                         routine_node(
@@ -1426,14 +1441,16 @@ pub trait DatabasePlugin: Send + Sync {
                             &node.metadata,
                         )
                     })
-                    .collect())
+                    .collect();
+                children.sort();
+                Ok(children)
             }
             DbNodeType::ProceduresFolder => {
                 let procedures = self
                     .list_procedures_in_schema(connection, database, schema.clone())
                     .await
                     .unwrap_or_default();
-                Ok(procedures
+                let mut children: Vec<DbNode> = procedures
                     .into_iter()
                     .map(|p| {
                         routine_node(
@@ -1446,7 +1463,9 @@ pub trait DatabasePlugin: Send + Sync {
                             &node.metadata,
                         )
                     })
-                    .collect())
+                    .collect();
+                children.sort();
+                Ok(children)
             }
             DbNodeType::SequencesFolder => {
                 let sequences = self
@@ -1460,7 +1479,7 @@ pub trait DatabasePlugin: Send + Sync {
                         .collect(),
                     None => sequences,
                 };
-                Ok(filtered
+                let mut children: Vec<DbNode> = filtered
                     .into_iter()
                     .map(|seq| {
                         let mut meta = node.metadata.clone();
@@ -1486,7 +1505,9 @@ pub trait DatabasePlugin: Send + Sync {
                         .with_parent_context(id)
                         .with_metadata(meta)
                     })
-                    .collect())
+                    .collect();
+                children.sort();
+                Ok(children)
             }
             _ => Ok(Vec::new()),
         }
@@ -2611,24 +2632,7 @@ pub trait DatabasePlugin: Send + Sync {
         schema: Option<&str>,
         table: &str,
     ) -> Result<String> {
-        let columns = self
-            .list_columns(connection, database, schema.map(|s| s.to_string()), table)
-            .await?;
-        if columns.is_empty() {
-            return Ok(String::new());
-        }
-
-        let table_ref = self.format_export_table_reference(database, schema, table);
-        let mut sql = format!("CREATE TABLE {} (\n", table_ref);
-        for (i, col) in columns.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(",\n");
-            }
-            sql.push_str("    ");
-            sql.push_str(&self.build_column_definition(col, true));
-        }
-        sql.push_str("\n)");
-        Ok(sql)
+        default_export_table_create_sql(self, connection, database, schema, table).await
     }
 
     /// Export table data as INSERT statements
@@ -3121,6 +3125,84 @@ pub trait DatabasePlugin: Send + Sync {
         config: &ExportConfig,
         progress_tx: Option<ExportProgressSender>,
     ) -> Result<ExportResult>;
+}
+
+/// Default column-based CREATE TABLE export shared by the `DatabasePlugin`
+/// trait default. Driver overrides that need to opt back into the generic
+/// builder (e.g. when the driver's own structure export is unavailable) call
+/// this free function directly: a `Trait::method(self)` call from inside an
+/// override would dispatch back to the override instead of the default body.
+pub(crate) async fn default_export_table_create_sql<P>(
+    plugin: &P,
+    connection: &dyn DbConnection,
+    database: &str,
+    schema: Option<&str>,
+    table: &str,
+) -> Result<String>
+where
+    P: DatabasePlugin + ?Sized,
+{
+    let columns = plugin
+        .list_columns(connection, database, schema.map(|s| s.to_string()), table)
+        .await?;
+    if columns.is_empty() {
+        return Ok(String::new());
+    }
+
+    let table_ref = plugin.format_export_table_reference(database, schema, table);
+    let mut definitions = columns
+        .iter()
+        .map(|column| format!("    {}", plugin.build_column_definition(column, true)))
+        .collect::<Vec<_>>();
+    let primary_keys = columns
+        .iter()
+        .filter(|column| column.is_primary_key)
+        .map(|column| plugin.quote_identifier(&column.name))
+        .collect::<Vec<_>>();
+    if !primary_keys.is_empty() {
+        definitions.push(format!("    PRIMARY KEY ({})", primary_keys.join(", ")));
+    }
+
+    let mut sql = format!(
+        "CREATE TABLE {} (\n{}\n)",
+        table_ref,
+        definitions.join(",\n")
+    );
+
+    // Best-effort table comment: drivers that cannot list table metadata are
+    // still able to export the structure (columns + primary key + column comments).
+    let mut statements = Vec::new();
+    if let Ok(tables) = plugin
+        .list_tables(connection, database, schema.map(|s| s.to_string()))
+        .await
+    {
+        if let Some(comment) = tables
+            .iter()
+            .find(|info| info.name == table)
+            .and_then(|info| info.comment.clone())
+        {
+            statements.push(format!(
+                "COMMENT ON TABLE {} IS {}",
+                table_ref,
+                plugin.escape_sql_value(&comment)
+            ));
+        }
+    }
+    statements.extend(columns.iter().filter_map(|column| {
+        column.comment.as_ref().map(|comment| {
+            format!(
+                "COMMENT ON COLUMN {}.{} IS {}",
+                table_ref,
+                plugin.quote_identifier(&column.name),
+                plugin.escape_sql_value(comment)
+            )
+        })
+    }));
+    if !statements.is_empty() {
+        sql.push('\n');
+        sql.push_str(&statements.join(";\n"));
+    }
+    Ok(sql)
 }
 
 fn foreign_key_action_sql(action: &str) -> Option<String> {

@@ -737,7 +737,7 @@ fn status_badge_sync_emits_state_changed_only_on_transition() {
     let sync = function_region(
         source,
         "fn sync_connection_status_badge",
-        "fn sync_credential_inputs",
+        "fn emit_connection_status_notice",
     );
     assert!(sync.contains("self.last_connection_status = current"));
     assert_guard_precedes(
@@ -745,6 +745,64 @@ fn status_badge_sync_emits_state_changed_only_on_transition() {
         "if current == self.last_connection_status",
         "cx.emit(TabContentEvent::StateChanged)",
         "status badge sync must skip unchanged connection states",
+    );
+}
+
+#[test]
+fn credential_capture_consumed_keys_block_text_system_passthrough() {
+    let source = include_str!("../terminal_events.rs");
+    let handler = function_region(
+        source,
+        "pub(super) fn handle_credential_capture_key_event",
+        "pub(super) fn capture_append_text",
+    );
+
+    for (action, capability) in [
+        ("self.capture_append_text(key, cx)", "printable capture input"),
+        (
+            "self.handle_credential_capture_submit(window, cx)",
+            "capture submit",
+        ),
+        ("capture.backspace()", "capture backspace"),
+        ("self.handle_credential_capture_cancel(cx)", "capture cancel"),
+    ] {
+        assert!(
+            handler.contains(action),
+            "{capability} should remain handled by the capture state machine"
+        );
+    }
+
+    let block = handler
+        .find("if handled")
+        .expect("capture must gate blocking on whether the key was consumed");
+    let prevent = handler
+        .find("window.prevent_default()")
+        .expect("capture must prevent the platform default action");
+    let stop = handler
+        .find("cx.stop_propagation()")
+        .expect("capture must stop propagation");
+    assert!(
+        block < prevent && prevent < stop,
+        "consumed capture keys must block passthrough so the text system never appends a second copy"
+    );
+}
+
+#[test]
+fn credential_capture_prompt_does_not_lead_with_a_blank_line() {
+    let source = include_str!("../terminal_events.rs");
+    let prompt = function_region(
+        source,
+        "fn inject_capture_prompt",
+        "pub(super) fn handle_credential_capture_key_event",
+    );
+
+    assert!(
+        prompt.contains("let mut text = String::new()"),
+        "capture prompt must start without a leading line break"
+    );
+    assert!(
+        !prompt.contains("String::from(\"\\r\\n\")"),
+        "the prompt must not inject a leading blank line"
     );
 }
 

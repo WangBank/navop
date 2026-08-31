@@ -163,6 +163,12 @@ impl TerminalView {
                     settings.cursor_blink = enabled;
                 });
             }
+            TerminalSidebarEvent::SelectionHighlightChanged(enabled) => {
+                let enabled = *enabled;
+                let _ = update_settings(cx, move |settings| {
+                    settings.selection_highlight = enabled;
+                });
+            }
             TerminalSidebarEvent::ConfirmMultilinePasteChanged(enabled) => {
                 let enabled = *enabled;
                 let _ = update_settings(cx, move |settings| {
@@ -213,6 +219,9 @@ impl TerminalView {
                 let _ = update_settings(cx, move |settings| {
                     settings.custom_highlights = rules;
                 });
+            }
+            TerminalSidebarEvent::OpenSftp(connection) => {
+                cx.emit(TerminalPaneEvent::OpenSftp(connection.clone()));
             }
             TerminalSidebarEvent::CdToTerminal(path) => {
                 // 向终端发送 cd 命令并回车

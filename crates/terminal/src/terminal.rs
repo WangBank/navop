@@ -73,12 +73,16 @@ use crate::ssh_backend::SshBackendConnect;
 use crate::windows_environment::{
     environment_value, merge_environment_overrides, refreshed_windows_environment,
 };
-use crate::zmodem::{ZmodemPickerRequest, ZmodemPickerResponse, ZmodemResponder};
+use crate::zmodem::{
+    ZmodemPickerClaim, ZmodemPickerRequest, ZmodemPickerResponse, ZmodemResponder,
+    ZmodemTransferId, ZmodemTransferOutcome, ZmodemTransferProgress,
+};
 
 use crate::{
     LocalConfig, SerialBackend, SshBackend, TelnetBackend, TerminalBackend, TerminalControlHandle,
     TerminalEvent, TerminalExecHandle, TerminalInputHandle, TerminalPerformanceMetrics,
     TerminalPerformanceSnapshot, TerminalPerformanceWindow, TerminalSize,
+    TerminalTransferCancelHandle,
 };
 use ssh::{
     ChannelEvent, HostKeyDetails, HostKeyIdentity, HostKeyRejection, HostKeyVerifier,
@@ -104,6 +108,14 @@ pub enum TerminalModelEvent {
     SshMfaChanged,
     /// SSH ZMODEM 文件选择请求状态变化
     ZmodemRequestChanged,
+    /// SSH ZMODEM 文件传输进度变化
+    ZmodemProgressChanged(ZmodemTransferProgress),
+    /// SSH ZMODEM 文件传输结束
+    ZmodemTransferFinished {
+        transfer_id: ZmodemTransferId,
+        outcome: ZmodemTransferOutcome,
+        progress: Option<ZmodemTransferProgress>,
+    },
     /// shell 开始渲染新的 prompt（OSC 133;A）
     PromptStart,
     /// shell prompt 已渲染完成，用户可以输入（OSC 133;B）
@@ -641,6 +653,7 @@ fn resolve_ssh_connection(
             pty_config,
             terminal_encoding,
             account_expect,
+            // 运行时注入不写远端文件，默认启用；仅显式存储的禁用值才关闭集成。
             disable_shell_integration: params.disable_shell_integration.unwrap_or(false),
         },
         credential_prompt_policy,
@@ -3133,6 +3146,20 @@ impl Terminal {
             TerminalEvent::ZmodemRequestChanged => {
                 cx.emit(TerminalModelEvent::ZmodemRequestChanged);
             }
+            TerminalEvent::ZmodemProgressChanged(progress) => {
+                cx.emit(TerminalModelEvent::ZmodemProgressChanged(progress));
+            }
+            TerminalEvent::ZmodemTransferFinished {
+                transfer_id,
+                outcome,
+                progress,
+            } => {
+                cx.emit(TerminalModelEvent::ZmodemTransferFinished {
+                    transfer_id,
+                    outcome,
+                    progress,
+                });
+            }
             TerminalEvent::PromptStart => {
                 cx.emit(TerminalModelEvent::PromptStart);
             }
@@ -3480,16 +3507,52 @@ impl Terminal {
             .is_some_and(|responder| responder.submit(responses))
     }
 
+    /// 取消等待中的 SSH keyboard-interactive/MFA 输入；返回是否有请求被清除。
+    pub fn cancel_ssh_mfa(&self) -> bool {
+        self.ssh_mfa_responder
+            .as_ref()
+            .is_some_and(|responder| responder.cancel())
+    }
+
     pub fn zmodem_picker_request(&self) -> Option<ZmodemPickerRequest> {
         self.zmodem_responder
             .as_ref()
             .and_then(ZmodemResponder::pending_request)
     }
 
+    pub fn zmodem_transfer_progress(&self) -> Option<ZmodemTransferProgress> {
+        self.zmodem_responder
+            .as_ref()
+            .and_then(ZmodemResponder::transfer_progress)
+    }
+
+    /// Request cancellation of the active ZMODEM transfer.
+    ///
+    /// Returns `true` only for a backend that accepted the request; the final
+    /// A `ZmodemTransferFinished { outcome: Cancelled, .. }` event remains
+    /// the source of truth.
+    pub fn cancel_zmodem_transfer(&self) -> bool {
+        self.backend
+            .as_deref()
+            .is_some_and(TerminalBackend::cancel_transfer)
+    }
+
+    pub fn zmodem_transfer_cancel_handle(&self) -> Option<TerminalTransferCancelHandle> {
+        self.backend
+            .as_deref()
+            .and_then(TerminalBackend::transfer_cancel_handle)
+    }
+
     pub fn submit_zmodem_picker(&self, response: ZmodemPickerResponse) -> bool {
         self.zmodem_responder
             .as_ref()
             .is_some_and(|responder| responder.submit(response))
+    }
+
+    pub fn claim_zmodem_picker(&self, request_id: u64) -> Option<ZmodemPickerClaim> {
+        self.zmodem_responder
+            .as_ref()
+            .and_then(|responder| responder.try_claim_picker(request_id))
     }
 
     /// 获取连接类型
@@ -3839,6 +3902,28 @@ impl Terminal {
         if let Some(ref backend) = self.backend {
             backend.write(data.to_vec());
         }
+    }
+
+    /// 向终端网格注入一段模型侧合成文本（连接状态提示、内联凭据回显等）。
+    ///
+    /// 只应在 PTY 不再产出内容的场景使用（断开、等待凭据/MFA），否则注入
+    /// 内容可能与远端输出互相覆盖。注入后自动滚动到底部并触发重绘。
+    pub fn inject_system_message(&self, text: &str, cx: &mut Context<Self>) {
+        if self.inject_system_text(text) {
+            cx.emit(TerminalModelEvent::Wakeup);
+        }
+    }
+
+    fn inject_system_text(&self, text: &str) -> bool {
+        if self.is_read_only() || text.is_empty() {
+            return false;
+        }
+        let mut term = self.term.lock();
+        let mut processor: Processor<StdSyncHandler> = Processor::new();
+        processor.advance(&mut *term, text.as_bytes());
+        term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+        drop(term);
+        true
     }
 
     /// 写入来自外部集成的输入，例如 Public MCP。
@@ -4508,6 +4593,24 @@ mod tests {
         external_writes: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
+    struct CancelTransferProbe {
+        requests: Arc<Mutex<usize>>,
+    }
+
+    impl TerminalBackend for CancelTransferProbe {
+        fn write(&self, _data: Vec<u8>) {}
+
+        fn resize(&self, _size: TerminalSize) {}
+
+        fn shutdown(&self) {}
+
+        fn cancel_transfer(&self) -> bool {
+            let mut requests = self.requests.lock().expect("cancel probe should lock");
+            *requests += 1;
+            true
+        }
+    }
+
     impl TerminalBackend for InputRouteProbe {
         fn write(&self, data: Vec<u8>) {
             self.direct_writes
@@ -5030,6 +5133,21 @@ mod tests {
     }
 
     #[test]
+    fn terminal_cancel_transfer_delegates_without_a_visible_progress_snapshot() {
+        let runtime = RecordingRuntime::new(RecordingRuntimeConfig::default())
+            .expect("create recording runtime");
+        let mut terminal = test_terminal_with_recording_runtime(Ok(runtime));
+        let requests = Arc::new(Mutex::new(0));
+        terminal.backend = Some(Box::new(CancelTransferProbe {
+            requests: requests.clone(),
+        }));
+
+        assert!(terminal.zmodem_transfer_progress().is_none());
+        assert!(terminal.cancel_zmodem_transfer());
+        assert_eq!(1, *requests.lock().expect("cancel requests should lock"));
+    }
+
+    #[test]
     fn terminal_external_input_uses_the_backend_external_input_route() {
         let runtime = RecordingRuntime::new(RecordingRuntimeConfig::default())
             .expect("create recording runtime");
@@ -5512,6 +5630,8 @@ mod tests {
         let mut connection = StoredConnection::new_ssh(
             "Latest SSH".to_string(),
             SshParams {
+                sftp_default_directory: None,
+                disabled_jump_server: None,
                 sftp_account: None,
                 host: "latest.example".to_string(),
                 port: 2222,
@@ -5537,6 +5657,7 @@ mod tests {
                 proxy: None,
                 os_id: None,
                 icon: None,
+                icon_file_path: None,
                 account_expect: Default::default(),
             },
             None,
@@ -5577,6 +5698,8 @@ mod tests {
         let connection = StoredConnection::new_ssh(
             "Prompted SSH".to_string(),
             SshParams {
+                sftp_default_directory: None,
+                disabled_jump_server: None,
                 sftp_account: None,
                 host: "prompted.example".to_string(),
                 port: 22,
@@ -5602,6 +5725,7 @@ mod tests {
                 proxy: None,
                 os_id: None,
                 icon: None,
+                icon_file_path: None,
                 account_expect: Default::default(),
             },
             None,
@@ -5649,6 +5773,8 @@ mod tests {
         let connection = StoredConnection::new_ssh(
             "No keyboard-interactive".to_string(),
             SshParams {
+                sftp_default_directory: None,
+                disabled_jump_server: None,
                 sftp_account: None,
                 host: "no-ki.example".to_string(),
                 port: 22,
@@ -5674,6 +5800,7 @@ mod tests {
                 proxy: None,
                 os_id: None,
                 icon: None,
+                icon_file_path: None,
                 account_expect: Default::default(),
             },
             None,
@@ -5707,6 +5834,8 @@ mod tests {
         let connection = StoredConnection::new_ssh(
             "Host-key retry".to_string(),
             SshParams {
+                sftp_default_directory: None,
+                disabled_jump_server: None,
                 sftp_account: None,
                 host: "host-key.example".to_string(),
                 port: 22,
@@ -5732,6 +5861,7 @@ mod tests {
                 proxy: None,
                 os_id: None,
                 icon: None,
+                icon_file_path: None,
                 account_expect: Default::default(),
             },
             None,
@@ -6275,6 +6405,78 @@ mod tests {
         assert!(responder.pending_request().is_none());
         assert!(task.await.unwrap().is_err());
         assert!(!responder.cancel());
+    }
+
+    #[test]
+    fn inject_system_text_writes_into_the_grid_and_scrolls_to_bottom() {
+        let runtime = RecordingRuntime::new(RecordingRuntimeConfig::default())
+            .expect("create recording runtime");
+        let terminal = test_terminal_with_recording_runtime(Ok(runtime));
+
+        // 预写一段输出并向上滚动，模拟用户正在回看历史
+        {
+            let mut term = terminal.term.lock();
+            let mut processor: Processor<StdSyncHandler> = Processor::new();
+            processor.advance(&mut *term, b"remote output\r\n");
+            term.scroll_display(alacritty_terminal::grid::Scroll::Top);
+        }
+
+        assert!(terminal.inject_system_text(
+            "\r\n\x1b[33m[connection lost]\x1b[0m\r\n\x1b[2mpress enter to reconnect\x1b[0m\r\n"
+        ));
+
+        let snapshot = recent_text_from_term(&terminal.term, 10);
+        assert!(snapshot.text.contains("[connection lost]"));
+        assert!(snapshot.text.contains("press enter to reconnect"));
+        assert!(snapshot.text.contains("remote output"));
+        assert_eq!(0, terminal.term.lock().grid().display_offset());
+        assert!(!terminal.inject_system_text(""));
+    }
+
+    #[test]
+    fn inject_system_text_ignores_read_only_surfaces() {
+        let runtime = RecordingRuntime::new(RecordingRuntimeConfig::default())
+            .expect("create recording runtime");
+        let mut terminal = test_terminal_with_recording_runtime(Ok(runtime));
+        terminal.session_mode = TerminalSessionMode::RecordingPlayback;
+
+        assert!(!terminal.inject_system_text("should not appear\r\n"));
+        let snapshot = recent_text_from_term(&terminal.term, 5);
+        assert!(!snapshot.text.contains("should not appear"));
+    }
+
+    #[tokio::test]
+    async fn cancel_ssh_mfa_reports_whether_a_request_was_pending() {
+        let runtime = RecordingRuntime::new(RecordingRuntimeConfig::default())
+            .expect("create recording runtime");
+        let mut terminal = test_terminal_with_recording_runtime(Ok(runtime));
+        assert!(!terminal.cancel_ssh_mfa());
+
+        let (event_tx, mut event_rx) = unbounded_channel();
+        let responder = TerminalMfaResponder::new(event_tx, None, None);
+        terminal.ssh_mfa_responder = Some(responder);
+        let pending = terminal.ssh_mfa_responder.as_ref().unwrap().clone();
+        let task = tokio::spawn(async move {
+            pending
+                .respond(KeyboardInteractiveRequest {
+                    target: ssh::KeyboardInteractiveTarget::TargetServer,
+                    name: "MFA".to_string(),
+                    instructions: String::new(),
+                    prompts: vec![ssh::KeyboardInteractivePrompt {
+                        prompt: "Verification code:".to_string(),
+                        echo: false,
+                    }],
+                })
+                .await
+        });
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(TerminalEvent::SshMfaChanged)
+        ));
+
+        assert!(terminal.cancel_ssh_mfa());
+        assert!(task.await.unwrap().is_err());
+        assert!(!terminal.cancel_ssh_mfa());
     }
 
     #[test]

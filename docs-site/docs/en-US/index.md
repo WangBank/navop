@@ -2,13 +2,15 @@
 
 Navop is the dev and ops workspace for the AI era, bringing databases, Redis, MongoDB, SSH, SFTP, terminals, remote desktops, Notes, AI, and team sync into one native workspace.
 
-## Current release: v0.11.0
+## Current release: v0.15.1
 
-[Download Navop v0.11.0](https://github.com/feigeCode/navop/releases/tag/v0.11.0)
+Download the latest stable release from the [official Download Center](https://navop.dev/en-US/extensions).
 
-- Added a configurable "Connection Sorting" option under **Settings → General → Connection Display**, defaulting to natural name order (IP addresses compared by value, case-insensitive) with "Most Recently Used" also available; the Home connection list, Redis/MongoDB workspace tabs, and the persistent sidebar connection tree all honor the setting.
-- SSH now offers opt-in compatibility for legacy servers that only support DSA host keys, SHA-1 key exchange/MAC, or 1024-bit DH group negotiation.
-- Duplicated tabs are automatically numbered (reusing freed numbers) and tab widths adapt to content so long titles are not truncated.
+- Terminal gains "highlight identical text on selection": after selecting text, matching text in the visible area is highlighted with a subtle background, working in both SSH and local terminals; toggleable in the terminal sidebar settings (on by default).
+- Connection list width is now persisted: resizing the sidebar connection tree is saved automatically and restored on next launch; the docked sidebar shares the main window background, and the floating mode adopts a card-style look (rounded corners + shadow).
+- The "check for updates automatically" toggle and "Check for Updates" button move from general settings to the About page, alongside the version information.
+- Fixed sidebar and command bar icon buttons rendering black instead of following the terminal/Agent custom theme colors.
+- Fixed SFTP restoring the old mtime when overwriting remote files, which made mtime-based change detection (rsync deploys, web/app caches, incremental builds) treat the overwritten file as unchanged.
 
 ## Start here
 

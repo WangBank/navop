@@ -382,6 +382,9 @@ pub struct SshParams {
     /// 独立的 SFTP 账户（可选）；`None` 表示 SFTP 复用主账户。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sftp_account: Option<SftpAccount>,
+    /// SFTP 面板连接成功后进入的初始目录；`None` 表示使用服务器登录目录。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sftp_default_directory: Option<String>,
     /// Optional field-level reference to the local credential vault.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_reference: Option<CredentialReference>,
@@ -432,6 +435,9 @@ pub struct SshParams {
     /// 跳板机配置
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jump_server: Option<JumpServerConfig>,
+    /// 停用保留的跳板机配置：启用/停用只是切换 `jump_server`，已填信息保存在这里以便恢复。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_jump_server: Option<JumpServerConfig>,
     /// 代理配置
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy: Option<ProxyConfig>,
@@ -441,6 +447,9 @@ pub struct SshParams {
     /// 手动指定的连接图标 ID（None = 按探测到的 os_id 自动选择）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// 本机自定义连接图标的绝对路径（优先于内置图标）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_file_path: Option<String>,
 }
 
 impl SshParams {
@@ -481,8 +490,26 @@ pub const SSH_ICON_IDS: &[&str] = &[
     "debian",
     "redhat",
     "centos",
+    "rocky",
+    "fedora",
     "almalinux",
+    "alpine",
+    "arch",
     "opensuse",
+    "kali",
+    "amzn",
+    "alinux",
+    "openeuler",
+    "freebsd",
+    "cisco",
+    "juniper",
+    "huawei",
+    "h3c",
+    "hpe",
+    "mikrotik",
+    "fortinet",
+    "paloalto",
+    "zyxel",
     "macos",
     "windows",
     "docker",
@@ -495,11 +522,29 @@ pub fn ssh_os_icon(os_id: Option<&str>) -> IconName {
         Some("ubuntu") => IconName::UbuntuColor,
         Some("debian") => IconName::DebianColor,
         Some("centos") => IconName::CentosColor,
+        Some("rocky") => IconName::RockyColor,
+        Some("fedora") => IconName::FedoraColor,
         Some("almalinux") => IconName::AlmalinuxColor,
-        Some("rhel" | "redhat" | "fedora" | "rocky" | "ol" | "amzn") => IconName::RedhatColor,
+        Some("alpine") => IconName::AlpineColor,
+        Some("arch" | "archarm" | "manjaro") => IconName::ArchColor,
+        Some("rhel" | "redhat" | "ol") => IconName::RedhatColor,
         Some("opensuse" | "opensuse-leap" | "opensuse-tumbleweed" | "sles" | "suse") => {
             IconName::OpensuseColor
         }
+        Some("kali") => IconName::KaliColor,
+        Some("amzn") => IconName::AmazonColor,
+        Some("alinux") => IconName::AlinuxColor,
+        Some("openeuler") => IconName::OpenEulerColor,
+        Some("freebsd") => IconName::FreebsdColor,
+        Some("cisco" | "ios" | "ios-xe") => IconName::CiscoColor,
+        Some("juniper" | "junos") => IconName::JuniperColor,
+        Some("huawei" | "vrp") => IconName::HuaweiColor,
+        Some("h3c" | "comware") => IconName::H3cColor,
+        Some("hpe") => IconName::HpeColor,
+        Some("mikrotik" | "routeros") => IconName::MikrotikColor,
+        Some("fortinet" | "fortios") => IconName::FortinetColor,
+        Some("paloalto" | "palo-alto" | "panos") => IconName::PaloaltoColor,
+        Some("zyxel") => IconName::ZyxelColor,
         Some("macos" | "darwin") => IconName::MacosColor,
         Some("windows") => IconName::WindowsColor,
         Some("docker") => IconName::DockerColor,
@@ -2040,6 +2085,8 @@ mod tests {
         let mut connection = StoredConnection::new_ssh(
             "prod-bastion".to_string(),
             SshParams {
+                disabled_jump_server: None,
+                sftp_default_directory: None,
                 sftp_account: None,
                 host: "bastion.example.com".to_string(),
                 port: 2222,
@@ -2063,6 +2110,7 @@ mod tests {
                 proxy: None,
                 os_id: None,
                 icon: None,
+                icon_file_path: None,
                 account_expect: Default::default(),
             },
             Some(7),
@@ -2232,6 +2280,8 @@ mod tests {
         );
 
         let ssh = SshParams {
+            disabled_jump_server: None,
+            sftp_default_directory: None,
             sftp_account: None,
             host: "localhost".to_string(),
             port: 22,
@@ -2255,6 +2305,7 @@ mod tests {
             proxy: None,
             os_id: None,
             icon: None,
+            icon_file_path: None,
             account_expect: Default::default(),
         };
         assert_eq!(
@@ -3166,10 +3217,31 @@ mod serial_tests {
             IconName::WindowsColor
         ));
         assert!(matches!(ssh_os_icon(Some("docker")), IconName::DockerColor));
-        for id in ["rhel", "redhat", "rocky", "fedora"] {
+        for (id, expected) in [
+            ("rhel", IconName::RedhatColor),
+            ("redhat", IconName::RedhatColor),
+            ("rocky", IconName::RockyColor),
+            ("fedora", IconName::FedoraColor),
+            ("alpine", IconName::AlpineColor),
+            ("arch", IconName::ArchColor),
+            ("kali", IconName::KaliColor),
+            ("amzn", IconName::AmazonColor),
+            ("alinux", IconName::AlinuxColor),
+            ("openeuler", IconName::OpenEulerColor),
+            ("freebsd", IconName::FreebsdColor),
+            ("cisco", IconName::CiscoColor),
+            ("juniper", IconName::JuniperColor),
+            ("huawei", IconName::HuaweiColor),
+            ("h3c", IconName::H3cColor),
+            ("hpe", IconName::HpeColor),
+            ("mikrotik", IconName::MikrotikColor),
+            ("fortinet", IconName::FortinetColor),
+            ("paloalto", IconName::PaloaltoColor),
+            ("zyxel", IconName::ZyxelColor),
+        ] {
             assert!(
-                matches!(ssh_os_icon(Some(id)), IconName::RedhatColor),
-                "{id} 应映射到 RedHat 图标"
+                matches!(ssh_os_icon(Some(id)), x if x == expected),
+                "{id} 应映射到 {expected:?} 图标"
             );
         }
         assert!(matches!(
@@ -3182,6 +3254,8 @@ mod serial_tests {
     #[test]
     fn ssh_params_os_id_round_trips_through_json() {
         let mut params = SshParams {
+            disabled_jump_server: None,
+            sftp_default_directory: None,
             sftp_account: None,
             host: "example.com".to_string(),
             port: 22,
@@ -3205,6 +3279,7 @@ mod serial_tests {
             proxy: None,
             os_id: Some("ubuntu".to_string()),
             icon: None,
+            icon_file_path: None,
             account_expect: Default::default(),
         };
         let json = serde_json::to_string(&params).expect("SshParams 应可序列化");
@@ -3215,6 +3290,26 @@ mod serial_tests {
         params.os_id = None;
         let json = serde_json::to_string(&params).expect("SshParams 应可序列化");
         assert!(!json.contains("os_id"));
+    }
+
+    #[test]
+    fn ssh_params_custom_icon_path_round_trips_and_defaults_to_none() {
+        let mut params: SshParams = serde_json::from_str(
+            r#"{"host":"example.com","port":22,"username":"root","auth_method":"Agent"}"#,
+        )
+        .expect("旧连接缺少自定义图标路径时应可反序列化");
+        assert_eq!(params.icon_file_path, None);
+
+        params.icon = Some("ubuntu".to_string());
+        params.icon_file_path = Some("/tmp/custom-ssh-icon.svg".to_string());
+        let json = serde_json::to_string(&params).expect("SshParams 应可序列化");
+        let parsed: SshParams = serde_json::from_str(&json).expect("SshParams 应可反序列化");
+
+        assert_eq!(parsed.icon, Some("ubuntu".to_string()));
+        assert_eq!(
+            parsed.icon_file_path,
+            Some("/tmp/custom-ssh-icon.svg".to_string())
+        );
     }
 
     #[test]
@@ -3292,8 +3387,7 @@ mod serial_tests {
 
         let json = serde_json::to_string(&params).expect("SSH 配置应可序列化");
         assert!(json.contains("\"sftp_account\""));
-        let parsed: SshParams =
-            serde_json::from_str(&json).expect("SSH 配置应可再次反序列化");
+        let parsed: SshParams = serde_json::from_str(&json).expect("SSH 配置应可再次反序列化");
         assert_eq!(parsed.sftp_account, params.sftp_account);
 
         let legacy: SshParams = serde_json::from_str(
@@ -3303,6 +3397,79 @@ mod serial_tests {
         assert_eq!(legacy.sftp_account, None);
         let legacy_json = serde_json::to_string(&legacy).expect("旧 SSH 配置应可序列化");
         assert!(!legacy_json.contains("sftp_account"));
+    }
+
+    #[test]
+    fn ssh_params_sftp_default_directory_round_trips_and_legacy_json_defaults_none() {
+        let params: SshParams = serde_json::from_value(serde_json::json!({
+            "host": "example.com",
+            "port": 22,
+            "username": "root",
+            "auth_method": "Agent",
+            "sftp_default_directory": "/data/upload"
+        }))
+        .expect("带 SFTP 初始目录的配置应可反序列化");
+        assert_eq!(
+            params.sftp_default_directory,
+            Some("/data/upload".to_string())
+        );
+
+        let json = serde_json::to_string(&params).expect("SSH 配置应可序列化");
+        assert!(json.contains("\"sftp_default_directory\""));
+
+        let parsed: SshParams = serde_json::from_str(&json).expect("SSH 配置应可再次反序列化");
+        assert_eq!(parsed.sftp_default_directory, params.sftp_default_directory);
+
+        let legacy: SshParams = serde_json::from_str(
+            r#"{"host":"example.com","port":22,"username":"root","auth_method":"Agent"}"#,
+        )
+        .expect("旧 SSH 配置应可反序列化");
+        assert_eq!(legacy.sftp_default_directory, None);
+        let legacy_json = serde_json::to_string(&legacy).expect("旧 SSH 配置应可序列化");
+        assert!(!legacy_json.contains("sftp_default_directory"));
+    }
+
+    #[test]
+    fn ssh_params_disabled_jump_server_round_trips_and_legacy_json_defaults_none() {
+        let params: SshParams = serde_json::from_value(serde_json::json!({
+            "host": "example.com",
+            "port": 22,
+            "username": "root",
+            "auth_method": "Agent",
+            "disabled_jump_server": {
+                "host": "jump.example.com",
+                "port": 2222,
+                "username": "jump",
+                "auth_method": {"Password": {"password": "secret"}}
+            }
+        }))
+        .expect("带停用跳板机配置的参数应可反序列化");
+        let stash = params
+            .disabled_jump_server
+            .as_ref()
+            .expect("停用跳板机配置应存在");
+        assert_eq!(stash.host, "jump.example.com");
+        assert_eq!(stash.port, 2222);
+
+        let json = serde_json::to_string(&params).expect("SSH 配置应可序列化");
+        assert!(json.contains("\"disabled_jump_server\""));
+
+        let parsed: SshParams = serde_json::from_str(&json).expect("SSH 配置应可再次反序列化");
+        let parsed_stash = parsed
+            .disabled_jump_server
+            .as_ref()
+            .expect("序列化往返后停用跳板机配置应保留");
+        assert_eq!(parsed_stash.host, stash.host);
+        assert_eq!(parsed_stash.port, stash.port);
+        assert_eq!(parsed_stash.username, stash.username);
+
+        let legacy: SshParams = serde_json::from_str(
+            r#"{"host":"example.com","port":22,"username":"root","auth_method":"Agent"}"#,
+        )
+        .expect("旧 SSH 配置应可反序列化");
+        assert!(legacy.disabled_jump_server.is_none());
+        let legacy_json = serde_json::to_string(&legacy).expect("旧 SSH 配置应可序列化");
+        assert!(!legacy_json.contains("disabled_jump_server"));
     }
 
     #[test]
@@ -3367,6 +3534,8 @@ mod serial_tests {
         let mut connection = StoredConnection::new_ssh(
             "example".to_string(),
             SshParams {
+                disabled_jump_server: None,
+                sftp_default_directory: None,
                 sftp_account: None,
                 host: "example.com".to_string(),
                 port: 22,
@@ -3390,6 +3559,7 @@ mod serial_tests {
                 proxy: None,
                 os_id: None,
                 icon: None,
+                icon_file_path: None,
                 account_expect: Default::default(),
             },
             None,

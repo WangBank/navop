@@ -2,6 +2,8 @@
 
 Navop includes MySQL, PostgreSQL, SQLite, DuckDB, SQL Server, Oracle, and ClickHouse support. Extensions can add Dameng, Kingbase, GBase 8s, OceanBase, openGauss, IoTDB, and other drivers. Fields and advanced capabilities depend on the driver and server version.
 
+The built-in Oracle driver requires the [Oracle Instant Client](https://www.oracle.com/database/technologies/instant-client/downloads.html). To use Oracle without Instant Client, install the pure-Go Oracle driver from the extension marketplace; when connecting to Oracle you can choose between the Native and Go drivers.
+
 ## Connect to a network database
 
 Choose the database type and enter a name, host, port, user, password, and default database. Test networking, authentication, and driver compatibility before saving. Diagnose failures in layers: DNS, port, firewall, account, database state, and version. Avoid changing many fields at once.
@@ -18,7 +20,7 @@ Network drives and cloud-synced folders can introduce locking or consistency pro
 
 Use SOCKS5 or HTTP CONNECT when direct access is unavailable, with proxy authentication if required. A proxy changes the route; it does not replace database TLS or authorization. Test the proxy address, credentials, destination, and policy separately.
 
-An SSH tunnel can reuse a saved SSH/SFTP connection or define a jump host manually. Authentication supports passwords, private-key files, private-key contents, and SSH Agent. Configure the actual tunnel target when the database is not on the SSH host itself. Test SSH first, then the database.
+An SSH tunnel can reuse a saved SSH/SFTP connection or define a jump host manually. Authentication supports passwords, private-key files, private-key contents, and SSH Agent. Configure the actual tunnel target when the database is not on the SSH host itself. Test SSH first, then the database. Disabling a jump host preserves its configuration so you can re-enable it quickly without re-entering credentials.
 
 ## Configure SSL/TLS
 

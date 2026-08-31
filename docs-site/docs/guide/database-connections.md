@@ -2,6 +2,8 @@
 
 Navop 内置支持 MySQL、PostgreSQL、SQLite、DuckDB、SQL Server、Oracle 和 ClickHouse，并可通过扩展增加达梦、金仓、GBase 8s、OceanBase、openGauss、IoTDB 等数据库。具体字段和能力取决于驱动与服务器版本。
 
+内置 Oracle 驱动依赖 [Oracle Instant Client](https://www.oracle.com/database/technologies/instant-client/downloads.html)；若不希望安装 Instant Client，可从扩展市场安装纯 Go Oracle 驱动。连接 Oracle 时可按需选择 Native 或 Go 驱动。
+
 ![数据库工作区](/images/database.png)
 
 本页先介绍所有数据库都通用的连接流程；驱动特有的参数、SQL 方言和对象能力以实际连接表单和驱动版本为准。
@@ -23,6 +25,8 @@ SQLite 和 DuckDB 可以直接选择本地文件，也可以通过系统文件�
 无法直连时，可以配置 SOCKS5 或 HTTP CONNECT 代理，并按需填写代理认证。代理只改变网络路径，不会替代数据库 TLS 和账号权限。测试失败时分别确认代理地址、代理凭据、目标端口和代理侧访问规则。
 
 SSH 隧道可以引用已保存的 SSH/SFTP 连接，也可以手动填写跳板机。认证支持密码、私钥文件、私钥内容和 SSH Agent；需要时配置实际隧道目标，而不是默认假设数据库就在 SSH 主机本机。先测试 SSH，再测试数据库，有助于区分隧道与数据库错误。
+
+SSH 跳板机配置在禁用后仍会保留，便于快速重新启用，不必重新填写认证信息。
 
 ## SSL/TLS 与证书
 

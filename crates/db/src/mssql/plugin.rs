@@ -8,6 +8,7 @@ use regex::Regex;
 use rust_i18n::t;
 use tracing::info;
 
+use crate::SqlFormatOptions;
 use crate::connection::{DbConnection, DbError};
 use crate::executor::SqlResult;
 use crate::import_export::{
@@ -1109,9 +1110,8 @@ impl DatabasePlugin for MsSqlPlugin {
         Box::new(sqlparser::dialect::MsSqlDialect {})
     }
 
-    fn format_sql(&self, sql: &str) -> String {
-        let formatted = crate::format_sql(sql);
-        fix_mssql_brackets(&formatted)
+    fn format_sql_with_options(&self, sql: &str, options: SqlFormatOptions) -> String {
+        fix_mssql_brackets(&crate::format_sql_with_options(sql, options))
     }
 
     async fn list_schemas(

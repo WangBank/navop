@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use gpui::prelude::FluentBuilder as _;
-use gpui::{AnyElement, IntoElement, ListSizingBehavior, ParentElement, Styled, div, uniform_list};
+use gpui::{AnyElement, ColorExt as _, IntoElement, ListSizingBehavior, ParentElement, Styled, div, uniform_list};
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, IconSize, Sizable, StyledExt, h_flex,
     input::{Input, LocalInputStyle},
@@ -49,8 +49,6 @@ impl PersistentConnectionSidebar {
                     .min_h_0()
                     .min_w_0()
                     .overflow_hidden()
-                    .border_r_1()
-                    .border_color(palette.border)
                     .child(
                         uniform_list("persistent-connection-tree", rows.len(), {
                             cx.processor(move |this, range: Range<usize>, _window, cx| {
@@ -157,13 +155,13 @@ impl PersistentConnectionSidebar {
             .w_full()
             .h_10()
             .flex_shrink_0()
-            .gap_2()
+            .gap_1()
             .items_center()
             .px_2()
             .bg(palette.background)
-            .border_r_1()
             .border_b_1()
-            .border_color(palette.border)
+            // 右侧分隔统一由 resize 手柄的可见线承担，避免多段边框叠加产生拼接感。
+            .border_color(palette.border.opacity(0.6))
             .child(
                 Icon::new(IconName::Search)
                     .with_size(IconSize::Micro)
@@ -185,6 +183,7 @@ impl PersistentConnectionSidebar {
                         .caret_color(palette.foreground),
                 ),
             )
+            .child(self.render_tree_filter_button(palette, cx))
             .into_any_element()
     }
 
@@ -204,11 +203,10 @@ impl PersistentConnectionSidebar {
             .h(layout.embedded_panel_header)
             .flex_shrink_0()
             .pr_2()
-            // Leave a full control-sized gap after the macOS traffic lights;
-            // the narrower padding made the title look attached to the green
-            // window button even though the bounds did not overlap.
+            // The navigation rail is gone, so on macOS the header starts at
+            // the window edge and must clear the full traffic-light strip.
             .when(cfg!(target_os = "macos"), |this| {
-                this.pl(layout.macos_compact_title_bar_content_padding)
+                this.pl(layout.macos_title_bar_content_padding)
             })
             .when(!cfg!(target_os = "macos"), |this| this.pl_2())
             .items_center()
@@ -222,8 +220,8 @@ impl PersistentConnectionSidebar {
                 palette.background
             })
             .text_color(palette.foreground)
-            .border_r_1()
-            .border_color(palette.border)
+            .border_b_1()
+            .border_color(palette.border.opacity(0.6))
             .child(
                 h_flex()
                     .min_w_0()
@@ -270,7 +268,7 @@ mod tests {
     fn macos_connection_header_clears_the_traffic_lights() {
         let source = include_str!("tree.rs");
         assert!(source.contains("cfg!(target_os = \"macos\")"));
-        assert!(source.contains("layout.macos_compact_title_bar_content_padding"));
+        assert!(source.contains("layout.macos_title_bar_content_padding"));
     }
 
     #[test]
@@ -288,15 +286,12 @@ mod tests {
     fn connection_header_exposes_auto_hide_toggle_left_of_batch_operations() {
         let source = include_str!("tree.rs");
         let implementation = source.split("#[cfg(test)]").next().unwrap();
-        let toggle = implementation.find("auto_hide_tree_toggle(").expect(
-            "连接树头部应渲染自动隐藏开关",
-        );
-        let batch = implementation.find("batch_mode_toggle(").expect(
-            "连接树头部应渲染批量操作开关",
-        );
-        assert!(
-            toggle < batch,
-            "自动隐藏开关应位于批量操作开关的左侧"
-        );
+        let toggle = implementation
+            .find("auto_hide_tree_toggle(")
+            .expect("连接树头部应渲染自动隐藏开关");
+        let batch = implementation
+            .find("batch_mode_toggle(")
+            .expect("连接树头部应渲染批量操作开关");
+        assert!(toggle < batch, "自动隐藏开关应位于批量操作开关的左侧");
     }
 }

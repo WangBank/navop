@@ -131,6 +131,8 @@ mod tests {
         StoredConnection::new_ssh(
             "SSH".to_string(),
             SshParams {
+                sftp_default_directory: None,
+                disabled_jump_server: None,
                 sftp_account: None,
                 host: "ssh.example.test".to_string(),
                 port: 22,
@@ -156,6 +158,7 @@ mod tests {
                 proxy: None,
                 os_id: None,
                 icon: None,
+                icon_file_path: None,
                 account_expect: Default::default(),
             },
             None,

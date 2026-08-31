@@ -13,6 +13,9 @@ const MAX_MENU_WIDTH: Pixels = px(320.);
 const MIN_MENU_WIDTH: Pixels = px(120.);
 const MAX_MENU_HEIGHT: Pixels = px(240.);
 const POPOVER_GAP: Pixels = px(4.);
+/// Preferred width of the completion documentation (hover) panel.
+/// Documentation prose wraps poorly at the menu width, so give it more room.
+const MAX_DOCUMENTATION_WIDTH: Pixels = px(480.);
 
 use crate::{
     ActiveTheme, IndexPath, Selectable, actions, h_flex,
@@ -210,11 +213,13 @@ fn completion_menu_layout(
     };
     let menu_max_height = MAX_MENU_HEIGHT.min((window_size.height - abs_y).max(px(80.)));
     let vertical_layout =
-        abs_x + MAX_MENU_WIDTH + POPOVER_GAP + MAX_MENU_WIDTH + POPOVER_GAP > window_size.width;
+        abs_x + MAX_MENU_WIDTH + POPOVER_GAP + MAX_DOCUMENTATION_WIDTH + POPOVER_GAP
+            > window_size.width;
     let documentation_width = if vertical_layout {
         max_width
     } else {
-        MAX_MENU_WIDTH
+        let remaining = window_size.width - abs_x - max_width - POPOVER_GAP * 2.;
+        MAX_DOCUMENTATION_WIDTH.min(remaining.max(MIN_MENU_WIDTH))
     };
 
     CompletionMenuLayout {
@@ -469,8 +474,10 @@ impl Render for CompletionMenu {
                 .when(layout.vertical_layout, |this| this.flex_col())
                 .child(
                     editor_popover("completion-menu", cx)
-                        .max_w(layout.max_width)
-                        .min_w(MIN_MENU_WIDTH)
+                        // 固定使用可用宽度（封顶 MAX_MENU_WIDTH）：内容测量按字符数选
+                        // 代表条目，字符数最宽≠像素最宽，按内容收缩会裁剪长条目
+                        // （如 SQL 大写标识符补全）。
+                        .w(layout.max_width)
                         .child(List::new(&self.list).max_h(layout.menu_max_height)),
                 )
                 .when_some(selected_documentation, |this, documentation| {
@@ -501,8 +508,23 @@ impl Render for CompletionMenu {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_MENU_HEIGHT, MIN_MENU_WIDTH, POPOVER_GAP, completion_menu_layout};
+    use super::{
+        MAX_DOCUMENTATION_WIDTH, MAX_MENU_HEIGHT, MIN_MENU_WIDTH, POPOVER_GAP,
+        completion_menu_layout,
+    };
     use gpui::{Point, px, size};
+
+    #[test]
+    fn completion_menu_documentation_uses_wider_panel_when_space_allows() {
+        let layout = completion_menu_layout(
+            Point::new(px(100.), px(100.)),
+            Point::new(px(0.), px(0.)),
+            size(px(1280.), px(800.)),
+        );
+
+        assert!(!layout.vertical_layout);
+        assert_eq!(MAX_DOCUMENTATION_WIDTH, layout.documentation_width);
+    }
 
     #[test]
     fn completion_menu_flips_above_when_bottom_space_is_tight() {
@@ -527,5 +549,22 @@ mod tests {
         assert_eq!(px(300.), layout.position.x);
         assert_eq!(MIN_MENU_WIDTH, layout.max_width);
         assert_eq!(MIN_MENU_WIDTH, layout.documentation_width);
+    }
+
+    /// 菜单必须以固定可用宽度渲染：按内容测量的宽度由“字符数最长”的条目决定，
+    /// 像素更宽的条目（如 SQL 大写标识符）会被 overflow_hidden 裁剪。
+    #[test]
+    fn completion_menu_renders_at_fixed_available_width() {
+        let source = include_str!("completion_menu.rs");
+        let render = source
+            .split("impl Render for CompletionMenu")
+            .nth(1)
+            .expect("CompletionMenu render impl exists")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("render impl has an end marker");
+
+        assert!(render.contains(".w(layout.max_width)"));
+        assert!(!render.contains(".max_w(layout.max_width)"));
     }
 }

@@ -107,6 +107,70 @@ pub enum HomePageStyle {
     Modern,
 }
 
+/// SQL 格式化时的关键字大小写策略；Preserve 保持用户原文不改变大小写
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SqlKeywordCase {
+    #[default]
+    Preserve,
+    Upper,
+    Lower,
+}
+
+/// SQL 格式化的缩进风格
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SqlIndentStyle {
+    #[default]
+    TwoSpaces,
+    FourSpaces,
+    Tabs,
+}
+
+/// SQL 美化 / 压缩相关的用户设置
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SqlFormatSettings {
+    pub keyword_case: SqlKeywordCase,
+    pub indent: SqlIndentStyle,
+}
+
+impl SqlKeywordCase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Preserve => "preserve",
+            Self::Upper => "upper",
+            Self::Lower => "lower",
+        }
+    }
+
+    pub fn from_value(value: &str) -> Self {
+        match value {
+            "upper" => Self::Upper,
+            "lower" => Self::Lower,
+            _ => Self::Preserve,
+        }
+    }
+}
+
+impl SqlIndentStyle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TwoSpaces => "two_spaces",
+            Self::FourSpaces => "four_spaces",
+            Self::Tabs => "tabs",
+        }
+    }
+
+    pub fn from_value(value: &str) -> Self {
+        match value {
+            "four_spaces" => Self::FourSpaces,
+            "tabs" => Self::Tabs,
+            _ => Self::TwoSpaces,
+        }
+    }
+}
+
 impl HomePageStyle {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -463,8 +527,19 @@ pub struct McpSettings {
     pub server_mode: McpServerMode,
     #[serde(default)]
     pub permission_mode: McpPermissionMode,
+    #[serde(default = "default_mcp_approval_timeout_ms")]
+    pub approval_timeout_ms: u64,
     #[serde(default, rename = "toolsets", skip_serializing)]
     pub legacy_toolsets: Option<ToolExposureToolsetSettings>,
+}
+
+pub const DEFAULT_MCP_APPROVAL_TIMEOUT_MS: u64 = 300_000;
+/// Upper bound exposed by the Settings UI for the MCP approval confirmation
+/// window. Use 0 in settings to wait indefinitely instead.
+pub const MAX_MCP_APPROVAL_TIMEOUT_MS: u64 = 3_600_000;
+
+fn default_mcp_approval_timeout_ms() -> u64 {
+    DEFAULT_MCP_APPROVAL_TIMEOUT_MS
 }
 
 impl Default for McpSettings {
@@ -473,6 +548,7 @@ impl Default for McpSettings {
             server_enabled: false,
             server_mode: McpServerMode::Temporary,
             permission_mode: McpPermissionMode::Deny,
+            approval_timeout_ms: default_mcp_approval_timeout_ms(),
             legacy_toolsets: None,
         }
     }
@@ -481,9 +557,9 @@ impl Default for McpSettings {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AiChatToolExecutionMode {
-    #[default]
     Auto,
     ReadOnly,
+    #[default]
     Manual,
 }
 
@@ -747,21 +823,31 @@ fn format_legacy_custom_command(program: &str, arguments: &str) -> String {
     }
 }
 
+/// 连接侧栏默认宽度（像素），与主题 `context_sidebar_default` 保持一致。
+pub const DEFAULT_CONNECTION_SIDEBAR_TREE_WIDTH: u32 = 260;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionSidebarTreeState {
     #[serde(default)]
     pub hide_empty_workspaces: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub auto_hide_tree: bool,
+    #[serde(default = "default_connection_sidebar_tree_width")]
+    pub tree_width: u32,
 }
 
 impl Default for ConnectionSidebarTreeState {
     fn default() -> Self {
         Self {
             hide_empty_workspaces: false,
-            auto_hide_tree: true,
+            auto_hide_tree: false,
+            tree_width: DEFAULT_CONNECTION_SIDEBAR_TREE_WIDTH,
         }
     }
+}
+
+fn default_connection_sidebar_tree_width() -> u32 {
+    DEFAULT_CONNECTION_SIDEBAR_TREE_WIDTH
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -832,6 +918,9 @@ pub struct AppSettings {
     pub terminal_confirm_high_risk_command: bool,
     #[serde(default = "default_true")]
     pub terminal_auto_session_logging: bool,
+    /// 选中文本后高亮可见区域内所有相同文本
+    #[serde(default = "default_true")]
+    pub terminal_selection_highlight: bool,
     #[serde(default)]
     pub local_terminal_profile: LocalTerminalProfileSettings,
     #[serde(default)]
@@ -901,6 +990,9 @@ pub struct AppSettings {
     /// SQL 查询默认最大返回行数，0 表示不限制
     #[serde(default = "default_sql_query_max_rows")]
     pub sql_query_max_rows: u32,
+    /// SQL 美化格式化设置
+    #[serde(default)]
+    pub sql_format: SqlFormatSettings,
     #[serde(default)]
     pub custom_keybindings: HashMap<String, Vec<String>>,
 }
@@ -1194,6 +1286,7 @@ impl Default for AppSettings {
             terminal_confirm_multiline_paste: default_true(),
             terminal_confirm_high_risk_command: default_true(),
             terminal_auto_session_logging: default_true(),
+            terminal_selection_highlight: default_true(),
             local_terminal_profile: LocalTerminalProfileSettings::default(),
             log_file_path: String::new(),
             auto_update: true,
@@ -1224,6 +1317,7 @@ impl Default for AppSettings {
             system_hotkey_other: default_system_hotkey_other(),
             table_row_height: default_table_row_height(),
             sql_query_max_rows: default_sql_query_max_rows(),
+            sql_format: SqlFormatSettings::default(),
             custom_keybindings: HashMap::new(),
         }
     }
@@ -1491,10 +1585,11 @@ mod tests {
 
     use super::{
         AiChatSettings, AiChatToolExecutionMode, AppSettings, ConnectionSortOrder, CustomFont,
-        DEFAULT_TERMINAL_THEME, HomeConnectionLayout, HomePageStyle, LOCALE_SYSTEM,
-        LargeTextCellEditorOpenMode, LocalTerminalProfileKind, LocalTerminalProfileSettings,
-        MainWindowState, McpPermissionMode, McpServerMode, PersonalSyncBackendKind,
-        RemoteFileOpenMode, StartupDefaultPage, SyncProvider, default_grid_font_fallback_families,
+        DEFAULT_MCP_APPROVAL_TIMEOUT_MS, DEFAULT_TERMINAL_THEME, HomeConnectionLayout,
+        HomePageStyle, LOCALE_SYSTEM, LargeTextCellEditorOpenMode, LocalTerminalProfileKind,
+        LocalTerminalProfileSettings, MainWindowState, McpPermissionMode, McpServerMode,
+        PersonalSyncBackendKind, RemoteFileOpenMode, SqlFormatSettings, SqlIndentStyle,
+        SqlKeywordCase, StartupDefaultPage, SyncProvider, default_grid_font_fallback_families,
         default_grid_monospace_font_family, grid_monospace_font, installed_grid_monospace_font,
         is_installed_font_family, resolve_installed_grid_monospace_font_family,
     };
@@ -1502,6 +1597,36 @@ mod tests {
     #[test]
     fn app_settings_disables_sync_by_default() {
         assert!(!AppSettings::default().sync_enabled);
+    }
+
+    #[test]
+    fn sql_format_settings_default_preserves_keyword_case() {
+        let settings = AppSettings::default().sql_format;
+        assert_eq!(SqlKeywordCase::Preserve, settings.keyword_case);
+        assert_eq!(SqlIndentStyle::TwoSpaces, settings.indent);
+    }
+
+    #[test]
+    fn sql_format_settings_round_trips_and_tolerates_missing_fields() {
+        let settings = SqlFormatSettings {
+            keyword_case: SqlKeywordCase::Upper,
+            indent: SqlIndentStyle::Tabs,
+            ..SqlFormatSettings::default()
+        };
+        let json = serde_json::to_string(&settings).expect("serialize sql format settings");
+        assert_eq!(r#"{"keyword_case":"upper","indent":"tabs"}"#, json.as_str());
+        assert_eq!(settings, serde_json::from_str(&json).expect("roundtrip"));
+
+        let partial: SqlFormatSettings =
+            serde_json::from_str(r#"{"keyword_case":"lower"}"#).expect("partial deserialize");
+        assert_eq!(
+            SqlFormatSettings {
+                keyword_case: SqlKeywordCase::Lower,
+                indent: SqlIndentStyle::TwoSpaces,
+                ..SqlFormatSettings::default()
+            },
+            partial
+        );
     }
 
     #[test]
@@ -1735,6 +1860,10 @@ mod tests {
         assert!(!settings.mcp.server_enabled);
         assert_eq!(settings.mcp.server_mode, McpServerMode::Temporary);
         assert_eq!(settings.mcp.permission_mode, McpPermissionMode::Deny);
+        assert_eq!(
+            DEFAULT_MCP_APPROVAL_TIMEOUT_MS,
+            settings.mcp.approval_timeout_ms
+        );
         assert!(settings.tool_exposure.mcp.terminal);
         assert!(settings.tool_exposure.mcp.terminal_ssh_exec);
         assert!(settings.tool_exposure.mcp.terminal_exec);
@@ -2030,11 +2159,27 @@ mod tests {
         assert_eq!("en", settings.locale);
         assert!(!settings.mcp.server_enabled);
         assert_eq!(settings.mcp.permission_mode, McpPermissionMode::Deny);
+        assert_eq!(
+            DEFAULT_MCP_APPROVAL_TIMEOUT_MS,
+            settings.mcp.approval_timeout_ms
+        );
         assert!(settings.tool_exposure.mcp.terminal);
         assert!(settings.tool_exposure.mcp.terminal_ssh_exec);
         assert!(settings.tool_exposure.mcp.terminal_exec);
         assert!(settings.tool_exposure.mcp.connections);
         assert!(settings.tool_exposure.agent.database);
+    }
+
+    #[test]
+    fn app_settings_parses_explicit_mcp_approval_timeout() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "mcp": {
+                "approval_timeout_ms": 0
+            }
+        }))
+        .expect("approval_timeout_ms 应能被解析");
+
+        assert_eq!(0, settings.mcp.approval_timeout_ms);
     }
 
     #[test]
@@ -2257,6 +2402,7 @@ mod tests {
         settings.mcp.server_enabled = true;
         settings.mcp.server_mode = McpServerMode::Persistent;
         settings.mcp.permission_mode = McpPermissionMode::Ask;
+        settings.mcp.approval_timeout_ms = 0;
         settings.tool_exposure.mcp.connections = false;
         settings.tool_exposure.mcp.database = true;
         settings.tool_exposure.mcp.redis = true;
@@ -2268,6 +2414,7 @@ mod tests {
         assert!(loaded.mcp.server_enabled);
         assert_eq!(loaded.mcp.server_mode, McpServerMode::Persistent);
         assert_eq!(loaded.mcp.permission_mode, McpPermissionMode::Ask);
+        assert_eq!(0, loaded.mcp.approval_timeout_ms);
         assert!(loaded.tool_exposure.mcp.terminal);
         assert!(loaded.tool_exposure.mcp.terminal_ssh_exec);
         assert!(loaded.tool_exposure.mcp.terminal_exec);
@@ -2278,12 +2425,12 @@ mod tests {
     }
 
     #[test]
-    fn ai_chat_tool_execution_mode_defaults_to_auto() {
+    fn ai_chat_tool_execution_mode_defaults_to_manual() {
         let settings: AppSettings = serde_json::from_value(serde_json::json!({"locale": "zh-CN"}))
             .expect("旧版设置应能反序列化");
 
         assert_eq!(
-            AiChatToolExecutionMode::Auto,
+            AiChatToolExecutionMode::Manual,
             settings.ai_chat.tool_execution_mode
         );
     }

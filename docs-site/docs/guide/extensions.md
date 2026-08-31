@@ -6,13 +6,29 @@
 
 ## 浏览市场与扩展类型
 
-从扩展市场按类型或名称查找组件。数据库驱动增加新的连接类型；ACP Agent 接入外部 Agent；连接导入扩展读取其他应用配置；远程桌面扩展提供 RDP/VNC Provider；语言扩展增加界面语言。
+从扩展市场按类型或名称查找组件，也可使用「有更新」过滤只看有可更新版本的扩展。数据库驱动增加新的连接类型；ACP Agent 接入外部 Agent；连接导入扩展读取其他应用配置；远程桌面扩展提供 RDP/VNC Provider；语言扩展增加界面语言。
 
 市场条目会说明版本、平台和 Navop 兼容范围。某种连接出现在宣传列表中，不代表未安装驱动时即可创建，应先确认相应扩展已启用。
+
+## 官方扩展仓库
+
+第一方扩展在 [navop-extensions](https://github.com/feigeCode/navop-extensions) 仓库独立构建与发布，市场中的官方扩展均来自该仓库。当前目录按类型分组如下：
+
+- **数据库驱动**：DuckDB、Redis、MongoDB（4.2+ / 3.6 / 3.2–3.4 三档）、达梦 DM、金仓 KingbaseES、GBase 8s、OceanBase、openGauss、Apache IoTDB、神通 Oscar，以及免 Oracle Instant Client 的纯 Go Oracle 驱动。
+- **远程桌面 Provider**：RDP、VNC。
+- **ACP Agent**：Codex、Claude Code、OpenCode。
+- **连接导入**：SecureCRT、Xshell、WindTerm、OpenSSH config、Navicat、DBeaver、JetBrains DataGrip、MongoDB Compass、Redis Desktop、TablePlus。
+- **外部编辑器**：Zed、Notepad++、Notepad--。
+- **Notes 渲染与导出**：Mermaid 图、LaTeX 数学公式渲染，HTML / PDF / Word 导出。
+- **语言包**：基于 Tree-sitter 的多语言语法高亮扩展包。
+
+各扩展的平台支持、最低版本与方法契约以市场条目和仓库文档为准；旧版 MongoDB 等面向 EOL 服务器的驱动不承诺支持 SRV、TLS 等新特性。
 
 ## 安装、更新与重载
 
 市场安装前阅读发布者、说明和所需权限。安装完成后按提示重载扩展或重新启动应用；新连接类型和设置项可能只有重载后出现。Navop 会按扩展类型刷新相关能力，并让语言解析器保持按需加载，避免普通扩展变更触发全部语言 WASM 编译。更新前保存工作并阅读变更说明，数据库驱动或 Provider 更新可能改变连接行为。
+
+Navop 启动后会在后台检查扩展市场并与已安装版本对比，发现新版本时弹出通知，可直接跳转到扩展市场查看更新；同一批更新仅提醒一次，确认后不再重复打扰。扩展市场页的「有更新」过滤可只显示可更新扩展。
 
 扩展异常时先尝试禁用、启用或重载，再检查日志和兼容版本。不要在生产任务进行中更新负责当前连接的驱动。
 

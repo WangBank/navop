@@ -6,7 +6,7 @@ Navop 提供 macOS、Windows 和 Linux 桌面版本。安装包、系统架构�
 
 ## 下载并安装
 
-从 [GitHub Releases](https://github.com/feigeCode/navop/releases) 选择最新稳定版。macOS 根据设备选择 Apple Silicon 或 Intel 构建，将应用拖入“应用程序”；Windows 使用对应安装包完成安装；Linux 按发布页提供的格式安装，并确认桌面环境允许启动图形应用。
+从[官网下载中心](https://navop.dev/zh-CN/extensions)选择最新稳定版。macOS 根据设备选择 Apple Silicon 或 Intel 构建，将应用拖入“应用程序”；Windows 使用对应安装包完成安装；Linux 按发布页提供的格式安装，并确认桌面环境允许启动图形应用。
 
 首次启动若被 macOS Gatekeeper 拦截，应先确认安装包来自项目正式发布页，再到“系统设置 → 隐私与安全性”允许打开。Windows 或 Linux 的安全软件提示也应先核对文件来源和版本，不要通过关闭全局安全策略来规避检查。企业设备如受管理员策略管理，请由管理员批准安装。
 
@@ -148,6 +148,17 @@ $env:NAVOP_DATA_DIR = "E:\NavopData"
 
 `NAVOP_PORTABLE` 支持 `1`、`true`、`yes` 或 `on`。数据目录的选择优先级为 `--data-dir`、`--portable`、`NAVOP_DATA_DIR`、`NAVOP_PORTABLE`/`navop.portable`，最后才是常规安装模式。指定的数据目录必须可写；建议使用绝对路径，因为相对路径会按启动 Navop 时的当前工作目录解析。
 
+## Linux Flatpak
+
+Navop 也在 [FlatPark](https://flatpark.org/apps/dev.navop.Navop/) 上架为开发者认可的社区 Flatpak 软件包。添加 FlatPark 软件源并为当前用户安装：
+
+```bash
+flatpak --user remote-add --if-not-exists flatpark https://dl.flatpark.org/flatpark.flatpakrepo
+flatpak --user install flatpark dev.navop.Navop
+```
+
+Flatpak 软件包运行在沙盒中，部分集成功能可能需要授予额外权限。详细说明与问题排查请参阅 [FlatPark 软件包页面](https://flatpark.org/apps/dev.navop.Navop/)。
+
 ## 首次启动与本地权限
 
 启动后先选择界面语言、主题和默认启动页。SSH、SFTP、网络数据库和远程桌面需要访问局域网或互联网；系统弹出本地网络、防火墙或钥匙串权限时，应根据实际连接范围授权。Notes 目录、外部编辑器和自定义字体需要相应文件系统权限。
@@ -168,7 +179,7 @@ MSI、EXE 安装版和普通 ZIP 版可在设置的“更新”区域开启自�
 4. 记录当前 Navop 版本和已安装扩展版本。
 5. 安装更新并重启后，先测试一个低风险连接，再恢复日常工作。
 
-macOS 如果确认安装包来源可信但仍被系统隔离，可以使用项目 README 中的 Gatekeeper 处理命令；不要把关闭系统保护作为长期安装方案。
+macOS 如果确认安装包来源可信但仍被系统隔离，可执行 `sudo xattr -rd com.apple.quarantine /Applications/Navop.app` 后重新打开；不要把关闭系统保护作为长期安装方案。
 
 ## 文件关联与命令行打开
 
