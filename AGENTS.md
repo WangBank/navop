@@ -478,6 +478,34 @@
 - **验证方式**：`cargo check -p ssh`、`cargo test -p ssh`（覆盖 gex 参数开/关、固定 group1 排在 group-exchange 前、以及 fake server 只声明 `DH_GEX_SHA1 + DH_G1_SHA1` 且 `lookup_dh_gex_group` 固定返回 `DH_GROUP1` 时 legacy 开启连接成功、关闭时报 `No common Kex algorithm`）、`cargo clippy -p ssh --all-targets` 无新增警告；再用真机 DMG 分别连接 2048 位组与 1024 位组设备确认 `Key exchange init failed` 消失。
 - **适用范围**：`crates/ssh/src/ssh.rs::build_russh_client_config` / `legacy_gex_params` / `build_client_preferred_algorithms_with_legacy`，以及任何直接构造 `russh::client::Config` 的 legacy 兼容链路。
 
+- **标题**：GPUI deferred 输入面板不要挂在会频繁重绘的业务 View 子树中
+- **触发信号**：Windows 上 Popover/List 搜索框输入时闪烁、字符无法持续输入或 IME/焦点丢失；日志或测试显示列表 `cx.notify()` 会让承载 trigger 的整棵业务 View 进入重绘。
+- **根因 / 约束**：GPUI 的脏标记沿 dispatch tree 祖先链传播；若 deferred/anchored overlay 的 `ListState` 与输入框仍是树行或大型业务 View 的后代，按键通知会重建该业务子树及 overlay。仅稳定 element id、受控 open 或对业务 View 使用 `Entity::cached(...)` 不能建立可靠失效边界，缓存还可能冻结动态内容。
+- **正确做法**：把面板状态提取为独立 `Entity`，由更稳定的页面宿主作为业务 View 的 sibling 渲染；业务行只保留 trigger、静默锚点同步和 `WeakEntity` 调用。面板自己管理 deferred 注册、backdrop、Escape、焦点恢复和连接清理；筛选 `ListState::notify()` 不得直接通知业务树。
+- **验证方式**：真实 GPUI 测试必须通过 `Root` 承载输入组件，覆盖搜索后面板保持打开、过滤结果更新、连接切换和 deferred 注册成对；结构 contract 保证行内不存在 `Popover`/`ListState` 状态且宿主 sibling 接线存在。不要把 sibling 的共同父级 render 次数误当成业务 View 自身被标脏；关键边界是输入状态不再处于业务 View 的 dispatch 子树中。
+- **适用范围**：`crates/db_view` 数据库树筛选，以及任何位于虚拟列表、树行或大型动态 View 中的 GPUI deferred 搜索/输入面板。
+
+- **标题**：MySQL 结果 collation 63 不等于字段一定是二进制
+- **触发信号**：数据库名、表名、字符集、排序规则等文本同时显示为 `0x...`；MySQL 列包的 `character_set()` 为 63，或会话 `@@character_set_results` 为 `binary`。
+- **根因 / 约束**：MySQL 列包中的 `character_set` 实际是 collation id。63 既用于 `BINARY` / `VARBINARY` / `BLOB`，也用于 `character_set_results=binary` 下未转换的文本结果；`BINARY_FLAG` 还可能出现在 `VARCHAR/TEXT ... BINARY` 上，因此任意 SQL 结果仅靠 type、flag、id 或“字节看起来像 UTF-8”都不能无歧义恢复源字段语义与编码。
+- **正确做法**：内置 MySQL 连接认证完成后显式设置 `character_set_results`，默认按服务器版本使用 `utf8mb4` 或旧版 `utf8`，但不要无配置时用 `SET NAMES` 改变 `collation_connection`；用户显式配置 charset/collation 时才执行 `SET NAMES ... [COLLATE ...]`。真实二进制按协议元数据保留 exact-byte sidecar；仍为 collation 63 的模糊结果不得猜编码，直接表查询交给 authoritative schema normalization 将 TEXT 与 BLOB 纠偏。
+- **验证方式**：单测覆盖默认/旧版/显式 charset 初始化命令、63 的模糊结果保留字节、普通 UTF-8/GBK 结果解码及 BINARY/VARBINARY/BLOB sidecar；真实 MySQL 测试检查连接后的 `@@character_set_results` 非 binary，并覆盖 `SET character_set_results=binary` 下模糊文本保持无损、三类二进制列精确字节不变。
+- **适用范围**：`crates/db/src/mysql/connection.rs`、`query_result_normalization.rs`、MySQL 元数据查询、SQL 结果表格及导入导出/比较链路。
+
+- **标题**：Go IPC 扩展不得按 Go 运行时类型判定 MySQL 协议文本/二进制
+- **触发信号**：OceanBase MySQL 模式等 IPC 扩展里，`VARCHAR/TEXT/DECIMAL/DATETIME/JSON` 查询结果全部显示为 `0x...` 二进制，而内置 MySQL 正常。
+- **根因 / 约束**：go-sql-driver/mysql / obconnector-go 把 MySQL 协议的所有字符串家族列扫描为 `[]byte`；共享 `toCell` 若只看 Go 类型，会把全部文本编码成 `CellValue::Bytes`。驱动层 `ColumnTypeDatabaseTypeName()` 已按列 charset 区分 `TEXT/CHAR/VARCHAR` 与 `BLOB/BINARY/VARBINARY`，列声明类型才是权威。
+- **正确做法**：`query/start` 保存每列 `typeKind` 到 `cursorState`，`cursor/fetch` 时 `toCellForKind` 按声明 kind 编码 `[]byte`：text 家族（含 uuid/xml/interval 映射）→ text，decimal/date/time/datetime → 对应文本 kind，json → 解析失败回退 text；binary/unknown 及非 UTF-8 字节一律保留无损 base64 `bytes`（JSON wire 会把非法 UTF-8 替换成 U+FFFD，必须回退而不是强转 string）。移除按内容猜测 JSON 的嗅探，避免内容恰为合法 JSON 的真二进制被误标。
+- **验证方式**：`go vet ./internal/... && go test ./internal/...`；用 `streamingRows` fake driver（可注入 typeNames）覆盖 VARCHAR/DECIMAL/DATETIME/JSON/VARBINARY/BLOB、非 UTF-8 文本、非法 JSON、NULL、UUID；`bash scripts/install-local-drivers.sh oceanbase` 本地安装后连接 OceanBase MySQL 租户验证文本列显示。
+- **适用范围**：`navop-extensions/internal/dbipc/{query,server}.go` 及所有共享 dbipc 的 Go IPC 驱动（oceanbase/dm/kingbase/oracle-go 等）。
+
+- **标题**：终端标准控制键不得被无上下文的全局快捷键占用
+- **触发信号**：`Ctrl+D`、`Ctrl+W` 等按键的终端编码测试正常，但真实终端没有收到 EOT、删词等控制字符，或按键触发了关闭窗口等应用 action。
+- **根因 / 约束**：GPUI 的无上下文全局 `KeyBinding` 可能在终端 `on_key_down` 前分派 action；即使终端键码转换和 PTY 写入正确，冲突按键仍不会到达终端。`Ctrl+D`、`Ctrl+W`、`Ctrl+C`、`Ctrl+Z` 等是 shell/TTY 标准控制键，不适合作为终端聚焦时仍生效的全局默认快捷键。
+- **正确做法**：窗口、页签和面板 action 优先使用不与终端控制字符冲突的组合，或绑定到排除 `TerminalView` 的明确 key context；运行时默认值、设置页展示和可刷新绑定必须使用同一默认来源。
+- **验证方式**：回归测试同时断言全局默认绑定不包含目标控制键、设置页元数据与运行时一致，并运行 `terminal_view` 键码测试确认目标按键仍编码为预期控制字节。
+- **适用范围**：`main/src/onetcli_app.rs`、`main/src/setting_tab.rs`、`crates/terminal_view/src/view/keybindings.rs` 与所有无 context 的 GPUI 全局快捷键。
+
 ### 执行原则
 
 1. 先澄清，再实现；先缩小边界，再扩展范围。
