@@ -5,6 +5,7 @@ use gpui_component::{Icon, IconName, IconSize, Sizable};
 use one_core::storage::{
     ConnectionType, DatabaseType, DbConnectionConfig, SshParams, StoredConnection,
 };
+use rust_i18n::t;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExternalDriverIconSource<'a> {
@@ -25,7 +26,6 @@ enum SshIconSource<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnectionVisualSize {
     Tree,
-    Inline,
     List,
     Card,
     Hero,
@@ -36,9 +36,9 @@ impl ConnectionVisualSize {
     pub(crate) const fn icon_size(self) -> IconSize {
         match self {
             Self::Tree => IconSize::Default,
-            Self::Inline | Self::Rail => IconSize::Medium,
+            Self::Rail => IconSize::Medium,
             Self::List => IconSize::Large,
-            Self::Card => IconSize::Display,
+            Self::Card => IconSize::Large,
             Self::Hero => IconSize::Hero,
         }
     }
@@ -51,26 +51,32 @@ const fn connection_type_icon_name(kind: ConnectionType) -> IconName {
         ConnectionType::SshSftp => IconName::TerminalColor,
         ConnectionType::Redis => IconName::Redis,
         ConnectionType::MongoDB => IconName::MongoDB,
+        // 品牌 SVG 图标,见 connection_type_icon 的特判分支
+        ConnectionType::Mqtt => IconName::Network,
         ConnectionType::Serial => IconName::SerialPort,
         ConnectionType::Telnet => IconName::SquareTerminalColor,
         ConnectionType::PortForwarding => IconName::PortForwardingColor,
         ConnectionType::Rdp => IconName::Rdp,
         ConnectionType::Vnc => IconName::Vnc,
+        ConnectionType::Extension => IconName::ExtensionsColor,
     }
 }
 
 const fn connection_type_navigation_icon_name(kind: ConnectionType) -> IconName {
     match kind {
-        ConnectionType::All => IconName::ServerLine,
+        ConnectionType::All => IconName::Asterisk,
         ConnectionType::Database => IconName::DatabaseLine,
         ConnectionType::SshSftp => IconName::TerminalLine,
         ConnectionType::Redis => IconName::RedisLine,
         ConnectionType::MongoDB => IconName::MongoDBLine,
+        // 品牌 SVG 图标,见 connection_type_navigation_icon 的特判分支
+        ConnectionType::Mqtt => IconName::Network,
         ConnectionType::Serial => IconName::SerialLine,
         ConnectionType::Telnet => IconName::SquareTerminal,
         ConnectionType::PortForwarding => IconName::PortForwardingLine,
         ConnectionType::Rdp => IconName::RdpLine,
         ConnectionType::Vnc => IconName::VncLine,
+        ConnectionType::Extension => IconName::ExtensionsLine,
     }
 }
 
@@ -79,6 +85,13 @@ pub(crate) fn connection_type_navigation_icon(
     kind: ConnectionType,
     size: ConnectionVisualSize,
 ) -> Icon {
+    // MQTT 品牌线条图标经应用 AssetSource 提供
+    if kind == ConnectionType::Mqtt {
+        return Icon::default()
+            .path(one_core::storage::NAVOP_MQTT_LINE_ICON)
+            .mono()
+            .with_size(size.icon_size());
+    }
     connection_type_navigation_icon_name(kind)
         .mono()
         .with_size(size.icon_size())
@@ -89,14 +102,47 @@ pub(crate) fn connection_type_rail_icon(kind: ConnectionType) -> Icon {
     connection_type_navigation_icon(kind, ConnectionVisualSize::Rail)
 }
 
+/// Localized connection-type label (筛选器/菜单共用；core 的 `label()` 只有英文)。
+pub(crate) fn connection_type_label(kind: ConnectionType) -> String {
+    match kind {
+        ConnectionType::All => t!("ConnectionType.all"),
+        ConnectionType::Database => t!("ConnectionType.database"),
+        ConnectionType::SshSftp => t!("ConnectionType.ssh_sftp"),
+        ConnectionType::Redis => t!("ConnectionType.redis"),
+        ConnectionType::MongoDB => t!("ConnectionType.mongodb"),
+        ConnectionType::Mqtt => t!("ConnectionType.mqtt"),
+        ConnectionType::Serial => t!("ConnectionType.serial"),
+        ConnectionType::Telnet => t!("ConnectionType.telnet"),
+        ConnectionType::PortForwarding => t!("ConnectionType.port_forwarding"),
+        ConnectionType::Rdp => t!("ConnectionType.rdp"),
+        ConnectionType::Vnc => t!("ConnectionType.vnc"),
+        ConnectionType::Extension => t!("ConnectionType.extension"),
+    }
+    .to_string()
+}
+
 /// Original-color protocol identity icon used by cards, lists, and connection pickers.
 pub(crate) fn connection_type_icon(kind: ConnectionType, size: ConnectionVisualSize) -> Icon {
+    // MQTT 品牌图标经应用 AssetSource 提供(外部 IconName 无此变体)
+    if kind == ConnectionType::Mqtt {
+        return Icon::default()
+            .path(one_core::storage::NAVOP_MQTT_COLOR_ICON)
+            .color()
+            .with_size(size.icon_size());
+    }
     connection_type_icon_name(kind)
         .color()
         .with_size(size.icon_size())
 }
 
 pub(crate) fn database_type_icon(kind: &DatabaseType, size: ConnectionVisualSize) -> Icon {
+    // TDengine 品牌图标经应用 AssetSource 提供(外部 IconName 无此变体)
+    if matches!(kind, DatabaseType::TDengine) {
+        return Icon::default()
+            .path(one_core::storage::NAVOP_TDENGINE_COLOR_ICON)
+            .color()
+            .with_size(size.icon_size());
+    }
     let name = match kind {
         DatabaseType::MySQL => IconName::MySQLColor,
         DatabaseType::PostgreSQL => IconName::PostgreSQLColor,
@@ -105,6 +151,8 @@ pub(crate) fn database_type_icon(kind: &DatabaseType, size: ConnectionVisualSize
         DatabaseType::MSSQL => IconName::MSSQLColor,
         DatabaseType::Oracle => IconName::OracleColor,
         DatabaseType::ClickHouse => IconName::ClickHouseColor,
+        // 上方提前返回,此处仅为穷尽匹配
+        DatabaseType::TDengine => return generic_database_icon(size),
         DatabaseType::External { .. } => return generic_database_icon(size),
     };
     name.color().with_size(size.icon_size())
@@ -214,9 +262,8 @@ mod tests {
     #[test]
     fn semantic_connection_sizes_map_to_the_shared_icon_scale() {
         assert_eq!(ConnectionVisualSize::Tree.icon_size(), IconSize::Default);
-        assert_eq!(ConnectionVisualSize::Inline.icon_size(), IconSize::Medium);
         assert_eq!(ConnectionVisualSize::List.icon_size(), IconSize::Large);
-        assert_eq!(ConnectionVisualSize::Card.icon_size(), IconSize::Display);
+        assert_eq!(ConnectionVisualSize::Card.icon_size(), IconSize::Large);
         assert_eq!(ConnectionVisualSize::Hero.icon_size(), IconSize::Hero);
         assert_eq!(ConnectionVisualSize::Rail.icon_size(), IconSize::Medium);
     }
@@ -247,7 +294,7 @@ mod tests {
     #[test]
     fn connection_navigation_icons_map_to_monochrome_line_assets() {
         let expected = [
-            (ConnectionType::All, IconName::ServerLine),
+            (ConnectionType::All, IconName::Asterisk),
             (ConnectionType::Database, IconName::DatabaseLine),
             (ConnectionType::SshSftp, IconName::TerminalLine),
             (ConnectionType::Redis, IconName::RedisLine),

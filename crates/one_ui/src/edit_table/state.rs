@@ -24,7 +24,7 @@ use gpui_component::{
     VirtualListScrollHandle, h_flex,
     input::{IndentInline, OutdentInline},
     menu::{ContextMenuExt, PopupMenu},
-    scroll::{ScrollableMask, Scrollbar},
+    scroll::{ScrollableMask, Scrollbar, ScrollbarShow},
     v_flex,
 };
 use rust_i18n::t;
@@ -45,6 +45,19 @@ fn selected_delegate_column_range(
     let first_data_col = min_col.max(row_number_offset);
     (first_data_col <= max_col)
         .then(|| first_data_col - row_number_offset..=max_col - row_number_offset)
+}
+
+fn batch_edit_changes(
+    cells: impl IntoIterator<Item = CellCoord>,
+    value: String,
+    row_number_offset: usize,
+) -> Vec<(usize, usize, String)> {
+    cells
+        .into_iter()
+        .filter_map(|(row, col)| {
+            (col >= row_number_offset).then(|| (row, col - row_number_offset, value.clone()))
+        })
+        .collect()
 }
 
 const SCROLLBAR_WIDTH: Pixels = px(16.);
@@ -168,6 +181,7 @@ pub struct EditTableState<D: EditTableDelegate> {
     selected_row: Option<usize>,
     selection_state: SelectionState,
     right_clicked_row: Option<usize>,
+    right_clicked_col: Option<usize>,
     selected_col: Option<usize>,
     selected_cell: Option<(usize, usize)>,
     resizing_col: Option<usize>,
@@ -212,6 +226,7 @@ where
             selection_state: SelectionState::Row,
             selected_row: None,
             right_clicked_row: None,
+            right_clicked_col: None,
             selected_col: None,
             selected_cell: None,
             resizing_col: None,
@@ -1109,6 +1124,7 @@ where
         _: &mut Context<Self>,
     ) {
         self.right_clicked_row = Some(row_ix);
+        self.right_clicked_col = None;
     }
 
     fn on_row_left_click(
@@ -1220,6 +1236,9 @@ where
         if self.editing_cell == Some((row_ix, col_ix)) {
             return;
         }
+        if !self.selection.contains(row_ix, col_ix) {
+            self.select_cell(row_ix, col_ix, cx);
+        }
         let delegate_col_ix = if self.delegate.row_number_enabled(cx) {
             col_ix.saturating_sub(1)
         } else {
@@ -1253,9 +1272,19 @@ where
                 .map(|editor| editor.get_value(cx))
                 .unwrap_or_default();
 
-            let accepted =
+            let selected_cells = self.selection.all_cells();
+            let accepted = if selected_cells.len() > 1 {
+                let row_number_offset = if self.delegate.row_number_enabled(cx) {
+                    1
+                } else {
+                    0
+                };
+                let changes = batch_edit_changes(selected_cells, new_value, row_number_offset);
+                self.delegate.set_cell_values(changes, window, cx)
+            } else {
                 self.delegate
-                    .on_cell_edited(row_ix, delegate_col_ix, new_value, window, cx);
+                    .on_cell_edited(row_ix, delegate_col_ix, new_value, window, cx)
+            };
             if accepted {
                 cx.emit(EditTableEvent::CellEdited(row_ix, col_ix));
             }
@@ -2054,12 +2083,13 @@ where
     }
 
     fn render_cell(
-        &self,
+        &mut self,
         col_ix: usize,
         row_ix: Option<usize>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        let cell_font = self.delegate.cell_font(cx);
         let Some(col_group) = self.col_groups.get(col_ix) else {
             return div().id("empty-cell");
         };
@@ -2140,6 +2170,7 @@ where
             .flex_shrink_0()
             .overflow_hidden()
             .whitespace_nowrap()
+            .when_some(cell_font, |this, font| this.font(font))
             .when(show_column_separator, |this| {
                 this.child(
                     div()
@@ -2514,7 +2545,7 @@ where
             Popover::new(("filter-popover", col_ix))
                 .trigger(
                     Button::new(("filter-btn", col_ix))
-                        .icon(IconName::Filter)
+                        .icon(IconName::Search)
                         .ghost()
                         .with_size(Size::XSmall)
                         .when(is_filtered, |this| this.primary()),
@@ -2630,7 +2661,11 @@ where
 
     fn render_th(&mut self, col_ix: usize, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let entity_id = cx.entity_id();
-        let col_group = self.col_groups.get(col_ix).expect("BUG: invalid col index");
+        let col_group = self
+            .col_groups
+            .get(col_ix)
+            .expect("BUG: invalid col index")
+            .clone();
 
         let is_row_number_col = self.delegate.row_number_enabled(cx) && col_ix == 0;
         let movable = self.col_movable && col_group.column.movable && !is_row_number_col;
@@ -2641,6 +2676,7 @@ where
         } else {
             col_ix
         };
+        let delegate_col_ix_menu = delegate_col_ix;
 
         h_flex()
             .h_full()
@@ -2650,6 +2686,14 @@ where
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.on_col_head_click(col_ix, window, cx);
                     }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, _, _, _| {
+                            this.right_clicked_col =
+                                (!is_row_number_col).then_some(delegate_col_ix_menu);
+                            this.right_clicked_row = None;
+                        }),
+                    )
                     .child(
                         h_flex()
                             .size_full()
@@ -3046,7 +3090,11 @@ where
                 .right_0()
                 .bottom_0()
                 .w(SCROLLBAR_WIDTH)
-                .child(Scrollbar::vertical(&self.vertical_scroll_handle)),
+                .child(
+                    Scrollbar::vertical(&self.vertical_scroll_handle)
+                        .scrollbar_show(ScrollbarShow::Always)
+                        .viewport_from_layout(),
+                ),
         )
     }
 
@@ -3062,7 +3110,11 @@ where
             .right_0()
             .bottom_0()
             .h(SCROLLBAR_WIDTH)
-            .child(Scrollbar::horizontal(&self.horizontal_scroll_handle))
+            .child(
+                Scrollbar::horizontal(&self.horizontal_scroll_handle)
+                    .scrollbar_show(ScrollbarShow::Always)
+                    .viewport_from_layout(),
+            )
     }
 }
 
@@ -3137,6 +3189,42 @@ mod tests {
 
         assert_eq!(vec![0, 1, 2], columns);
         assert_eq!(None, selected_delegate_column_range(0, 0, 1));
+    }
+
+    #[test]
+    fn batch_edit_applies_the_same_value_to_every_selected_data_cell() {
+        let changes = batch_edit_changes([(2, 1), (3, 1), (4, 1)], "active".to_string(), 1);
+
+        assert_eq!(
+            vec![
+                (2, 0, "active".to_string()),
+                (3, 0, "active".to_string()),
+                (4, 0, "active".to_string()),
+            ],
+            changes
+        );
+    }
+
+    #[test]
+    fn batch_edit_skips_row_number_cells_and_maps_data_columns() {
+        let changes = batch_edit_changes([(1, 0), (1, 1), (1, 3)], "7".to_string(), 1);
+
+        assert_eq!(
+            vec![(1, 0, "7".to_string()), (1, 2, "7".to_string())],
+            changes
+        );
+    }
+
+    #[test]
+    fn table_scrollbars_use_their_overlay_layout_as_viewport() {
+        let source = include_str!("state.rs");
+
+        assert!(source.contains(
+            "Scrollbar::vertical(&self.vertical_scroll_handle)\n                        .scrollbar_show(ScrollbarShow::Always)\n                        .viewport_from_layout()"
+        ));
+        assert!(source.contains(
+            "Scrollbar::horizontal(&self.horizontal_scroll_handle)\n                    .scrollbar_show(ScrollbarShow::Always)\n                    .viewport_from_layout()"
+        ));
     }
 }
 
@@ -3220,12 +3308,19 @@ where
             .context_menu({
                 let view = cx.entity().clone();
                 move |this, window: &mut Window, cx: &mut Context<PopupMenu>| {
-                    if let Some(row_ix) = view.read(cx).right_clicked_row {
-                        view.update(cx, |menu, cx| {
+                    let (right_clicked_row, right_clicked_col) = {
+                        let state = view.read(cx);
+                        (state.right_clicked_row, state.right_clicked_col)
+                    };
+                    match (right_clicked_row, right_clicked_col) {
+                        (Some(row_ix), _) => view.update(cx, |menu, cx| {
                             menu.delegate_mut().context_menu(row_ix, this, window, cx)
-                        })
-                    } else {
-                        this
+                        }),
+                        (None, Some(col_ix)) => view.update(cx, |menu, cx| {
+                            menu.delegate_mut()
+                                .header_context_menu(col_ix, this, window, cx)
+                        }),
+                        (None, None) => this,
                     }
                 }
             })

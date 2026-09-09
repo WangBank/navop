@@ -407,6 +407,10 @@ fn connection_endpoint(connection: &StoredConnection) -> Option<String> {
             .ok()
             .map(|params| format!("{}:{}/{}", params.host, params.port, params.db_index)),
         ConnectionType::MongoDB => mongodb_endpoint(connection),
+        ConnectionType::Mqtt => connection
+            .to_mqtt_params()
+            .ok()
+            .map(|params| format!("{}:{}", params.host, params.port)),
         ConnectionType::Serial => connection
             .to_serial_params()
             .ok()
@@ -929,10 +933,13 @@ fn personal_sync_status_from_task(
     result: Result<Result<(), SyncStoreError>, tokio::task::JoinError>,
 ) -> PersonalSyncRuntimeStatus {
     match result {
-        Ok(Ok(())) => PersonalSyncRuntimeStatus::Ready {
-            health: SyncStoreHealth::Ready,
-            message: None,
-        },
+        Ok(Ok(())) => {
+            crate::personal_sync_status::note_sync_completed();
+            PersonalSyncRuntimeStatus::Ready {
+                health: SyncStoreHealth::Ready,
+                message: None,
+            }
+        }
         Ok(Err(error)) => PersonalSyncRuntimeStatus::from_error(error),
         Err(error) => PersonalSyncRuntimeStatus::failed(&error.to_string()),
     }

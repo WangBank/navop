@@ -1,7 +1,7 @@
 use crate::file_policy::{
-    EditorMode, FilePolicy, MAX_EDITABLE_FILE_SIZE, decode_text_content, determine_file_policy,
+    EditorMode, FilePolicy, decode_text_content, determine_file_policy_with_limit,
 };
-use crate::language::language_for_path;
+use crate::language::load_language_for_path;
 use crate::{
     CloseIntercept, RemoteMutationCallback, active_index_after_close, active_index_after_open,
     decide_close_intercept,
@@ -14,7 +14,7 @@ use gpui_component::{
     ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, Size, WindowExt,
     button::Button,
     h_flex,
-    input::{Input, InputEvent, InputState, Search},
+    input::{Editor, EditorState, InputEvent},
     notification::Notification,
     tab::{Tab, TabBar},
     v_flex,
@@ -261,7 +261,7 @@ struct RemoteEditorTab {
     id: u64,
     remote_path: String,
     display_name: String,
-    editor: Option<Entity<InputState>>,
+    editor: Option<Entity<EditorState>>,
     subscriptions: Vec<gpui::Subscription>,
     saved_text: String,
     file_size: usize,
@@ -422,17 +422,18 @@ impl RemoteFileEditorWindow {
         let remote_path = tab.remote_path.clone();
         let task_remote_path = remote_path.clone();
         let client = self.client.clone();
+        let max_bytes = one_core::settings::AppSettings::current(cx)
+            .remote_file_editor
+            .max_file_size_bytes();
         let task = Tokio::spawn(cx, async move {
             let bytes = {
                 let mut client = client.lock().await;
-                client
-                    .read_file(&task_remote_path, MAX_EDITABLE_FILE_SIZE)
-                    .await?
+                client.read_file(&task_remote_path, max_bytes).await?
             };
             let file_size = bytes.len();
-            let policy = determine_file_policy(file_size)?;
+            let policy = determine_file_policy_with_limit(file_size, max_bytes)?;
             let text = decode_text_content(&bytes)?;
-            let language = language_for_path(&task_remote_path, policy.is_large_file);
+            let language = load_language_for_path(&task_remote_path, policy.is_large_file)?;
             Ok::<_, anyhow::Error>(LoadedFile {
                 text,
                 policy,
@@ -491,8 +492,8 @@ impl RemoteFileEditorWindow {
         let initial_text = text.clone();
         let soft_wrap = tab.soft_wrap;
         let editor = cx.new(|cx| {
-            let mut state = InputState::new(window, cx)
-                .code_editor(language)
+            let mut state = EditorState::new(window, cx)
+                .language(language)
                 .line_number(true)
                 .searchable(true)
                 .soft_wrap(soft_wrap);
@@ -510,7 +511,7 @@ impl RemoteFileEditorWindow {
         );
 
         if index == self.active_tab {
-            editor.update(cx, |state: &mut InputState, cx| {
+            editor.update(cx, |state: &mut EditorState, cx| {
                 state.focus(window, cx);
             });
         }
@@ -833,8 +834,14 @@ impl RemoteFileEditorWindow {
     }
 
     fn trigger_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.focus_editor(window, cx);
-        window.dispatch_action(Box::new(Search), cx);
+        let Some(editor) = self.active_tab().and_then(|tab| tab.editor.as_ref()) else {
+            return;
+        };
+
+        editor.update(cx, |state, cx| {
+            state.focus(window, cx);
+            state.open_search(false, cx);
+        });
     }
 
     fn on_action_open_search(
@@ -861,7 +868,8 @@ impl RemoteFileEditorWindow {
         };
 
         editor.update(cx, |state, cx| {
-            state.open_search_and_replace(window, cx);
+            state.focus(window, cx);
+            state.open_search(true, cx);
         });
     }
 
@@ -1130,7 +1138,7 @@ impl RemoteFileEditorWindow {
         match tab.editor.as_ref() {
             Some(editor) => v_flex()
                 .size_full()
-                .child(Input::new(editor).size_full())
+                .child(Editor::new(editor).size_full())
                 .into_any_element(),
             None => v_flex().size_full().into_any_element(),
         }

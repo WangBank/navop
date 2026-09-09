@@ -7,7 +7,6 @@ mod kind;
 mod language_bundle_provider;
 mod language_provider;
 pub mod manifest;
-mod mcp_helper_provider;
 mod provider;
 mod remote_desktop_provider;
 mod summary;
@@ -21,7 +20,6 @@ pub use database_driver_provider::DatabaseDriverExtensionProvider;
 pub use kind::ExtensionKind;
 pub use language_bundle_provider::LanguageBundleExtensionProvider;
 pub use language_provider::LanguageExtensionProvider;
-pub use mcp_helper_provider::McpHelperExtensionProvider;
 pub use provider::{ExtensionProvider, ExtensionRegistry, init_global};
 pub use remote_desktop_provider::RemoteDesktopProviderExtensionProvider;
 pub use summary::ExtensionSummary;
@@ -30,8 +28,10 @@ use std::{path::PathBuf, sync::Arc};
 
 use db_view::extension_menu::DbTreeExtensionMenuRegistry;
 use gpui::{App, BorrowAppContext};
-use gpui_component::highlighter::{
-    LanguageRegistry, LoadReport, load_extensions_dir, register_extension_manifests_dir,
+use gpui_component::highlighter::LanguageRegistry;
+
+use crate::language_extensions::{
+    LoadReport, load_extensions_dir, register_extension_manifests_dir,
 };
 
 pub fn init(cx: &mut App) {
@@ -53,7 +53,6 @@ pub fn builtin_registry(extensions_root: PathBuf) -> ExtensionRegistry {
     registry.register_provider(Arc::new(LanguageBundleExtensionProvider));
     registry.register_provider(Arc::new(DatabaseDriverExtensionProvider));
     registry.register_provider(Arc::new(RemoteDesktopProviderExtensionProvider));
-    registry.register_provider(Arc::new(McpHelperExtensionProvider));
     registry.register_provider(Arc::new(AcpAgentExtensionProvider));
     registry.register_provider(Arc::new(CompositeExtensionProvider));
     registry
@@ -79,10 +78,7 @@ pub fn load_language_extensions_from_root(root: &std::path::Path) -> anyhow::Res
 pub fn register_language_extension_manifests_from_root(
     root: &std::path::Path,
 ) -> anyhow::Result<LoadReport> {
-    register_extension_manifests_dir(
-        &root.join(ExtensionKind::Language.dir_name()),
-        LanguageRegistry::singleton(),
-    )
+    register_extension_manifests_dir(&root.join(ExtensionKind::Language.dir_name()))
 }
 
 fn register_language_extension_manifests(root: &std::path::Path) {
@@ -140,7 +136,5 @@ fn load_db_tree_extension_menu_registry(
 
 #[cfg(test)]
 mod composite_provider_tests;
-#[cfg(test)]
-mod mcp_helper_provider_tests;
 #[cfg(test)]
 mod provider_tests;

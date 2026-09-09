@@ -231,6 +231,10 @@ fn window_controls_follow_the_active_theme_for_contrast() {
     assert!(controls.contains("cx.theme().secondary_hover"));
     assert!(controls.contains("cx.theme().secondary_active"));
     assert!(controls.contains("cx.theme().danger"));
+    assert!(
+        controls.contains("Icon::new(icon).mono().with_size(Size::Small)"),
+        "caption SVGs contain fixed black fills and must use theme-tinted monochrome rendering"
+    );
     assert!(!controls.contains(".text_color(gpui::white())"));
 
     let always_on_top = &source[controls_end..];
@@ -319,7 +323,7 @@ fn sidebar_shell_uses_shared_header_geometry_and_resize_tokens() {
 
     assert!(source.contains("PanelHeader::new(header_id)"));
     assert!(source.contains(".variant(PanelHeaderVariant::Sidebar)"));
-    assert!(source.contains(".with_size(IconSize::Default)"));
+    assert!(source.contains(".with_size(IconSize::Small)"));
 
     assert!(source.contains("layout.utility_panel_default"));
     assert!(source.contains("layout.utility_panel_min"));

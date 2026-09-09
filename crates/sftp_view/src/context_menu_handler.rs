@@ -9,7 +9,8 @@ use crate::{
     join_remote_path, remote_extract_has_conflict,
 };
 use gpui::{
-    AppContext, ClipboardItem, Context, ParentElement, PathPromptOptions, Styled, Window, div, px,
+    App, AppContext, ClipboardItem, Context, ParentElement, PathPromptOptions, Styled, Window, div,
+    px,
 };
 use gpui_component::{
     WindowExt,
@@ -536,10 +537,11 @@ impl ContextMenuHandler for SftpView {
                 .confirm()
                 .button_props(
                     DialogButtonProps::default()
+                        .show_cancel(true)
                         .ok_text(t!("Common.create").to_string())
                         .cancel_text(t!("Common.cancel").to_string()),
                 )
-                .on_ok(move |_, window, cx| {
+                .on_ok(move |_, window, cx: &mut App| {
                     let file_name = input_for_callback.read(cx).text().to_string();
                     if file_name.is_empty() {
                         return false;
@@ -665,10 +667,11 @@ impl ContextMenuHandler for SftpView {
                 .confirm()
                 .button_props(
                     DialogButtonProps::default()
+                        .show_cancel(true)
                         .ok_text(t!("Common.rename").to_string())
                         .cancel_text(t!("Common.cancel").to_string()),
                 )
-                .on_ok(move |_, window, cx| {
+                .on_ok(move |_, window, cx: &mut App| {
                     let new_name = input_for_callback.read(cx).text().to_string();
                     if new_name.is_empty() {
                         return false;
@@ -809,10 +812,11 @@ impl ContextMenuHandler for SftpView {
                 .confirm()
                 .button_props(
                     DialogButtonProps::default()
+                        .show_cancel(true)
                         .ok_text(t!("Common.modify").to_string())
                         .cancel_text(t!("Common.cancel").to_string()),
                 )
-                .on_ok(move |_, window, cx| {
+                .on_ok(move |_, window, cx: &mut App| {
                     let perm_str = input_for_callback.read(cx).text().to_string();
                     if perm_str.is_empty() {
                         return false;
@@ -1128,7 +1132,6 @@ impl ContextMenuHandler for SftpView {
             cx,
         );
         self.active_extract = Some(ActiveExtract { background_task });
-        self.show_background_tasks(cx);
         cx.notify();
 
         let session_manager = Arc::new(SshSessionManager::new(self.sftp_config.clone()));

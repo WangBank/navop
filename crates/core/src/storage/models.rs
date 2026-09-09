@@ -8,15 +8,21 @@ use gpui_component::Size::Large;
 use gpui_component::{Icon, IconName, Sizable};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use super::rdp_settings::RdpSettings;
 
 /// 活跃连接状态 - 用于跟踪哪些连接当前已打开
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ActiveConnections {
-    active_ids: HashSet<i64>,
+    active_ids: Arc<Mutex<HashSet<i64>>>,
+}
+
+pub struct ActiveConnectionLease {
+    active_ids: Arc<Mutex<HashSet<i64>>>,
+    conn_id: i64,
 }
 
 impl Global for ActiveConnections {}
@@ -24,24 +30,52 @@ impl Global for ActiveConnections {}
 impl ActiveConnections {
     pub fn new() -> Self {
         Self {
-            active_ids: HashSet::new(),
+            active_ids: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
     pub fn add(&mut self, conn_id: i64) {
-        self.active_ids.insert(conn_id);
+        self.active_ids
+            .lock()
+            .expect("active connections poisoned")
+            .insert(conn_id);
     }
 
     pub fn remove(&mut self, conn_id: i64) {
-        self.active_ids.remove(&conn_id);
+        self.active_ids
+            .lock()
+            .expect("active connections poisoned")
+            .remove(&conn_id);
     }
 
     pub fn is_active(&self, conn_id: i64) -> bool {
-        self.active_ids.contains(&conn_id)
+        self.active_ids
+            .lock()
+            .expect("active connections poisoned")
+            .contains(&conn_id)
     }
 
     pub fn active_count(&self) -> usize {
-        self.active_ids.len()
+        self.active_ids
+            .lock()
+            .expect("active connections poisoned")
+            .len()
+    }
+
+    pub fn lease(&mut self, conn_id: i64) -> ActiveConnectionLease {
+        self.add(conn_id);
+        ActiveConnectionLease {
+            active_ids: Arc::clone(&self.active_ids),
+            conn_id,
+        }
+    }
+}
+
+impl Drop for ActiveConnectionLease {
+    fn drop(&mut self) {
+        if let Ok(mut active_ids) = self.active_ids.lock() {
+            active_ids.remove(&self.conn_id);
+        }
     }
 }
 
@@ -52,11 +86,13 @@ pub enum ConnectionType {
     SshSftp,
     Redis,
     MongoDB,
+    Mqtt,
     Serial,
     Telnet,
     PortForwarding,
     Rdp,
     Vnc,
+    Extension,
 }
 
 impl fmt::Display for ConnectionType {
@@ -67,11 +103,13 @@ impl fmt::Display for ConnectionType {
             ConnectionType::SshSftp => "SshSftp",
             ConnectionType::Redis => "Redis",
             ConnectionType::MongoDB => "MongoDB",
+            ConnectionType::Mqtt => "Mqtt",
             ConnectionType::Serial => "Serial",
             ConnectionType::Telnet => "Telnet",
             ConnectionType::PortForwarding => "PortForwarding",
             ConnectionType::Rdp => "Rdp",
             ConnectionType::Vnc => "Vnc",
+            ConnectionType::Extension => "Extension",
         };
         write!(f, "{}", s)
     }
@@ -85,11 +123,13 @@ impl ConnectionType {
             ConnectionType::Database,
             ConnectionType::Redis,
             ConnectionType::MongoDB,
+            ConnectionType::Mqtt,
             ConnectionType::Serial,
             ConnectionType::Telnet,
             ConnectionType::PortForwarding,
             ConnectionType::Rdp,
             ConnectionType::Vnc,
+            ConnectionType::Extension,
         ]
     }
     pub fn from_str(s: &str) -> Self {
@@ -98,11 +138,13 @@ impl ConnectionType {
             "SshSftp" => ConnectionType::SshSftp,
             "Redis" => ConnectionType::Redis,
             "MongoDB" => ConnectionType::MongoDB,
+            "Mqtt" => ConnectionType::Mqtt,
             "Serial" => ConnectionType::Serial,
             "Telnet" => ConnectionType::Telnet,
             "PortForwarding" => ConnectionType::PortForwarding,
             "Rdp" => ConnectionType::Rdp,
             "Vnc" => ConnectionType::Vnc,
+            "Extension" => ConnectionType::Extension,
             _ => ConnectionType::Database,
         }
     }
@@ -114,11 +156,13 @@ impl ConnectionType {
             ConnectionType::SshSftp => "SSH/SFTP",
             ConnectionType::Redis => "Redis",
             ConnectionType::MongoDB => "MongoDB",
+            ConnectionType::Mqtt => "MQTT",
             ConnectionType::Serial => "Serial",
             ConnectionType::Telnet => "Telnet",
             ConnectionType::PortForwarding => "Port Forwarding",
             ConnectionType::Rdp => "RDP",
             ConnectionType::Vnc => "VNC",
+            ConnectionType::Extension => "Extension",
         }
     }
 
@@ -129,14 +173,30 @@ impl ConnectionType {
             ConnectionType::SshSftp => IconName::TerminalColor,
             ConnectionType::Redis => IconName::Redis,
             ConnectionType::MongoDB => IconName::MongoDB,
+            // 外部 gpui-component 未提供 MQTT 品牌图标,
+            // 核心层回退通用网络图标;品牌图标经应用 AssetSource 提供
+            ConnectionType::Mqtt => IconName::Network,
             ConnectionType::Serial => IconName::SerialPort,
             ConnectionType::Telnet => IconName::SquareTerminalColor,
             ConnectionType::PortForwarding => IconName::PortForwardingColor,
             ConnectionType::Rdp => IconName::Rdp,
             ConnectionType::Vnc => IconName::Vnc,
+            ConnectionType::Extension => IconName::ExtensionsColor,
         }
     }
 }
+
+/// Navop 自带品牌图标的资源路径。
+///
+/// 外部 gpui-component 的 `IconName` 由其资产宏生成,无法在本仓库扩展变体;
+/// TDengine/MQTT 品牌图标以 SVG 形式内嵌于应用(main 的 `AppAssets`),
+/// 通过 `Icon::default().path(...)` 按路径引用。
+pub const NAVOP_TDENGINE_COLOR_ICON: &str = "navop/tdengine-color.svg";
+pub const NAVOP_TDENGINE_LINE_COLOR_ICON: &str = "navop/tdengine-line-color.svg";
+pub const NAVOP_MQTT_COLOR_ICON: &str = "navop/mqtt-color.svg";
+pub const NAVOP_MQTT_LINE_ICON: &str = "navop/mqtt-line.svg";
+/// 后台任务入口的任务语义图标（待办清单 + 勾选），内嵌于应用 AssetSource。
+pub const NAVOP_BACKGROUND_TASK_ICON: &str = "navop/background-task.svg";
 
 /// Database type enumeration
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -148,7 +208,11 @@ pub enum DatabaseType {
     MSSQL,
     Oracle,
     ClickHouse,
-    External { driver_id: String },
+    /// TDengine 时序数据库(官方 taos ws 驱动,经 taosAdapter 连接)
+    TDengine,
+    External {
+        driver_id: String,
+    },
 }
 
 impl DatabaseType {
@@ -165,6 +229,7 @@ impl DatabaseType {
             DatabaseType::MSSQL,
             DatabaseType::Oracle,
             DatabaseType::ClickHouse,
+            DatabaseType::TDengine,
         ]
     }
 
@@ -194,6 +259,7 @@ impl DatabaseType {
             DatabaseType::MSSQL => "MSSQL",
             DatabaseType::Oracle => "Oracle",
             DatabaseType::ClickHouse => "ClickHouse",
+            DatabaseType::TDengine => "TDengine",
             DatabaseType::External { .. } => "External",
         }
     }
@@ -229,6 +295,7 @@ impl DatabaseType {
             "MSSQL" => Some(DatabaseType::MSSQL),
             "Oracle" => Some(DatabaseType::Oracle),
             "ClickHouse" => Some(DatabaseType::ClickHouse),
+            "TDengine" => Some(DatabaseType::TDengine),
             _ => None,
         }
     }
@@ -242,6 +309,10 @@ impl DatabaseType {
             DatabaseType::MSSQL => IconName::MSSQLColor.color().with_size(Large),
             DatabaseType::Oracle => IconName::OracleColor.color().with_size(Large),
             DatabaseType::ClickHouse => IconName::ClickHouseColor.color().with_size(Large),
+            DatabaseType::TDengine => Icon::default()
+                .path(NAVOP_TDENGINE_COLOR_ICON)
+                .color()
+                .with_size(Large),
             DatabaseType::External { .. } => IconName::Database.color().with_size(Large),
         }
     }
@@ -254,6 +325,10 @@ impl DatabaseType {
             DatabaseType::MSSQL => IconName::MSSQLLineColor.color().with_size(Large),
             DatabaseType::Oracle => IconName::OracleLineColor.color().with_size(Large),
             DatabaseType::ClickHouse => IconName::ClickHouseLineColor.color().with_size(Large),
+            DatabaseType::TDengine => Icon::default()
+                .path(NAVOP_TDENGINE_LINE_COLOR_ICON)
+                .color()
+                .with_size(Large),
             DatabaseType::External { .. } => IconName::Database.color().with_size(Large),
         }
     }
@@ -981,6 +1056,175 @@ impl MongoDBParams {
     }
 }
 
+pub type MqttSshTunnelConfig = SshTunnelConfig;
+
+/// MQTT 协议版本
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MqttVersion {
+    /// MQTT 3.1.1
+    #[default]
+    V311,
+    /// MQTT 5(rumqttc 暂不支持,预留)
+    V5,
+}
+
+impl MqttVersion {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::V311 => "3.1.1",
+            Self::V5 => "5.0",
+        }
+    }
+}
+
+/// MQTT 连接参数
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MqttParams {
+    #[serde(default = "default_mqtt_host")]
+    pub host: String,
+    #[serde(default = "default_mqtt_port")]
+    pub port: u16,
+    /// 客户端 ID(空串表示连接时自动生成)
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_reference: Option<CredentialReference>,
+    /// 是否启用 TLS(默认端口切换为 8883)
+    #[serde(default)]
+    pub use_tls: bool,
+    /// 连接超时(秒)
+    #[serde(default)]
+    pub connect_timeout: Option<u64>,
+    /// keep-alive 间隔(秒,默认 30)
+    #[serde(default)]
+    pub keep_alive: Option<u64>,
+    /// MQTT 协议版本
+    #[serde(default)]
+    pub mqtt_version: MqttVersion,
+    /// 清除会话
+    #[serde(default = "default_true")]
+    pub clean_session: bool,
+    /// SSH 隧道配置
+    #[serde(default)]
+    pub ssh_tunnel: Option<MqttSshTunnelConfig>,
+}
+
+fn default_mqtt_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_mqtt_port() -> u16 {
+    1883
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for MqttParams {
+    fn default() -> Self {
+        Self {
+            host: default_mqtt_host(),
+            port: default_mqtt_port(),
+            client_id: String::new(),
+            username: None,
+            password: None,
+            credential_reference: None,
+            use_tls: false,
+            connect_timeout: None,
+            keep_alive: None,
+            mqtt_version: MqttVersion::V311,
+            clean_session: true,
+            ssh_tunnel: None,
+        }
+    }
+}
+
+impl MqttParams {
+    pub fn apply_referenced_ssh_tunnel(
+        &mut self,
+        ssh_connection: &StoredConnection,
+    ) -> Result<(), serde_json::Error> {
+        let Some(tunnel) = self.ssh_tunnel.as_mut() else {
+            return Ok(());
+        };
+        let Some(ssh_connection_id) = tunnel.connection_id else {
+            return Ok(());
+        };
+        if ssh_connection.id != Some(ssh_connection_id) {
+            return Ok(());
+        }
+        if ssh_connection.connection_type != ConnectionType::SshSftp {
+            return Ok(());
+        }
+
+        let ssh_params = ssh_connection.to_ssh_params()?;
+        tunnel.host = ssh_params.host;
+        tunnel.port = ssh_params.port;
+        tunnel.username = ssh_params.username;
+        tunnel.timeout = ssh_params.connect_timeout;
+        tunnel.target_host.get_or_insert_with(|| self.host.clone());
+        tunnel.target_port.get_or_insert(self.port);
+
+        match ssh_params.auth_method {
+            SshAuthMethod::Password { password } => {
+                tunnel.auth_type = "password".to_string();
+                tunnel.password = Some(password);
+                tunnel.private_key_path = None;
+                tunnel.private_key_content = None;
+                tunnel.private_key_passphrase = None;
+            }
+            SshAuthMethod::PrivateKey {
+                key_path,
+                passphrase,
+            } => {
+                tunnel.auth_type = "private_key".to_string();
+                tunnel.password = None;
+                tunnel.private_key_path = Some(key_path);
+                tunnel.private_key_content = None;
+                tunnel.private_key_passphrase = passphrase;
+            }
+            SshAuthMethod::PrivateKeyContent {
+                private_key,
+                passphrase,
+            } => {
+                tunnel.auth_type = "private_key_content".to_string();
+                tunnel.password = None;
+                tunnel.private_key_path = None;
+                tunnel.private_key_content = Some(private_key);
+                tunnel.private_key_passphrase = passphrase;
+            }
+            SshAuthMethod::Agent => {
+                tunnel.auth_type = "agent".to_string();
+                tunnel.password = None;
+                tunnel.private_key_path = None;
+                tunnel.private_key_content = None;
+                tunnel.private_key_passphrase = None;
+            }
+            SshAuthMethod::Pageant => {
+                tunnel.auth_type = "pageant".to_string();
+                tunnel.password = None;
+                tunnel.private_key_path = None;
+                tunnel.private_key_content = None;
+                tunnel.private_key_passphrase = None;
+            }
+            SshAuthMethod::AutoPublicKey => {
+                tunnel.auth_type = "auto_publickey".to_string();
+                tunnel.password = None;
+                tunnel.private_key_path = None;
+                tunnel.private_key_content = None;
+                tunnel.private_key_passphrase = None;
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// 串口校验位
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SerialParity {
@@ -1640,6 +1884,61 @@ pub struct StoredConnection {
     pub owner_id: Option<String>,
 }
 
+pub const EXTENSION_CONNECTION_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionConnectionParams {
+    pub schema_version: u32,
+    pub extension_id: String,
+    pub contribution_id: String,
+    #[serde(default)]
+    pub config: serde_json::Map<String, Value>,
+    #[serde(default)]
+    pub secrets: BTreeMap<String, String>,
+}
+
+impl ExtensionConnectionParams {
+    pub fn new(
+        extension_id: impl Into<String>,
+        contribution_id: impl Into<String>,
+        config: serde_json::Map<String, Value>,
+        secrets: BTreeMap<String, String>,
+    ) -> anyhow::Result<Self> {
+        let params = Self {
+            schema_version: EXTENSION_CONNECTION_SCHEMA_VERSION,
+            extension_id: extension_id.into(),
+            contribution_id: contribution_id.into(),
+            config,
+            secrets,
+        };
+        params.validate()?;
+        Ok(params)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.schema_version == EXTENSION_CONNECTION_SCHEMA_VERSION,
+            "unsupported extension connection schema version {}",
+            self.schema_version
+        );
+        anyhow::ensure!(
+            !self.extension_id.trim().is_empty(),
+            "extension id is empty"
+        );
+        anyhow::ensure!(
+            !self.contribution_id.trim().is_empty(),
+            "connection contribution id is empty"
+        );
+        anyhow::ensure!(
+            self.secrets
+                .keys()
+                .all(|key| !self.config.contains_key(key)),
+            "extension connection config and secrets must not share keys"
+        );
+        Ok(())
+    }
+}
+
 fn default_sync_enabled() -> bool {
     true
 }
@@ -1755,6 +2054,10 @@ fn default_mongodb_name(name: String, params: &MongoDBParams) -> String {
     trimmed_or_default(name, default_name)
 }
 
+fn default_mqtt_name(name: String, params: &MqttParams) -> String {
+    trimmed_or_default(name, host_port_name(&params.host, params.port))
+}
+
 fn default_serial_name(name: String, params: &SerialParams) -> String {
     trimmed_or_default(name, params.port_name.trim().to_string())
 }
@@ -1781,6 +2084,44 @@ fn default_port_forwarding_name(name: String, params: &PortForwardingParams) -> 
 }
 
 impl StoredConnection {
+    pub fn new_extension(
+        name: String,
+        params: ExtensionConnectionParams,
+        workspace_id: Option<i64>,
+    ) -> Self {
+        let name = trimmed_or_default(name, params.contribution_id.clone());
+        Self {
+            id: None,
+            credential_revision: None,
+            name,
+            connection_type: ConnectionType::Extension,
+            params: serde_json::to_string(&params)
+                .expect("ExtensionConnectionParams serialization must succeed"),
+            workspace_id,
+            selected_databases: None,
+            remark: None,
+            sync_enabled: true,
+            cloud_id: None,
+            last_synced_at: None,
+            last_used_at: None,
+            sort_order: None,
+            created_at: None,
+            updated_at: None,
+            team_id: None,
+            owner_id: None,
+        }
+    }
+
+    pub fn to_extension_params(&self) -> anyhow::Result<ExtensionConnectionParams> {
+        anyhow::ensure!(
+            self.connection_type == ConnectionType::Extension,
+            "connection is not an extension connection"
+        );
+        let params: ExtensionConnectionParams = serde_json::from_str(&self.params)?;
+        params.validate()?;
+        Ok(params)
+    }
+
     pub fn new_database(
         name: String,
         params: DbConnectionConfig,
@@ -1909,6 +2250,29 @@ impl StoredConnection {
         }
     }
 
+    pub fn new_mqtt(name: String, params: MqttParams, workspace_id: Option<i64>) -> Self {
+        let name = default_mqtt_name(name, &params);
+        Self {
+            id: None,
+            credential_revision: None,
+            name,
+            connection_type: ConnectionType::Mqtt,
+            params: serde_json::to_string(&params).expect("MqttParams 序列化不应失败"),
+            workspace_id,
+            selected_databases: None,
+            remark: None,
+            sync_enabled: true,
+            cloud_id: None,
+            last_synced_at: None,
+            last_used_at: None,
+            sort_order: None,
+            created_at: None,
+            updated_at: None,
+            team_id: None,
+            owner_id: None,
+        }
+    }
+
     pub fn to_ssh_params(&self) -> Result<SshParams, serde_json::Error> {
         let mut params: SshParams = serde_json::from_str(&self.params)?;
         params.sanitize_for_storage();
@@ -1924,6 +2288,10 @@ impl StoredConnection {
     }
 
     pub fn to_mongodb_params(&self) -> Result<MongoDBParams, serde_json::Error> {
+        serde_json::from_str(&self.params)
+    }
+
+    pub fn to_mqtt_params(&self) -> Result<MqttParams, serde_json::Error> {
         serde_json::from_str(&self.params)
     }
 
@@ -2043,8 +2411,27 @@ impl StoredConnection {
     ///
     /// 敏感字段包括：password、passphrase、private_key、private_key_content、
     /// Telnet 登录脚本的 send 值，以及嵌套结构中的同类字段。
-    pub fn encrypt_params(&self) -> String {
-        encrypt_json_passwords(&self.params_for_storage())
+    pub fn try_encrypt_params(&self) -> anyhow::Result<String> {
+        if self.connection_type != ConnectionType::Extension {
+            return Ok(encrypt_json_passwords(&self.params_for_storage()));
+        }
+        let mut params = self.to_extension_params()?;
+        for secret in params.secrets.values_mut() {
+            if secret.is_empty() || crypto::is_encrypted(secret) {
+                continue;
+            }
+            anyhow::ensure!(
+                crypto::has_master_key(),
+                "Cannot persist extension connection secrets without a master key"
+            );
+            let encrypted = crypto::encrypt_password(secret);
+            anyhow::ensure!(
+                encrypted != *secret && crypto::is_encrypted(&encrypted),
+                "extension connection secret encryption failed"
+            );
+            *secret = encrypted;
+        }
+        Ok(serde_json::to_string(&params)?)
     }
 
     /// 返回适合持久化、同步、分享或导出的参数 JSON。
@@ -2065,6 +2452,17 @@ impl StoredConnection {
 
     /// 对 params 中的加密字段进行解密，返回解密后的 params 字符串。
     pub fn decrypt_params(&self) -> String {
+        if self.connection_type == ConnectionType::Extension {
+            let Ok(mut params) = self.to_extension_params() else {
+                return self.params.clone();
+            };
+            for secret in params.secrets.values_mut() {
+                if crypto::is_encrypted(secret) {
+                    *secret = crypto::decrypt_password(secret);
+                }
+            }
+            return serde_json::to_string(&params).unwrap_or_else(|_| self.params.clone());
+        }
         decrypt_json_passwords(&self.params)
     }
 
@@ -2076,10 +2474,51 @@ impl StoredConnection {
     }
 }
 
+pub fn has_connection_decrypt_failure(connection_type: ConnectionType, params: &str) -> bool {
+    if connection_type != ConnectionType::Extension {
+        return has_decrypt_failure_in_sensitive_fields(params);
+    }
+    let Ok(params) = serde_json::from_str::<ExtensionConnectionParams>(params) else {
+        return true;
+    };
+    params.validate().is_err()
+        || params.secrets.values().any(|secret| {
+            crypto::is_encrypted(secret) && crypto::decrypt_password(secret).is_empty()
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn active_connection_lease_cleans_up_on_drop() {
+        let mut active = ActiveConnections::new();
+        let lease = active.lease(42);
+
+        assert!(active.is_active(42));
+        drop(lease);
+        assert!(!active.is_active(42));
+    }
+
+    #[test]
+    fn extension_connection_encrypts_arbitrary_secret_fields() {
+        crypto::set_master_key_for_session("extension-connection-test-key").unwrap();
+        let params = ExtensionConnectionParams::new(
+            "com.example.search",
+            "search",
+            serde_json::Map::from_iter([("url".into(), Value::String("https://example".into()))]),
+            BTreeMap::from([("api_key".into(), "secret-value".into())]),
+        )
+        .unwrap();
+        let connection = StoredConnection::new_extension("Search".into(), params, Some(7));
+
+        let encrypted = connection.try_encrypt_params().unwrap();
+        assert!(!encrypted.contains("secret-value"));
+        let encrypted: ExtensionConnectionParams = serde_json::from_str(&encrypted).unwrap();
+        assert!(crypto::is_encrypted(&encrypted.secrets["api_key"]));
+    }
 
     fn ssh_connection_with_id(id: i64, auth_method: SshAuthMethod) -> StoredConnection {
         let mut connection = StoredConnection::new_ssh(
@@ -2688,7 +3127,19 @@ pub(crate) fn re_encrypt_sensitive_json(
     new_key: &str,
 ) -> anyhow::Result<String> {
     let mut value: Value = serde_json::from_str(json_str)?;
-    re_encrypt_value(&mut value, old_key, new_key)?;
+    if value.get("schema_version").and_then(Value::as_u64)
+        == Some(u64::from(EXTENSION_CONNECTION_SCHEMA_VERSION))
+        && value.get("extension_id").is_some()
+        && value.get("contribution_id").is_some()
+    {
+        if let Some(secrets) = value.get_mut("secrets").and_then(Value::as_object_mut) {
+            for secret in secrets.values_mut() {
+                re_encrypt_string(secret, old_key, new_key)?;
+            }
+        }
+    } else {
+        re_encrypt_value(&mut value, old_key, new_key)?;
+    }
     Ok(serde_json::to_string(&value)?)
 }
 
@@ -3853,7 +4304,7 @@ mod serial_tests {
 
     #[test]
     fn telnet_login_script_send_is_a_sensitive_field() {
-        // encrypt_params/decrypt_params 依赖该字段名识别 Telnet 登录脚本中的
+        // 参数加解密依赖该字段名识别 Telnet 登录脚本中的
         // 自动发送凭据；不要退回到只识别 password/passphrase/private_key。
         assert!(is_sensitive_field("send"));
         assert!(is_sensitive_field("password"));

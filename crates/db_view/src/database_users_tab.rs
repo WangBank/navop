@@ -171,8 +171,11 @@ impl DatabaseUsersTab {
                 .overlay(false)
                 .width(px(700.0))
                 .child(editor.clone())
+                .confirm()
                 .button_props(
-                    DialogButtonProps::default().ok_text(t!("DatabaseUsers.execute").to_string()),
+                    DialogButtonProps::default()
+                        .ok_text(t!("DatabaseUsers.execute").to_string())
+                        .show_cancel(true),
                 )
                 .on_ok(move |_, _window, cx| {
                     let sql = editor_ok.read(cx).get_sql(cx);
@@ -188,7 +191,6 @@ impl DatabaseUsersTab {
                     execute_user_operation(sql, config.clone(), tab.clone(), editor_ok.clone(), cx);
                     false
                 })
-                .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
         });
     }
 

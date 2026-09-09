@@ -91,7 +91,7 @@ pub(crate) fn show_workspace_dialog(
                     }),
             )
             .confirm()
-            .on_ok(move |_, _, cx| {
+            .on_ok(move |_, _, cx: &mut App| {
                 let name = input_for_ok.read(cx).text().to_string().trim().to_string();
                 if name.is_empty() {
                     return false;

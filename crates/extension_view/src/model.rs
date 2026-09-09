@@ -8,7 +8,6 @@ pub enum ExtensionKind {
     LanguageBundle,
     DatabaseDriver,
     RemoteDesktopProvider,
-    McpHelper,
     AcpAgent,
     Composite,
 }
@@ -24,6 +23,22 @@ pub struct ExtensionSummary {
     pub icon: Option<String>,
     pub driver_id: Option<String>,
     pub default_port: Option<u16>,
+    pub shell_views: Vec<ShellViewSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellViewSummary {
+    pub id: String,
+    pub title: String,
+}
+
+impl ShellViewSummary {
+    pub fn new(id: impl Into<String>, title: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            title: title.into(),
+        }
+    }
 }
 
 impl ExtensionSummary {
@@ -43,6 +58,7 @@ impl ExtensionSummary {
             icon: None,
             driver_id: None,
             default_port: None,
+            shell_views: Vec::new(),
         }
     }
 
@@ -68,6 +84,11 @@ impl ExtensionSummary {
 
     pub fn with_default_port(mut self, default_port: Option<u16>) -> Self {
         self.default_port = default_port;
+        self
+    }
+
+    pub fn with_shell_views(mut self, shell_views: Vec<ShellViewSummary>) -> Self {
+        self.shell_views = shell_views;
         self
     }
 }
@@ -98,6 +119,7 @@ pub struct PermissionReviewModel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadedMarketplaceExtension {
     pub entry: MarketplaceEntry,
+    pub target_extension_id: String,
     pub staging: PathBuf,
     pub review: PermissionReviewModel,
 }

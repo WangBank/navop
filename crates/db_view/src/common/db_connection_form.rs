@@ -17,8 +17,8 @@ use connection_form::{
 };
 use db::plugin_manifest::FormVisibilityRule;
 use db::{
-    DEFAULT_SCHEMA_PARAM, GlobalDbState, SCHEMA_FILTER_EXCLUDE_PARAM, SCHEMA_FILTER_INCLUDE_PARAM,
-    SCHEMA_FILTER_MODE_PARAM, oracle,
+    DEFAULT_SCHEMA_PARAM, GlobalDbState, ORACLE_ROLE_PARAM, SCHEMA_FILTER_EXCLUDE_PARAM,
+    SCHEMA_FILTER_INCLUDE_PARAM, SCHEMA_FILTER_MODE_PARAM, oracle,
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -883,6 +883,27 @@ impl DbFormConfig {
                     FormField::new("sid", "SID", FormFieldType::Text)
                         .optional()
                         .placeholder(t!("ConnectionForm.sid_placeholder").to_string()),
+                    FormField::new(
+                        ORACLE_ROLE_PARAM,
+                        t!("ConnectionForm.oracle_role"),
+                        FormFieldType::Select,
+                    )
+                    .optional()
+                    .default("default")
+                    .options(vec![
+                        (
+                            "default".to_string(),
+                            t!("ConnectionForm.oracle_role_default").to_string(),
+                        ),
+                        (
+                            "sysdba".to_string(),
+                            t!("ConnectionForm.oracle_role_sysdba").to_string(),
+                        ),
+                        (
+                            "sysoper".to_string(),
+                            t!("ConnectionForm.oracle_role_sysoper").to_string(),
+                        ),
+                    ]),
                 ]),
                 TabGroup::new("advanced", t!("ConnectionForm.advanced")).fields(
                     Self::with_schema_preference_fields(vec![
@@ -982,6 +1003,92 @@ impl DbFormConfig {
                     ]),
                 ]),
                 Self::clickhouse_ssl_tab_group(),
+                Self::ssh_tab_group(),
+                TabGroup::new("notes", t!("ConnectionForm.notes")).fields(vec![
+                    FormField::new(
+                        "remark",
+                        t!("ConnectionForm.remark"),
+                        FormFieldType::TextArea,
+                    )
+                    .rows(14)
+                    .optional()
+                    .placeholder(t!("ConnectionForm.enter_remark"))
+                    .default(""),
+                ]),
+            ],
+        }
+    }
+
+    /// TDengine 连接表单配置(WebSocket 经 taosAdapter,默认端口 6041,默认用户 root)
+    pub fn tdengine() -> Self {
+        Self {
+            db_type: DatabaseType::TDengine,
+            title: format!("{} (TDengine)", t!("Common.new")),
+            hidden_params: HashMap::new(),
+            tab_groups: vec![
+                TabGroup::new("general", t!("ConnectionForm.general")).fields(vec![
+                    FormField::new(
+                        "name",
+                        t!("ConnectionForm.connection_name"),
+                        FormFieldType::Text,
+                    )
+                    .placeholder(
+                        t!(
+                            "ConnectionForm.connection_name_placeholder",
+                            kind = "TDengine"
+                        )
+                        .to_string(),
+                    )
+                    .default("Local TDengine"),
+                    FormField::new("host", t!("ConnectionForm.host"), FormFieldType::Text)
+                        .placeholder("localhost")
+                        .default("localhost"),
+                    FormField::new("port", t!("ConnectionForm.port"), FormFieldType::Number)
+                        .placeholder("6041 (taosAdapter port)")
+                        .default("6041"),
+                    FormField::new(
+                        "username",
+                        t!("ConnectionForm.username"),
+                        FormFieldType::Text,
+                    )
+                    .placeholder("root")
+                    .default("root"),
+                    FormField::new(
+                        "password",
+                        t!("ConnectionForm.password"),
+                        FormFieldType::Password,
+                    )
+                    .placeholder("taosdata"),
+                    FormField::new(
+                        "database",
+                        t!("ConnectionForm.database"),
+                        FormFieldType::Text,
+                    )
+                    .optional()
+                    .placeholder(t!("ConnectionForm.database_optional").to_string()),
+                ]),
+                TabGroup::new("advanced", t!("ConnectionForm.advanced")).fields(vec![
+                    FormField::new(
+                        "connect_timeout",
+                        t!("ConnectionForm.connect_timeout"),
+                        FormFieldType::Number,
+                    )
+                    .optional()
+                    .placeholder("30")
+                    .default("30"),
+                ]),
+                TabGroup::new("ssl", t!("ConnectionForm.ssl")).fields(vec![
+                    FormField::new("schema", t!("ConnectionForm.schema"), FormFieldType::Select)
+                        .optional()
+                        .default("ws")
+                        .options(vec![
+                            ("ws".to_string(), t!("ConnectionForm.schema_ws").to_string()),
+                            (
+                                "wss".to_string(),
+                                t!("ConnectionForm.schema_wss").to_string(),
+                            ),
+                        ]),
+                ]),
                 Self::ssh_tab_group(),
                 TabGroup::new("notes", t!("ConnectionForm.notes")).fields(vec![
                     FormField::new(
@@ -1345,16 +1452,6 @@ impl DbConnectionForm {
 
                         if field.field_type == FormFieldType::Password {
                             input_state = input_state.masked(true);
-                        }
-
-                        if field.field_type == FormFieldType::TextArea {
-                            if field.name == "remark" {
-                                input_state = input_state.auto_grow(3, 10);
-                            } else if field.rows == 14 {
-                                input_state = input_state.rows(14);
-                            } else {
-                                input_state = input_state.auto_grow(5, 14);
-                            }
                         }
 
                         input_state.set_value(field.default_value.clone(), window, cx);
@@ -2291,7 +2388,6 @@ impl DbConnectionForm {
         field()
             .label("钥匙串")
             .items_center()
-            .label_justify_end()
             .child(div().w_full().child(picker))
     }
 
@@ -2382,7 +2478,6 @@ impl DbConnectionForm {
             .required(field_info.required)
             .when(!is_textarea, |field| field.items_center())
             .when(is_textarea, |field| field.items_start())
-            .label_justify_end()
             .child(
                 h_flex()
                     .w_full()
@@ -2461,7 +2556,15 @@ impl DbConnectionForm {
             })
             .collect::<Vec<_>>();
 
-        if visible_fields.is_empty() {
+        let has_main_credentials = current_tab_fields
+            .iter()
+            .any(|field| matches!(field.name.as_str(), "username" | "password"));
+        let has_proxy_credentials = self.field_bool_value("proxy_enabled", cx)
+            && current_tab_fields
+                .iter()
+                .any(|field| matches!(field.name.as_str(), "proxy_username" | "proxy_password"));
+
+        if visible_fields.is_empty() && !has_main_credentials && !has_proxy_credentials {
             return div()
                 .flex()
                 .items_center()
@@ -2476,27 +2579,40 @@ impl DbConnectionForm {
         let db_type = self.config.db_type.clone();
         let is_builtin_oracle = db_type == DatabaseType::Oracle;
         let is_native_oracle = self.effective_database_type(cx) == DatabaseType::Oracle;
-        let has_main_credentials = current_tab_fields
+        // 钥匙串下拉与账号密码字段成组渲染:锚定在原始声明序中首个
+        // username/password 之前。引用被选中导致凭据隐藏时,锚点按"仍排在
+        // 该凭据之前的可见字段数"计算,下拉留在原位置,不会跳到表单顶部。
+        let main_credential_anchor = current_tab_fields
             .iter()
-            .any(|field| matches!(field.name.as_str(), "username" | "password"));
-        let has_proxy_credentials = self.field_bool_value("proxy_enabled", cx)
-            && current_tab_fields
-                .iter()
-                .any(|field| matches!(field.name.as_str(), "proxy_username" | "proxy_password"));
+            .position(|field| matches!(field.name.as_str(), "username" | "password"))
+            .map(|orig| {
+                visible_fields
+                    .iter()
+                    .take_while(|(index, _)| *index < orig)
+                    .count()
+            })
+            .unwrap_or(0);
+        let proxy_credential_anchor = current_tab_fields
+            .iter()
+            .position(|field| matches!(field.name.as_str(), "proxy_username" | "proxy_password"))
+            .map(|orig| {
+                visible_fields
+                    .iter()
+                    .take_while(|(index, _)| *index < orig)
+                    .count()
+            })
+            .unwrap_or(0);
 
         v_form()
             .layout(Axis::Horizontal)
             .with_size(Size::Medium)
             .columns(1)
             .label_width(px(100.))
-            .when(has_main_credentials, |form| {
-                form.child(self.render_credential_picker_field(false))
-            })
-            .when(has_proxy_credentials, |form| {
-                form.child(self.render_credential_picker_field(true))
-            })
-            .children(visible_fields.into_iter().map(|(i, field_info)| {
-                let input_idx = field_input_offset + i;
+            .children({
+                let mut rendered: Vec<gpui_component::form::Field> = visible_fields
+                    .into_iter()
+                    .map(|(i, field_info)| {
+                        let input_idx = field_input_offset + i;
                 let is_sqlite_path = matches!(db_type, DatabaseType::SQLite | DatabaseType::DuckDB)
                     && field_info.name == "host";
                 let is_textarea = field_info.field_type == FormFieldType::TextArea;
@@ -2511,7 +2627,6 @@ impl DbConnectionForm {
                     .required(field_info.required)
                     .when(!is_textarea, |f| f.items_center())
                     .when(is_textarea, |f| f.items_start())
-                    .label_justify_end()
                     .child(
                         h_flex()
                             .w_full()
@@ -2573,7 +2688,17 @@ impl DbConnectionForm {
                                 )
                             }),
                     )
-            }))
+            }).collect();
+            // 钥匙串下拉按锚定位置插入(见上方注释);anchor 默认 0 保证
+            // 无凭据字段时也稳定成组。
+            if has_main_credentials {
+                rendered.insert(main_credential_anchor.min(rendered.len()), self.render_credential_picker_field(false));
+            }
+            if has_proxy_credentials {
+                rendered.insert(proxy_credential_anchor.min(rendered.len()), self.render_credential_picker_field(true));
+            }
+            rendered
+            })
             .when(is_general_tab, |form| {
                 let sync_enabled = self.sync_enabled.clone();
                 let is_sync_checked = *self.sync_enabled.read(cx);
@@ -2586,7 +2711,6 @@ impl DbConnectionForm {
                     field()
                         .label(t!("ConnectionForm.workspace").to_string())
                         .items_center()
-                        .label_justify_end()
                         .child(Select::new(&self.workspace_select).w_full()),
                 )
                 .when(
@@ -2596,7 +2720,6 @@ impl DbConnectionForm {
                         field()
                             .label(team_label())
                             .items_center()
-                            .label_justify_end()
                             .child(
                                 h_flex()
                                     .gap_2()
@@ -2619,7 +2742,6 @@ impl DbConnectionForm {
                         field()
                             .label(t!("ConnectionForm.cloud_sync").to_string())
                             .items_center()
-                            .label_justify_end()
                             .child(
                                 h_flex()
                                     .gap_2()
@@ -2650,7 +2772,6 @@ impl DbConnectionForm {
                         field()
                             .label(t!("ConnectionForm.oracle_driver_mode").to_string())
                             .items_center()
-                            .label_justify_end()
                             .child(
                                 h_flex()
                                     .w_full()
@@ -2766,7 +2887,6 @@ impl DbConnectionForm {
                         field()
                             .label(t!("ConnectionForm.oracle_client_status").to_string())
                             .items_center()
-                            .label_justify_end()
                             .child(
                                 h_flex()
                                     .w_full()
@@ -2949,7 +3069,6 @@ impl DbConnectionForm {
                 field()
                     .label(self.field_label("ssh_tunnel_enabled"))
                     .items_center()
-                    .label_justify_end()
                     .child(
                         Checkbox::new("db-ssh-tunnel-enabled")
                             .checked(ssh_enabled)
@@ -2969,7 +3088,6 @@ impl DbConnectionForm {
                     field()
                         .label(t!("ConnectionForm.ssh_connection_id").to_string())
                         .items_center()
-                        .label_justify_end()
                         .child(
                             Select::new(&self.ssh_connection_select)
                                 .placeholder(t!("ConnectionForm.ssh_connection_manual"))
@@ -2986,7 +3104,6 @@ impl DbConnectionForm {
                         field()
                             .label(self.field_label("ssh_auth_type"))
                             .items_center()
-                            .label_justify_end()
                             .child(h_flex().w_full().flex_wrap().gap_4().children(
                                 SshAuthOption::ALL.iter().copied().map(|option| {
                                     Radio::new(format!("db-ssh-auth-{}", option.value()))
@@ -3041,7 +3158,6 @@ impl DbConnectionForm {
                 field()
                     .label(t!("ConnectionForm.require_ssl").to_string())
                     .items_center()
-                    .label_justify_end()
                     .child(
                         Checkbox::new("db-ssl-enabled")
                             .checked(ssl_enabled)
@@ -3431,6 +3547,26 @@ mod tests {
         let config = DbFormConfig::oracle();
 
         assert!(config.tab_groups.iter().all(|group| group.name != "ssl"));
+    }
+
+    #[test]
+    fn oracle_form_offers_connect_role_select() {
+        let config = DbFormConfig::oracle();
+        let field = config
+            .tab_groups
+            .iter()
+            .flat_map(|group| group.fields.iter())
+            .find(|field| field.name == ORACLE_ROLE_PARAM)
+            .expect("Oracle form should contain the role field");
+
+        assert_eq!(field.field_type, FormFieldType::Select);
+        let values: Vec<&str> = field
+            .options
+            .iter()
+            .map(|(value, _)| value.as_str())
+            .collect();
+        assert_eq!(values, vec!["default", "sysdba", "sysoper"]);
+        assert_eq!(field.default_value, "default");
     }
 
     #[test]

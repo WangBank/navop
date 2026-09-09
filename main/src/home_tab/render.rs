@@ -46,7 +46,7 @@ impl Render for HomePage {
                         .title(t!("Auth.auth_error_title").to_string())
                         .child(error_msg.clone().into_any_element())
                         .alert()
-                        .on_ok(move |_, window, cx| {
+                        .on_ok(move |_, window, cx: &mut App| {
                             // 关闭错误对话框后重新弹出登录对话框
                             view_clone.update(cx, |this, cx| {
                                 this.show_login_dialog(window, cx);
@@ -57,10 +57,7 @@ impl Render for HomePage {
             });
         }
 
-        let content = match self.home_page_style {
-            HomePageStyle::Legacy => self.render_legacy_home(window, cx),
-            HomePageStyle::Modern => self.render_modern_home(window, cx),
-        };
+        let content = self.render_home_layout(window, cx);
 
         div()
             .size_full()

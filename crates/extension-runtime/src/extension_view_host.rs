@@ -35,6 +35,7 @@ impl extension_view::ExtensionViewHost for MainExtensionViewHost {
             Ok(manifest
                 .into_entries()
                 .into_iter()
+                .filter(|entry| entry.kind != host_extension::ExtensionKind::Unsupported)
                 .map(to_view_entry)
                 .collect())
         }
@@ -51,6 +52,7 @@ impl extension_view::ExtensionViewHost for MainExtensionViewHost {
             Ok(manifest
                 .into_entries()
                 .into_iter()
+                .filter(|entry| entry.kind != host_extension::ExtensionKind::Unsupported)
                 .map(to_view_entry)
                 .collect())
         }
@@ -125,7 +127,7 @@ impl extension_view::ExtensionViewHost for MainExtensionViewHost {
     ) -> anyhow::Result<Vec<extension_view::ExtensionSummary>> {
         ensure_extension_path_still_installed(summary)?;
         if summary.kind == extension_view::ExtensionKind::Language {
-            gpui_component::highlighter::LanguageRegistry::singleton().unregister(&summary.name);
+            crate::language_extensions::forget_language(&summary.name);
         }
         reload_extension_runtime(summary.kind, cx);
         let installed = self.list_installed()?;
@@ -185,6 +187,15 @@ fn reload_extension_runtime(kind: extension_view::ExtensionKind, cx: &mut App) {
     if should_reload_languages(kind) {
         refresh_language_extension_manifests();
     }
+    match kind {
+        extension_view::ExtensionKind::DatabaseDriver => {
+            db::ipc::IpcDriverRegistry::refresh_global_registry();
+        }
+        extension_view::ExtensionKind::RemoteDesktopProvider => {
+            remote_desktop::RemoteDesktopProviderRegistry::refresh_global_registry();
+        }
+        _ => {}
+    }
     crate::refresh_global_runtime_catalog(cx);
     crate::extension::refresh_runtime_contributions(cx);
 }
@@ -210,6 +221,11 @@ fn review_downloaded_extension(
     kind: host_extension::ExtensionKind,
     entry: extension_view::MarketplaceEntry,
 ) -> anyhow::Result<extension_view::MarketplaceInstallOutcome> {
+    let target_extension_id = if kind == host_extension::ExtensionKind::Composite {
+        load_from_dir(&package_root(&staging)?)?.id
+    } else {
+        entry.id.clone()
+    };
     let review = match permission_review_for_staging(&staging, kind) {
         Ok(review) => review,
         Err(err) => {
@@ -221,6 +237,7 @@ fn review_downloaded_extension(
         return Ok(extension_view::MarketplaceInstallOutcome::NeedsPermission(
             extension_view::DownloadedMarketplaceExtension {
                 entry,
+                target_extension_id,
                 staging,
                 review,
             },
@@ -284,6 +301,20 @@ fn install_staging_with_permission(
 }
 
 fn to_view_summary(summary: host_extension::ExtensionSummary) -> extension_view::ExtensionSummary {
+    let shell_views = if summary.kind == host_extension::ExtensionKind::Composite {
+        load_from_dir(&summary.path)
+            .map(|manifest| {
+                manifest
+                    .contributes
+                    .shell_views
+                    .into_iter()
+                    .map(|view| extension_view::ShellViewSummary::new(view.id, view.title))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     extension_view::ExtensionSummary::new(
         to_view_kind(summary.kind),
         summary.name,
@@ -295,6 +326,7 @@ fn to_view_summary(summary: host_extension::ExtensionSummary) -> extension_view:
     .with_icon(summary.icon)
     .with_driver_id(summary.driver_id)
     .with_default_port(summary.default_port)
+    .with_shell_views(shell_views)
 }
 
 fn to_view_entry(entry: host_downloader::MarketplaceEntry) -> extension_view::MarketplaceEntry {
@@ -380,9 +412,11 @@ fn to_view_kind(kind: host_extension::ExtensionKind) -> extension_view::Extensio
         host_extension::ExtensionKind::RemoteDesktopProvider => {
             extension_view::ExtensionKind::RemoteDesktopProvider
         }
-        host_extension::ExtensionKind::McpHelper => extension_view::ExtensionKind::McpHelper,
         host_extension::ExtensionKind::AcpAgent => extension_view::ExtensionKind::AcpAgent,
         host_extension::ExtensionKind::Composite => extension_view::ExtensionKind::Composite,
+        host_extension::ExtensionKind::Unsupported => {
+            unreachable!("unsupported kind is filtered before view conversion")
+        }
     }
 }
 
@@ -398,7 +432,6 @@ fn to_host_kind(kind: extension_view::ExtensionKind) -> host_extension::Extensio
         extension_view::ExtensionKind::RemoteDesktopProvider => {
             host_extension::ExtensionKind::RemoteDesktopProvider
         }
-        extension_view::ExtensionKind::McpHelper => host_extension::ExtensionKind::McpHelper,
         extension_view::ExtensionKind::AcpAgent => host_extension::ExtensionKind::AcpAgent,
         extension_view::ExtensionKind::Composite => host_extension::ExtensionKind::Composite,
     }
@@ -421,7 +454,6 @@ mod tests {
         for kind in [
             extension_view::ExtensionKind::DatabaseDriver,
             extension_view::ExtensionKind::RemoteDesktopProvider,
-            extension_view::ExtensionKind::McpHelper,
             extension_view::ExtensionKind::AcpAgent,
             extension_view::ExtensionKind::Composite,
         ] {
@@ -464,6 +496,23 @@ mod tests {
         assert!(
             !refresh.contains("load_language_extensions_from_root"),
             "metadata refresh must not eagerly compile language WASM"
+        );
+    }
+
+    #[test]
+    fn database_driver_reload_refreshes_driver_registry() {
+        let source = include_str!("extension_view_host.rs");
+        let reload = source
+            .split("fn reload_extension_runtime")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("extension runtime reload should exist");
+
+        assert!(reload.contains("ExtensionKind::DatabaseDriver"));
+        assert!(reload.contains("refresh_global_registry"));
+        assert!(
+            reload.contains("ExtensionKind::RemoteDesktopProvider"),
+            "provider reload must invalidate the single remote-desktop registry too"
         );
     }
 

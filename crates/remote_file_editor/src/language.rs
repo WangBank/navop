@@ -1,8 +1,6 @@
-use std::{path::Path, sync::Once};
+use std::path::Path;
 
-use gpui_component::highlighter::{LanguageRegistry, register_extension_manifests_dir};
-
-static LANGUAGE_MANIFEST_SCAN: Once = Once::new();
+use anyhow::Result;
 
 pub fn language_for_path(path: &str, plain_text_mode: bool) -> String {
     if plain_text_mode {
@@ -18,29 +16,41 @@ pub fn language_for_path(path: &str, plain_text_mode: bool) -> String {
         .unwrap_or_else(|| "text".to_string())
 }
 
-fn language_name_for_extension(extension: &str) -> Option<String> {
-    let registry = LanguageRegistry::singleton();
-    registry.language_name_for_extension(extension).or_else(|| {
-        scan_language_extension_manifests(registry);
-        registry.language_name_for_extension(extension)
-    })
+pub fn load_language_for_path(path: &str, plain_text_mode: bool) -> Result<String> {
+    let language = language_for_path(path, plain_text_mode);
+    if language != "text" {
+        extension_runtime::language_extensions::load_registered_language(&language)?;
+    }
+    Ok(language)
 }
 
-fn scan_language_extension_manifests(registry: &LanguageRegistry) {
-    LANGUAGE_MANIFEST_SCAN.call_once(|| {
-        let Ok(config_dir) = one_core::storage::get_config_dir() else {
-            return;
-        };
-        let root = config_dir.join("extensions").join("languages");
-        if let Err(error) = register_extension_manifests_dir(&root, registry) {
-            tracing::warn!("failed to scan language extension manifests: {error:?}");
-        }
-    });
+fn language_name_for_extension(extension: &str) -> Option<String> {
+    extension_runtime::language_extensions::registered_language_name(extension)
+        .or_else(|| local_language_name(extension).map(str::to_string))
+}
+
+fn local_language_name(extension: &str) -> Option<&'static str> {
+    match extension
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "sh" | "bash" => Some("bash"),
+        "html" | "htm" => Some("html"),
+        "json" | "jsonc" => Some("json"),
+        "md" | "markdown" => Some("markdown"),
+        "sql" => Some("sql"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::language_for_path;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{language_for_path, load_language_for_path};
 
     #[test]
     fn language_for_path_uses_plain_text_for_large_file_mode() {
@@ -49,7 +59,11 @@ mod tests {
 
     #[test]
     fn language_for_path_maps_known_extensions() {
-        assert_eq!(language_for_path("/tmp/index.json", false), "json");
+        assert_eq!(language_for_path("/tmp/deploy.sh", false), "bash");
+        assert_eq!(language_for_path("/tmp/index.html", false), "html");
+        assert_eq!(language_for_path("/tmp/data.json", false), "json");
+        assert_eq!(language_for_path("/tmp/README.md", false), "markdown");
+        assert_eq!(language_for_path("/tmp/query.sql", false), "sql");
     }
 
     #[test]
@@ -58,30 +72,43 @@ mod tests {
     }
 
     #[test]
-    fn language_for_path_uses_registry_extension_lookup() {
+    fn language_for_path_maps_local_aliases() {
         assert_eq!(language_for_path("/tmp/settings.jsonc", false), "json");
     }
 
     #[test]
     fn language_for_path_ignores_query_string() {
-        let registry = gpui_component::highlighter::LanguageRegistry::singleton();
-        registry.register_wasm_manifest(
-            gpui_component::highlighter::LanguageManifest {
-                name: "__remote_html__".to_string(),
-                version: "0.1.0".to_string(),
-                file_extensions: vec!["html".to_string()],
-                injection_languages: Vec::new(),
-                requires: Vec::new(),
-                sha256_wasm: None,
-            },
-            std::path::PathBuf::new(),
-        );
-
         assert_eq!(
-            language_for_path("/tmp/index.html?token=Nwiw70H2Gs", false),
-            "__remote_html__"
+            language_for_path("/tmp/settings.jsonc?token=Nwiw70H2Gs", false),
+            "json"
         );
+    }
 
-        registry.unregister("__remote_html__");
+    #[test]
+    fn load_language_for_path_loads_registered_parser() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "navop-remote-language-test-{}-{unique}",
+            std::process::id()
+        ));
+        let language_dir = root.join("languages").join("__remote_lazy_language__");
+        fs::create_dir_all(&language_dir).unwrap();
+        fs::write(
+            language_dir.join("manifest.json"),
+            r#"{"name":"__remote_lazy_language__","file_extensions":["remote_lazy"]}"#,
+        )
+        .unwrap();
+        fs::write(language_dir.join("parser.wasm"), [0u8; 4]).unwrap();
+        extension_runtime::extension::register_language_extension_manifests_from_root(&root)
+            .unwrap();
+
+        let error = load_language_for_path("/tmp/example.remote_lazy", false).unwrap_err();
+
+        assert!(error.to_string().contains("load wasm language"));
+        extension_runtime::language_extensions::forget_language("__remote_lazy_language__");
+        fs::remove_dir_all(root).unwrap();
     }
 }

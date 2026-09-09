@@ -26,12 +26,11 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, WindowExt as _,
-    button::{Button, ButtonCustomVariant, ButtonVariants, IconButton, IconButtonRole},
+    button::{Button, ButtonCustomVariant, ButtonVariants},
     dialog::DialogButtonProps,
     h_flex,
     input::{Input, InputState},
     menu::{DropdownMenu, PopupMenu, PopupMenuItem},
-    panel_header::{PanelHeader, PanelHeaderVariant},
     popover::Popover,
     spinner::Spinner,
     v_flex,
@@ -41,6 +40,7 @@ use one_core::gpui_tokio::Tokio;
 use one_core::llm::{GlobalProviderState, LlmConnector, LlmProvider, ProviderConfig};
 use one_core::settings::{AiChatToolExecutionMode, AppSettings};
 use one_core::sidebar_contribution::SidebarPlacement;
+use one_ui::{IconButton, IconButtonRole, PanelHeader, PanelHeaderVariant};
 use rust_i18n::t;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
@@ -67,7 +67,8 @@ use crate::input::{
     ComposerSkillSummary, ComposerSubAgentItem, ComposerTarget, MentionItem, QueuedPromptPreview,
 };
 use crate::message_view::{
-    render_messages_with_code_actions, render_sidebar_messages_with_code_actions,
+    render_messages_with_code_actions_and_activity,
+    render_sidebar_messages_with_code_actions_and_activity, render_running_activity,
 };
 use crate::pending_submission::{PendingSubmission, PendingSubmissions};
 use crate::persistence;
@@ -3127,9 +3128,10 @@ impl AgentChatView {
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text(t!("AgentUi.save").to_string())
-                        .cancel_text(t!("AgentUi.cancel").to_string()),
+                        .cancel_text(t!("AgentUi.cancel").to_string())
+                        .show_cancel(true),
                 )
-                .on_ok(move |_, _window, cx| {
+                .on_ok(move |_, _window, cx: &mut App| {
                     let new_name = input_for_ok.read(cx).value().trim().to_string();
                     if !new_name.is_empty() {
                         view_for_ok.update(cx, |this, cx| this.apply_rename(&uid, new_name, cx));
@@ -3187,9 +3189,10 @@ impl AgentChatView {
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text(t!("AgentUi.delete").to_string())
-                        .cancel_text(t!("AgentUi.cancel").to_string()),
+                        .cancel_text(t!("AgentUi.cancel").to_string())
+                        .show_cancel(true),
                 )
-                .on_ok(move |_, _window, cx| {
+                .on_ok(move |_, _window, cx: &mut App| {
                     view_for_ok.update(cx, |this, cx| this.apply_delete(&uid, cx));
                     true
                 })
@@ -3840,21 +3843,26 @@ impl Render for AgentChatView {
             self.scroll_handle.scroll_to_bottom();
         }
         let chat_theme = resolve_agent_chat_theme(self.theme.as_ref(), cx);
+        let running_activity = self
+            .is_running
+            .then(|| render_running_activity(&chat_theme));
         let messages = if self.sidebar_mode {
-            render_sidebar_messages_with_code_actions(
+            render_sidebar_messages_with_code_actions_and_activity(
                 &self.transcript.messages,
                 &self.scroll_handle,
                 Some(&self.code_block_actions),
                 Some(&chat_theme),
+                running_activity,
                 window,
                 cx,
             )
         } else {
-            render_messages_with_code_actions(
+            render_messages_with_code_actions_and_activity(
                 &self.transcript.messages,
                 &self.scroll_handle,
                 Some(&self.code_block_actions),
                 Some(&chat_theme),
+                running_activity,
                 window,
                 cx,
             )
@@ -8623,6 +8631,38 @@ mod tests {
             .expect("background running conversation should show loading in the sidebar");
         cx.debug_bounds(current_spinner_id)
             .expect("current running conversation should show loading in the sidebar");
+    }
+
+    #[gpui::test]
+    fn running_chat_shows_activity_indicator_in_message_area(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![]);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        view.update(cx, |view, cx| {
+            view.set_running(true, cx);
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        cx.debug_bounds("ai-chat-activity")
+            .expect("running conversation should show the activity strip in the message area");
+    }
+
+    #[gpui::test]
+    fn idle_chat_hides_activity_indicator(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![]);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        view.update(cx, |view, _| {
+            assert!(!view.is_running);
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        assert!(
+            cx.debug_bounds("ai-chat-activity").is_none(),
+            "idle conversation must not show the running activity strip"
+        );
     }
 
     #[test]

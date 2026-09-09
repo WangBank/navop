@@ -2,6 +2,7 @@ use db::ipc::IpcDriverRegistry;
 use db_view::connection_form_window::{ConnectionFormWindow, ConnectionFormWindowConfig};
 use gpui::{AnyView, AnyWindowHandle, AppContext, Context, Entity, Window};
 use mongodb_view::{MongoFormWindow, MongoFormWindowConfig};
+use mqtt_view::{MqttFormConfig, MqttFormWindow};
 use one_core::cloud_sync::get_cached_team_options;
 use one_core::storage::{ConnectionType, DatabaseType, RemoteDesktopProtocol};
 use port_forwarding_view::{PortForwardingFormWindow, PortForwardingFormWindowConfig};
@@ -17,6 +18,8 @@ use crate::new_connection::connection_kind::NewConnectionKind;
 use remote_desktop_view::remote_desktop_form::{
     RemoteDesktopFormWindow, RemoteDesktopFormWindowConfig,
 };
+#[cfg(feature = "shell-plugins")]
+use universal_plugins::{ExtensionConnectionForm, ExtensionConnectionFormConfig};
 
 pub(crate) enum NewConnectionFormResult {
     Form(AnyView),
@@ -50,6 +53,7 @@ impl NewConnectionFormPage for NewConnectionKind {
             Self::Vnc => build_remote_desktop_form(parent, RemoteDesktopProtocol::Vnc, window, cx),
             Self::Redis => build_redis_form(parent, window, cx),
             Self::MongoDB => build_mongo_form(parent, window, cx),
+            Self::Mqtt => build_mqtt_form(parent, window, cx),
             Self::Serial => build_serial_form(parent, window, cx),
             Self::Telnet => build_telnet_form(parent, window, cx),
             Self::PortForwarding => build_port_forwarding_form(parent, window, cx),
@@ -68,8 +72,49 @@ impl NewConnectionFormPage for NewConnectionKind {
                     cx,
                 )
             }
+            #[cfg(feature = "shell-plugins")]
+            Self::Extension(contribution) => build_extension_form(parent, contribution, window, cx),
+            #[cfg(not(feature = "shell-plugins"))]
+            Self::Extension(_) => NewConnectionFormResult::Blocked,
         }
     }
+}
+
+#[cfg(feature = "shell-plugins")]
+fn build_extension_form(
+    parent: Entity<HomePage>,
+    contribution: extension_runtime::RegisteredResourceConnectionContribution,
+    window: &mut Window,
+    cx: &mut Context<NewConnectionWindow>,
+) -> NewConnectionFormResult {
+    let teams = get_cached_team_options(cx);
+    let Some(config) = parent.update(cx, |home, _| {
+        if home.editing_connection_id.is_none() && !home.is_master_key_ready_for_new_connection() {
+            return None;
+        }
+        let editing_connection = home.editing_connection_id.and_then(|id| {
+            home.connections
+                .iter()
+                .find(|connection| {
+                    connection.id == Some(id)
+                        && connection.connection_type == ConnectionType::Extension
+                })
+                .cloned()
+        });
+        home.editing_connection_id = None;
+        Some(ExtensionConnectionFormConfig {
+            contribution,
+            editing_connection,
+            workspaces: home.workspaces.clone(),
+            teams,
+        })
+    }) else {
+        return NewConnectionFormResult::Blocked;
+    };
+    NewConnectionFormResult::Form(
+        cx.new(|cx| ExtensionConnectionForm::new(config, window, cx))
+            .into(),
+    )
 }
 
 fn build_port_forwarding_form(
@@ -314,6 +359,42 @@ fn build_mongo_form(
     };
 
     NewConnectionFormResult::Form(cx.new(|cx| MongoFormWindow::new(config, window, cx)).into())
+}
+
+fn build_mqtt_form(
+    parent: Entity<HomePage>,
+    window: &mut Window,
+    cx: &mut Context<NewConnectionWindow>,
+) -> NewConnectionFormResult {
+    let Some(config) = parent.update(cx, |home, cx| {
+        if !home.is_master_key_ready_for_new_connection() {
+            return None;
+        }
+
+        let editing_connection = home.editing_connection_id.and_then(|id| {
+            home.connections
+                .iter()
+                .find(|c| c.id == Some(id) && c.connection_type == ConnectionType::Mqtt)
+                .cloned()
+        });
+        home.editing_connection_id = None;
+        let ssh_connections = home.connections.clone();
+        Some(MqttFormConfig {
+            editing_connection,
+            initial_connection: None,
+            workspaces: home.workspaces.clone(),
+            teams: get_cached_team_options(cx),
+            ssh_connections,
+            on_saved: None,
+        })
+    }) else {
+        return NewConnectionFormResult::Blocked;
+    };
+
+    NewConnectionFormResult::Form(
+        cx.new(|cx| MqttFormWindow::new(config.into_window_config(), window, cx))
+            .into(),
+    )
 }
 
 fn build_serial_form(

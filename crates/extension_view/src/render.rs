@@ -3,16 +3,15 @@ use gpui::{
     px,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, Icon, IconName, IconSize, ObjectIcon, Sizable,
+    ActiveTheme, Disableable, Icon, IconName, IconSize, Sizable,
     button::{Button, ButtonVariants},
-    content_state::ContentState,
     h_flex,
     input::Input,
-    panel_header::{PanelHeader, PanelHeaderVariant},
     progress::Progress,
     scroll::ScrollableElement,
     v_flex,
 };
+use one_ui::{ContentState, PanelHeader, PanelHeaderVariant};
 use rust_i18n::t;
 
 use crate::{
@@ -57,7 +56,7 @@ impl ExtensionManagerView {
                     .child(
                         Button::new("extension-manager-local")
                             .small()
-                            .icon(ObjectIcon::new(IconName::File))
+                            .icon(IconName::File)
                             .label(t!("Extension.local_install").to_string())
                             .on_click(cx.listener(|view, _, _, cx| {
                                 view.select_local_tarball(cx);
@@ -310,6 +309,10 @@ impl ExtensionManagerView {
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
         let action_busy = self.busy.is_some();
+        // 打开入口不在扩展管理页:连接类由「新建连接」聚合,非连接工具由
+        // 「工具箱」聚合(见 catalog::toolbox_views)。这里只保留生命周期
+        // 管理操作(重载/卸载)。
+        let mut actions = Vec::new();
         let summary_for_reload = summary.clone();
         let reload = Button::new(format!("extension-manager-reload-{}", summary.name))
             .small()
@@ -328,12 +331,13 @@ impl ExtensionManagerView {
             .on_click(cx.listener(move |view, _, window, cx| {
                 view.uninstall_extension(summary_for_uninstall.clone(), window, cx);
             }));
+        actions.extend([reload, uninstall]);
         extension_card(
             kind_label(summary.kind),
             summary.name,
             summary.version,
             summary.description,
-            vec![reload, uninstall],
+            actions,
             cx,
         )
     }
@@ -453,7 +457,6 @@ fn kind_label(kind: ExtensionKind) -> String {
         ExtensionKind::RemoteDesktopProvider => {
             t!("Extension.kind_remote_desktop_provider").to_string()
         }
-        ExtensionKind::McpHelper => t!("Extension.kind_mcp_helper").to_string(),
         ExtensionKind::AcpAgent => t!("Extension.kind_acp_agent").to_string(),
         ExtensionKind::Composite => t!("Extension.kind_composite").to_string(),
     }
@@ -465,7 +468,6 @@ fn extension_kind_id(kind: ExtensionKind) -> &'static str {
         ExtensionKind::LanguageBundle => "language-bundle",
         ExtensionKind::DatabaseDriver => "database-driver",
         ExtensionKind::RemoteDesktopProvider => "remote-desktop-provider",
-        ExtensionKind::McpHelper => "mcp-helper",
         ExtensionKind::AcpAgent => "acp-agent",
         ExtensionKind::Composite => "composite",
     }
