@@ -1,9 +1,9 @@
 rust_i18n::i18n!("locales", fallback = "en");
 
+mod blend;
 pub mod content_state;
 pub mod edit_table;
 pub mod file_conflict_prompt;
-mod blend;
 pub use blend::ColorMix;
 
 mod geometry;
@@ -40,7 +40,7 @@ pub use settings::{
     table_row_height_or,
 };
 pub use signature_help::{ExtendedEditor, ExtendedEditorState, SignatureHelpProvider};
-pub use status_bar::{StatusBar, StatusPresentation};
+pub use status_bar::{StatusBar, StatusBarColors, StatusPresentation};
 pub use time::datetime_picker::{DateTimePicker, DateTimePickerEvent, DateTimePickerState};
 pub use time::time_picker::{TimePicker, TimePickerEvent, TimePickerState};
 

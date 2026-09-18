@@ -115,7 +115,7 @@ use paste_safety::{
 };
 use remote_image_preview::image_from_local_path;
 use rust_i18n::t;
-use sftp::{RusshSftpClient, SftpClient};
+use sftp::{RemoteFileClient, RusshSftpClient, SftpClient};
 use ssh::SshSessionManager;
 use std::ops::Deref;
 use terminal::GpuiEventProxy;

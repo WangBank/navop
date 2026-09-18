@@ -915,7 +915,7 @@ pub fn resolve_local_workspace_root(config: &LocalConfig) -> Option<PathBuf> {
 /// 准备本地终端的 Shell Integration 环境
 ///
 /// 将 `shell_integration.sh` 写入进程级临时目录 `/tmp/onetcli-<pid>/`，
-/// 仅对当前 OnetCli 进程内的终端会话生效，不污染全局配置。
+/// 仅对当前 Navop 进程内的终端会话生效，不污染全局配置。
 /// 返回 `(额外环境变量, shell 额外参数)`。
 #[cfg(not(target_os = "windows"))]
 fn prepare_shell_integration(shell: Option<&str>) -> (Vec<(String, String)>, Vec<String>) {
@@ -1233,7 +1233,7 @@ pub struct Terminal {
     connection_name: Option<String>,
     /// 初始化命令（连接成功后执行）
     init_commands: Option<String>,
-    /// 当前 OnetCli 会话内记录的命令历史（富条目，含 frecency 元数据）
+    /// 当前 Navop 会话内记录的命令历史（富条目，含 frecency 元数据）
     session_history: VecDeque<HistoryEntry>,
     /// 从 shell 历史文件加载的持久化历史
     persisted_history: Vec<String>,
@@ -5672,6 +5672,7 @@ mod tests {
         let mut connection = StoredConnection::new_ssh(
             "Latest SSH".to_string(),
             SshParams {
+                remote_file: None,
                 sftp_default_directory: None,
                 disabled_jump_server: None,
                 sftp_account: None,
@@ -5740,6 +5741,7 @@ mod tests {
         let connection = StoredConnection::new_ssh(
             "Prompted SSH".to_string(),
             SshParams {
+                remote_file: None,
                 sftp_default_directory: None,
                 disabled_jump_server: None,
                 sftp_account: None,
@@ -5815,6 +5817,7 @@ mod tests {
         let connection = StoredConnection::new_ssh(
             "No keyboard-interactive".to_string(),
             SshParams {
+                remote_file: None,
                 sftp_default_directory: None,
                 disabled_jump_server: None,
                 sftp_account: None,
@@ -5876,6 +5879,7 @@ mod tests {
         let connection = StoredConnection::new_ssh(
             "Host-key retry".to_string(),
             SshParams {
+                remote_file: None,
                 sftp_default_directory: None,
                 disabled_jump_server: None,
                 sftp_account: None,
